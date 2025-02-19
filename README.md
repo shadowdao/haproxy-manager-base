@@ -1,3 +1,2 @@
-# haproxy-manager-base
+# HAProxy Manager Base
 
-Base code for HAProxy Web Manager
