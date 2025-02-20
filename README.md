@@ -4,7 +4,7 @@ A Flask-based API service for managing HAProxy configurations, domains, and SSL 
 
 To run the container:
 ```bash
-docker run -d  -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy --name haproxy-manager repo.anhonesthost.net/jknapp/haproxy-manager-base:latest
+docker run -d  -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy --name haproxy-manager repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
 ```
 
 ## API Endpoints
