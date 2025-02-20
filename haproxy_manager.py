@@ -281,7 +281,8 @@ def generate_config():
         # Add Let's Encrypt
         letsencrypt_acl = template_env.get_template('hap_letsencrypt.tpl').render()
         config_parts.append(letsencrypt_acl)
-
+        config_acls = []
+        config_backends = []
 # Add domain configurations
         for domain in domains:
             if not domain['backend_name']:
@@ -294,7 +295,7 @@ def generate_config():
                     domain=domain['domain'],
                     name=domain['backend_name']
                 )
-                config_parts.append(domain_acl)
+                config_acls.append(domain_acl)
                 print(f"Added ACL for domain: {domain['domain']}")  # Debug log
             except Exception as e:
                 print(f"Error generating domain ACL for {domain['domain']}: {e}")
@@ -316,12 +317,16 @@ def generate_config():
                     ssl_enabled=domain['ssl_enabled'],
                     servers=servers
                 )
-                config_parts.append(backend_block)
+                config_backends.append(backend_block)
                 print(f"Added backend block for: {domain['backend_name']}")  # Debug log
             except Exception as e:
                 print(f"Error generating backend block for {domain['backend_name']}: {e}")
                 continue
-
+        
+        # Add ACLS
+        config_parts.append('\n' .join(config_acls))
+        # Add Backends
+        config_parts.append('\n' .join(config_backends))
         # Write complete configuration to tmp 
         temp_config_path = "/etc/haproxy/haproxy.cfg"
 
