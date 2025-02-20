@@ -53,6 +53,12 @@ def init_db():
         ''')
         conn.commit()
 
+def certbot_register():
+    """Register with Let's Encrypt using the certbot client and agree to the terms of service"""
+    result = subprocess.run(['certbot', 'show_account'],  capture_output=True)
+    if result.returncode != 0:
+        subprocess.run(['certbot', 'register', '--agree-tos', '--register-unsafely-without-email', '--no-eff-email'])
+
 def generate_self_signed_cert(ssl_certs_dir):
     """Generate a self-signed certificate for a domain."""
     self_sign_cert = os.path.join(ssl_certs_dir, "default_self_signed_cert.pem")
@@ -352,5 +358,6 @@ def generate_config():
 
 if __name__ == '__main__':
     init_db()
+    certbot_register()
     generate_self_signed_cert(SSL_CERTS_DIR)
     app.run(host='0.0.0.0', port=8000)
