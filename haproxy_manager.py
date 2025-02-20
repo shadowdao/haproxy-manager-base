@@ -122,6 +122,17 @@ def health_check():
             'status': 'unhealthy',
             'error': str(e)
         }), 500
+    
+@app.route('/regenerate', methods=['GET'])
+def regenerate_conf():
+    try:
+        generate_config()
+        return jsonify({'status': 'success'}), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'failed',
+            'error': str(e)
+        }), 500
 
 @app.route('/api/domain', methods=['POST'])
 def add_domain():
