@@ -1,5 +1,5 @@
 FROM python:3.12-slim
-RUN apt update -y && apt dist-upgrade -y && apt install socat haproxy cron certbot -y && apt clean && rm -rf /var/lib/apt/lists/*
+RUN apt update -y && apt dist-upgrade -y && apt install socat haproxy cron certbot curl -y && apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
 COPY ./templates /haproxy/templates
 COPY requirements.txt /haproxy/
