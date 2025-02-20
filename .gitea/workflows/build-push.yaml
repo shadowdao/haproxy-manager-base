@@ -1,0 +1,34 @@
+name: HAProxy Manager Build and Push
+run-name: ${{ gitea.actor }} pushed a change to main
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  Build-and-Push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+      
+      - name: Login to Gitea
+        uses: docker/login-action@v3
+        with:
+          registry: repo.anhonesthost.net
+          username: ${{ secrets.CI_USER }}
+          password: ${{ secrets.CI_TOKEN }}
+      
+      - name: Build Image
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64
+          push: true
+          tags: |
+            repo.anhonesthost.net/jknapp/haproxy-manager-base:latest
