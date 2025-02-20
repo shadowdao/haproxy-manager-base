@@ -31,4 +31,4 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            repo.anhonesthost.net/jknapp/haproxy-manager-base:latest
+            repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
