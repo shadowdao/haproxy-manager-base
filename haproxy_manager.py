@@ -147,7 +147,7 @@ def add_domain():
         cursor = conn.cursor()
 
         # Add domain
-        cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override or None))
+        cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override))
         domain_id = cursor.lastrowid
 
         # Add backend
@@ -160,7 +160,7 @@ def add_domain():
             cursor.execute('''
                 INSERT INTO backend_servers
                 (backend_id, server_name, server_address, server_port, server_options)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
             ''', (backend_id, server['name'], server['address'],
                  server['port'], server.get('options')))
     # Close cursor and connection
