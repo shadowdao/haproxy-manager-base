@@ -9,7 +9,7 @@ import psutil
 
 app = Flask(__name__)
 
-DB_FILE = 'haproxy_config.db'
+DB_FILE = '/etc/haproxy/haproxy_config.db'
 TEMPLATE_DIR = Path('templates')
 HAPROXY_CONFIG_PATH = '/etc/haproxy/haproxy.cfg'
 SSL_CERTS_DIR = '/etc/haproxy/certs'
@@ -123,7 +123,7 @@ def health_check():
             'error': str(e)
         }), 500
     
-@app.route('/regenerate', methods=['GET'])
+@app.route('/api/regenerate', methods=['GET'])
 def regenerate_conf():
     try:
         generate_config()
@@ -336,6 +336,9 @@ def generate_config():
         
         # Add ACLS
         config_parts.append('\n' .join(config_acls))
+        # Add LetsEncrypt Backend
+        letsencrypt_backend = template_env.get_template('hap_letsencrypt_backend.tpl').render()
+        config_parts.append(letsencrypt_backend)
         # Add Backends
         config_parts.append('\n' .join(config_backends))
         # Write complete configuration to tmp 
