@@ -392,5 +392,6 @@ if __name__ == '__main__':
     init_db()
     certbot_register()
     generate_self_signed_cert(SSL_CERTS_DIR)
-    
+    start_haproxy()
+    certbot_register()
     app.run(host='0.0.0.0', port=8000)
