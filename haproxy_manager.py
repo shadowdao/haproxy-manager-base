@@ -325,15 +325,16 @@ def generate_config():
                     print(f"No servers found for backend {domain['backend_name']}")  # Debug log
                     continue
 
-                if domain['template_override'] is None:
+                if domain['template_override']:
+                    backend_block = template_env.get_template(domain['template_override' + '.tpl']).render(
+                        name=domain['backend_name'],
+                        servers=servers
+                    
+                    )
+                else:
                     backend_block = template_env.get_template('hap_backend.tpl').render(
                         name=domain['backend_name'],
                         ssl_enabled=domain['ssl_enabled'],
-                        servers=servers
-                    )
-                else:
-                    backend_block = template_env.get_template(domain['template_override' + '.tpl']).render(
-                        name=domain['backend_name'],
                         servers=servers
                     )
                 config_backends.append(backend_block)
