@@ -270,6 +270,7 @@ def generate_config():
                 d.domain,
                 d.ssl_enabled,
                 d.ssl_cert_path,
+                d.template_override,
                 b.id as backend_id,
                 b.name as backend_name
             FROM domains d
@@ -324,9 +325,11 @@ def generate_config():
                 if not servers:
                     print(f"No servers found for backend {domain['backend_name']}")  # Debug log
                     continue
-
-                if domain['template_override']:
-                    backend_block = template_env.get_template(domain['template_override' + '.tpl']).render(
+                
+                if domain['template_override'] is not None:
+                    print(f"Template Override is set to: {domain['template_override']}")
+                    template_file = domain['template_override'] + ".tpl"
+                    backend_block = template_env.get_template(template_file).render(
                         name=domain['backend_name'],
                         servers=servers
                     
