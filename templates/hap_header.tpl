@@ -46,3 +46,4 @@ defaults
     timeout http-keep-alive 120s
     timeout check           10s
     maxconn                 3000
+    

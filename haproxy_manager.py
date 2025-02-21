@@ -174,9 +174,9 @@ def request_ssl():
 
     # Request Let's Encrypt certificate
     result = subprocess.run([
-        'certbot', 'certonly', '--standalone',
-        '--preferred-challenges', 'http',
-        '-d', domain, '--non-interactive --http-01-port=8688'
+        'certbot', 'certonly', '-n', '--standalone',
+        '--preferred-challenges', 'http', '--http-01-port=8688',
+        '-d', domain 
     ])
 
     if result.returncode == 0:
@@ -364,7 +364,11 @@ def generate_config():
                         capture_output=True,
                         text=True
                     )
-                    print("HAProxy started successfully")
+                    if result.returncode == 0:
+                        print("HAProxy started successfully")
+                    else:
+                        print(f"HAProxy start command returned: {result.stdout}")
+                        print(f"Error output: {result.stderr}")
                 except subprocess.CalledProcessError as e:
                     print(f"Failed to start HAProxy: {e.stdout}\n{e.stderr}")
                     raise
@@ -383,7 +387,11 @@ def start_haproxy():
                 capture_output=True,
                 text=True
             )
-            print("HAProxy started successfully")
+            if result.returncode == 0:
+                print("HAProxy started successfully")
+            else:
+                print(f"HAProxy start command returned: {result.stdout}")
+                print(f"Error output: {result.stderr}")
         except subprocess.CalledProcessError as e:
             print(f"Failed to start HAProxy: {e.stdout}\n{e.stderr}")
             raise
