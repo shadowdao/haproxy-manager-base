@@ -24,7 +24,8 @@ def init_db():
                 id INTEGER PRIMARY KEY,
                 domain TEXT UNIQUE NOT NULL,
                 ssl_enabled BOOLEAN DEFAULT 0,
-                ssl_cert_path TEXT
+                ssl_cert_path TEXT,
+                template_override TEXT      
             )
         ''')
 
@@ -138,6 +139,7 @@ def regenerate_conf():
 def add_domain():
     data = request.get_json()
     domain = data.get('domain')
+    template_override = data.get('template_override')
     backend_name = data.get('backend_name')
     servers = data.get('servers', [])
 
@@ -145,7 +147,7 @@ def add_domain():
         cursor = conn.cursor()
 
         # Add domain
-        cursor.execute('INSERT INTO domains (domain) VALUES (?)', (domain,))
+        cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override or None))
         domain_id = cursor.lastrowid
 
         # Add backend
@@ -158,7 +160,7 @@ def add_domain():
             cursor.execute('''
                 INSERT INTO backend_servers
                 (backend_id, server_name, server_address, server_port, server_options)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
             ''', (backend_id, server['name'], server['address'],
                  server['port'], server.get('options')))
     # Close cursor and connection
@@ -323,11 +325,17 @@ def generate_config():
                     print(f"No servers found for backend {domain['backend_name']}")  # Debug log
                     continue
 
-                backend_block = template_env.get_template('hap_backend.tpl').render(
-                    name=domain['backend_name'],
-                    ssl_enabled=domain['ssl_enabled'],
-                    servers=servers
-                )
+                if domain['template_override'] is None:
+                    backend_block = template_env.get_template('hap_backend.tpl').render(
+                        name=domain['backend_name'],
+                        ssl_enabled=domain['ssl_enabled'],
+                        servers=servers
+                    )
+                else:
+                    backend_block = template_env.get_template(domain['template_override' + '.tpl']).render(
+                        name=domain['backend_name'],
+                        servers=servers
+                    )
                 config_backends.append(backend_block)
                 print(f"Added backend block for: {domain['backend_name']}")  # Debug log
             except Exception as e:
