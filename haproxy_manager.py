@@ -340,7 +340,7 @@ def generate_config():
         letsencrypt_backend = template_env.get_template('hap_letsencrypt_backend.tpl').render()
         config_parts.append(letsencrypt_backend)
         # Add Backends
-        config_parts.append('\n' .join(config_backends))
+        config_parts.append('\n' .join(config_backends) + '\n')
         # Write complete configuration to tmp 
         temp_config_path = "/etc/haproxy/haproxy.cfg"
 
