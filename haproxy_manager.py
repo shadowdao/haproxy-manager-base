@@ -351,7 +351,6 @@ def generate_config():
         # Check HAProxy Configuration, and reload if it works
         with open(temp_config_path, 'w') as f:
             f.write(config_content)
-
         result = subprocess.run(['haproxy', '-c', '-f', temp_config_path], capture_output=True)
         if result.returncode == 0:
             print("HAProxy configuration check passed")
@@ -375,8 +374,23 @@ def generate_config():
         traceback.print_exc()
         raise
 
+def start_haproxy():
+    if not is_process_running('haproxy'):
+        try:
+            result = subprocess.run(
+                ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print("HAProxy started successfully")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to start HAProxy: {e.stdout}\n{e.stderr}")
+            raise
+
 if __name__ == '__main__':
     init_db()
     certbot_register()
     generate_self_signed_cert(SSL_CERTS_DIR)
+    
     app.run(host='0.0.0.0', port=8000)
