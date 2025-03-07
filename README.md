@@ -28,6 +28,12 @@ docker run -d  -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt
 - Certbot (for Let's Encrypt certificates)
 - OpenSSL (for self-signed start-up certificate)
 
+## Web UI Interface
+
+The HAProxy Manager includes a web-based user interface accessible at port 8000, providing:
+- Domain and backend server management interface
+- SSL certificate status monitoring
+
 ## API Endpoints
 
 ### Health Check
