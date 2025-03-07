@@ -1,6 +1,6 @@
 import sqlite3
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from pathlib import Path
 import subprocess
 import jinja2
@@ -25,7 +25,7 @@ def init_db():
                 domain TEXT UNIQUE NOT NULL,
                 ssl_enabled BOOLEAN DEFAULT 0,
                 ssl_cert_path TEXT,
-                template_override TEXT      
+                template_override TEXT
             )
         ''')
 
@@ -101,18 +101,34 @@ def is_process_running(process_name):
 template_loader = jinja2.FileSystemLoader(TEMPLATE_DIR)
 template_env = jinja2.Environment(loader=template_loader)
 
+@app.route('/api/domains', methods=['GET'])
+def get_domains():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+          conn.row_factory = sqlite3.Row
+          cursor = conn.cursor()
+          cursor.execute('''
+            SELECT d.*, b.name as backend_name
+            FROM domains d
+            LEFT JOIN backends b ON d.id = b.domain_id
+        ''')
+        domains = [dict(row) for row in cursor.fetchall()]
+        return jsonify(domains)
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 @app.route('/health', methods=['GET'])
 def health_check():
     try:
         # Check if HAProxy is running
         haproxy_running = is_process_running('haproxy')
-        
+
         # Check if database is accessible
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT 1')
             cursor.fetchone()
-        
+
         return jsonify({
             'status': 'healthy',
             'haproxy_status': 'running' if haproxy_running else 'stopped',
@@ -123,7 +139,7 @@ def health_check():
             'status': 'unhealthy',
             'error': str(e)
         }), 500
-    
+
 @app.route('/api/regenerate', methods=['GET'])
 def regenerate_conf():
     try:
@@ -155,7 +171,6 @@ def add_domain():
                       (backend_name, domain_id))
         backend_id = cursor.lastrowid
 
-        # Add servers
         for server in servers:
             cursor.execute('''
                 INSERT INTO backend_servers
@@ -169,6 +184,10 @@ def add_domain():
     generate_config()
     return jsonify({'status': 'success', 'domain_id': domain_id})
 
+@app.route('/')
+def index():
+    return render_template('index.html')
+
 @app.route('/api/ssl', methods=['POST'])
 def request_ssl():
     data = request.get_json()
@@ -178,7 +197,7 @@ def request_ssl():
     result = subprocess.run([
         'certbot', 'certonly', '-n', '--standalone',
         '--preferred-challenges', 'http', '--http-01-port=8688',
-        '-d', domain 
+        '-d', domain
     ])
 
     if result.returncode == 0:
@@ -216,14 +235,14 @@ def remove_domain():
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            
+
             # Get domain ID and check if it exists
             cursor.execute('SELECT id FROM domains WHERE domain = ?', (domain,))
             domain_result = cursor.fetchone()
-            
+
             if not domain_result:
                 return jsonify({'status': 'error', 'message': 'Domain not found'}), 404
-                
+
             domain_id = domain_result[0]
 
             # Get backend IDs associated with this domain
@@ -325,14 +344,14 @@ def generate_config():
                 if not servers:
                     print(f"No servers found for backend {domain['backend_name']}")  # Debug log
                     continue
-                
+
                 if domain['template_override'] is not None:
                     print(f"Template Override is set to: {domain['template_override']}")
                     template_file = domain['template_override'] + ".tpl"
                     backend_block = template_env.get_template(template_file).render(
                         name=domain['backend_name'],
                         servers=servers
-                    
+
                     )
                 else:
                     backend_block = template_env.get_template('hap_backend.tpl').render(
@@ -345,7 +364,7 @@ def generate_config():
             except Exception as e:
                 print(f"Error generating backend block for {domain['backend_name']}: {e}")
                 continue
-        
+
         # Add ACLS
         config_parts.append('\n' .join(config_acls))
         # Add LetsEncrypt Backend
@@ -353,7 +372,7 @@ def generate_config():
         config_parts.append(letsencrypt_backend)
         # Add Backends
         config_parts.append('\n' .join(config_backends) + '\n')
-        # Write complete configuration to tmp 
+        # Write complete configuration to tmp
         temp_config_path = "/etc/haproxy/haproxy.cfg"
 
         config_content = '\n'.join(config_parts)

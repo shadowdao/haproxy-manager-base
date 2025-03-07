@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HAProxy Manager</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="number"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .server-list {
+            margin-top: 10px;
+        }
+        .server-item {
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+        }
+        .delete-btn {
+            background-color: #f44336;
+        }
+        .delete-btn:hover {
+            background-color: #da190b;
+        }
+        .domain-list {
+            margin-top: 20px;
+        }
+        .ssl-btn {
+            background-color: #2196F3;
+        }
+        .ssl-btn:hover {
+            background-color: #0b7dda;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .status.success {
+            background-color: #dff0d8;
+            color: #3c763d;
+        }
+        .status.error {
+            background-color: #f2dede;
+            color: #a94442;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HAProxy Domain Manager</h1>
+        
+        <!-- Add Domain Form -->
+        <h2>Add New Domain</h2>
+        <form id="domainForm">
+            <div class="form-group">
+                <label for="domain">Domain:</label>
+                <input type="text" id="domain" required placeholder="example.com">
+            </div>
+            
+            <div class="form-group">
+                <label for="backendName">Backend Name:</label>
+                <input type="text" id="backendName" required placeholder="example_backend">
+            </div>
+
+            <div class="form-group">
+                <label for="templateOverride">Template Override (optional):</label>
+                <input type="text" id="templateOverride" placeholder="custom_template">
+            </div>
+
+            <h3>Backend Servers</h3>
+            <div id="serverList" class="server-list"></div>
+            
+            <button type="button" onclick="addServerField()">Add Server</button>
+            <button type="submit">Add Domain</button>
+        </form>
+
+        <!-- Domain List -->
+        <h2>Existing Domains</h2>
+        <div id="domainList" class="domain-list">
+            <!-- Domains will be listed here -->
+        </div>
+    </div>
+
+    <script>
+        // Add server field to the form
+        function addServerField() {
+            const serverList = document.getElementById('serverList');
+            const serverDiv = document.createElement('div');
+            serverDiv.className = 'server-item';
+            serverDiv.innerHTML = `
+                <div class="form-group">
+                    <label>Server Name:</label>
+                    <input type="text" class="server-name" required placeholder="server1">
+                </div>
+                <div class="form-group">
+                    <label>Server Address:</label>
+                    <input type="text" class="server-address" required placeholder="192.168.1.100">
+                </div>
+                <div class="form-group">
+                    <label>Server Port:</label>
+                    <input type="number" class="server-port" required placeholder="8080">
+                </div>
+                <div class="form-group">
+                    <label>Server Options:</label>
+                    <input type="text" class="server-options" placeholder="check">
+                </div>
+                <button type="button" class="delete-btn" onclick="this.parentElement.remove()">Remove Server</button>
+            `;
+            serverList.appendChild(serverDiv);
+        }
+
+        // Handle form submission
+        document.getElementById('domainForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const servers = Array.from(document.getElementsByClassName('server-item')).map(item => ({
+                name: item.querySelector('.server-name').value,
+                address: item.querySelector('.server-address').value,
+                port: parseInt(item.querySelector('.server-port').value),
+                options: item.querySelector('.server-options').value
+            }));
+
+            const data = {
+                domain: document.getElementById('domain').value,
+                backend_name: document.getElementById('backendName').value,
+                template_override: document.getElementById('templateOverride').value || null,
+                servers: servers
+            };
+
+            try {
+                const response = await fetch('/api/domain', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(data)
+                });
+
+                if (response.ok) {
+                    showStatus('Domain added successfully!', 'success');
+                    document.getElementById('domainForm').reset();
+                    loadDomains();
+                } else {
+                    showStatus('Failed to add domain', 'error');
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        });
+
+        // Request SSL certificate
+        async function requestSSL(domain) {
+            try {
+                const response = await fetch('/api/ssl', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ domain })
+                });
+
+                if (response.ok) {
+                    showStatus(`SSL certificate requested for ${domain}`, 'success');
+                    loadDomains();
+                } else {
+                    showStatus('Failed to request SSL certificate', 'error');
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        }
+
+        // Delete domain
+        async function deleteDomain(domain) {
+            if (!confirm(`Are you sure you want to delete ${domain}?`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/domain', {
+                    method: 'DELETE',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ domain })
+                });
+
+                if (response.ok) {
+                    showStatus(`Domain ${domain} deleted successfully`, 'success');
+                    loadDomains();
+                } else {
+                    showStatus('Failed to delete domain', 'error');
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        }
+
+        // Show status message
+        function showStatus(message, type) {
+            const statusDiv = document.createElement('div');
+            statusDiv.className = `status ${type}`;
+            statusDiv.textContent = message;
+            document.querySelector('.container').insertBefore(statusDiv, document.querySelector('.domain-list'));
+            setTimeout(() => statusDiv.remove(), 5000);
+        }
+
+        // Load existing domains
+        async function loadDomains() {
+            try {
+                const response = await fetch('/api/domains');
+                const domains = await response.json();
+                const domainList = document.getElementById('domainList');
+                domainList.innerHTML = domains.map(domain => `
+                    <div class="server-item">
+                        <h3>${domain.domain}</h3>
+                        <p>Backend: ${domain.backend_name}</p>
+                        <p>SSL: ${domain.ssl_enabled ? 'Enabled' : 'Disabled'}</p>
+                        <button onclick="requestSSL('${domain.domain}')" class="ssl-btn">
+                            ${domain.ssl_enabled ? 'Renew SSL' : 'Enable SSL'}
+                        </button>
+                        <button onclick="deleteDomain('${domain.domain}')" class="delete-btn">Delete</button>
+                    </div>
+                `).join('');
+            } catch (error) {
+                showStatus('Error loading domains: ' + error.message, 'error');
+            }
+        }
+
+        // Add initial server field and load domains
+        addServerField();
+        loadDomains();
+    </script>
+</body>
+</html>
