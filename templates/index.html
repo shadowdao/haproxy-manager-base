@@ -47,11 +47,17 @@
         .server-list {
             margin-top: 10px;
         }
-        .server-item {
+        .server-item, .domain-list-item {
             border: 1px solid #ddd;
-            padding: 10px;
+            padding: 15px;
             margin-bottom: 10px;
-            border-radius: 4px;
+            border-radius: 5px;
+        }
+        .domain-list-item {
+            background-color: #f9f9f9;
+        }
+        .server-item {
+            background-color: #fff;
         }
         .delete-btn {
             background-color: #f44336;
@@ -84,55 +90,41 @@
     </style>
 </head>
 <body>
-    <script>
-        window.onerror = function(msg, url, lineNo, columnNo, error) {
-            console.log('Error: ' + msg + '\nURL: ' + url + '\nLine: ' + lineNo + '\nColumn: ' + columnNo + '\nError object: ' + JSON.stringify(error));
-            return false;
-        };
-    </script>
-
     <div class="container">
         <h1>HAProxy Domain Manager</h1>
-
-        <!-- Add Domain Form -->
-        <h2>Add New Domain</h2>
         <form id="domainForm">
             <div class="form-group">
                 <label for="domain">Domain:</label>
                 <input type="text" id="domain" required placeholder="example.com">
             </div>
-
             <div class="form-group">
                 <label for="backendName">Backend Name:</label>
                 <input type="text" id="backendName" required placeholder="example_backend">
             </div>
-
             <div class="form-group">
                 <label for="templateOverride">Template Override (optional):</label>
                 <input type="text" id="templateOverride" placeholder="custom_template">
             </div>
-
             <h3>Backend Servers</h3>
             <div id="serverList" class="server-list"></div>
-
             <button type="button" onclick="addServerField()">Add Server</button>
             <button type="submit">Add Domain</button>
         </form>
-
-        <!-- Domain List -->
         <h2>Existing Domains</h2>
-        <div id="domainList" class="domain-list">
-            <!-- Domains will be listed here -->
-        </div>
+        <div id="domainList" class="domain-list"></div>
     </div>
 
     <script>
-        // Add server field to the form
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+            console.log('Error: ' + msg + '\nURL: ' + url + '\nLine: ' + lineNo + '\nColumn: ' + columnNo + '\nError object: ' + JSON.stringify(error));
+            return false;
+        };
+
         function addServerField() {
             const serverList = document.getElementById('serverList');
             const serverDiv = document.createElement('div');
             serverDiv.className = 'server-item';
-            serverDiv.innerHTML = `
+            const serverHTML = `
                 <div class="form-group">
                     <label>Server Name:</label>
                     <input type="text" class="server-name" required placeholder="server1">
@@ -151,17 +143,21 @@
                 </div>
                 <button type="button" class="delete-btn" onclick="this.parentElement.remove()">Remove Server</button>
             `;
+
+            serverDiv.innerHTML = serverHTML;
             serverList.appendChild(serverDiv);
         }
 
-        // Handle form submission
         document.getElementById('domainForm').addEventListener('submit', async (e) => {
             e.preventDefault();
+            const serverItems = document.getElementById('serverList').getElementsByClassName('server-item');
+
+            console.log("Form submitted");
+            console.log("Server items found:", serverItems.length);
 
             const domainInput = document.getElementById('domain');
             const backendNameInput = document.getElementById('backendName');
             const templateOverrideInput = document.getElementById('templateOverride');
-            const serverItems = document.getElementsByClassName('server-item');
 
             if (!domainInput || !backendNameInput) {
                 showStatus('Required form fields are missing', 'error');
@@ -175,18 +171,33 @@
 
             const servers = [];
             for (const item of serverItems) {
+                if (!item.querySelector('.form-group')) {
+                    continue;
+                }
                 const nameInput = item.querySelector('.server-name');
                 const addressInput = item.querySelector('.server-address');
                 const portInput = item.querySelector('.server-port');
                 const optionsInput = item.querySelector('.server-options');
 
-                if (!nameInput || !addressInput || !portInput) {
-                    showStatus('Server configuration is incomplete', 'error');
+                const missingFields = [];
+                if (!nameInput) missingFields.push('name input');
+                if (!addressInput) missingFields.push('address input');
+                if (!portInput) missingFields.push('port input');
+
+                if (missingFields.length > 0) {
+                    showStatus(`Server configuration is incomplete. Missing: ${missingFields.join(', ')}`, 'error');
+                    console.error('Missing fields:', missingFields);
+                    console.error('Server item HTML:', item.innerHTML);
                     return;
                 }
 
-                if (!nameInput.value || !addressInput.value || !portInput.value) {
-                    showStatus('Please fill in all required server fields', 'error');
+                const missingValues = [];
+                if (!nameInput.value) missingValues.push('server name');
+                if (!addressInput.value) missingValues.push('server address');
+                if (!portInput.value) missingValues.push('server port');
+
+                if (missingValues.length > 0) {
+                    showStatus(`Please fill in all required server fields: ${missingValues.join(', ')}`, 'error');
                     return;
                 }
 
@@ -204,6 +215,7 @@
                 template_override: templateOverrideInput ? templateOverrideInput.value : null,
                 servers: servers
             };
+
             try {
                 const response = await fetch('/api/domain', {
                     method: 'POST',
@@ -217,8 +229,8 @@
                     showStatus('Domain added successfully!', 'success');
                     document.getElementById('domainForm').reset();
                     document.getElementById('serverList').innerHTML = '';
-                    addServerField();
-                    loadDomains();
+        addServerField();
+        loadDomains();
                 } else {
                     const errorData = await response.json();
                     showStatus('Failed to add domain: ' + (errorData.message || 'Unknown error'), 'error');
@@ -229,7 +241,6 @@
             }
         });
 
-        // Request SSL certificate
         async function requestSSL(domain) {
             try {
                 const response = await fetch('/api/ssl', {
@@ -251,7 +262,6 @@
             }
         }
 
-        // Delete domain
         async function deleteDomain(domain) {
             if (!confirm(`Are you sure you want to delete ${domain}?`)) {
                 return;
@@ -278,7 +288,6 @@
         }
 
         function showStatus(message, type) {
-            console.log(`Status [${type}]:`, message);
             const statusDiv = document.createElement('div');
             statusDiv.className = `status ${type}`;
             statusDiv.textContent = message;
@@ -296,29 +305,32 @@
             }, 5000);
         }
 
-        // Load existing domains
-        async function loadDomains() {
-            try {
-                const response = await fetch('/api/domains');
-                const domains = await response.json();
-                const domainList = document.getElementById('domainList');
-                domainList.innerHTML = domains.map(domain => `
-                    <div class="server-item">
-                        <h3>${domain.domain}</h3>
-                        <p>Backend: ${domain.backend_name}</p>
+        function loadDomains() {
+            fetch('/api/domains')
+                .then(response => response.json())
+                .then(domains => {
+                    const domainList = document.querySelector('.domain-list');
+                    domainList.innerHTML = '';
+                    domains.forEach(domain => {
+                        const domainDiv = document.createElement('div');
+                        domainDiv.className = 'domain-list-item';
+                        domainDiv.innerHTML = `
+                            <h3>${domain.domain}</h3>
+                            <p>Backend: ${domain.backend_name}</p>
                         <p>SSL: ${domain.ssl_enabled ? 'Enabled' : 'Disabled'}</p>
                         <button onclick="requestSSL('${domain.domain}')" class="ssl-btn">
-                            ${domain.ssl_enabled ? 'Renew SSL' : 'Enable SSL'}
+                                ${domain.ssl_enabled ? 'Disable' : 'Enable'} SSL
                         </button>
                         <button onclick="deleteDomain('${domain.domain}')" class="delete-btn">Delete</button>
-                    </div>
-                `).join('');
-            } catch (error) {
-                showStatus('Error loading domains: ' + error.message, 'error');
+                        `;
+                        domainList.appendChild(domainDiv);
+                    });
+                })
+                .catch(error => {
+                    console.error('Error loading domains:', error);
+                    showStatus('Error loading domains', 'error');
+                });
             }
-        }
-
-        // Add initial server field and load domains
         addServerField();
         loadDomains();
     </script>
