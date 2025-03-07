@@ -152,9 +152,6 @@
             e.preventDefault();
             const serverItems = document.getElementById('serverList').getElementsByClassName('server-item');
 
-            console.log("Form submitted");
-            console.log("Server items found:", serverItems.length);
-
             const domainInput = document.getElementById('domain');
             const backendNameInput = document.getElementById('backendName');
             const templateOverrideInput = document.getElementById('templateOverride');
@@ -171,33 +168,18 @@
 
             const servers = [];
             for (const item of serverItems) {
-                if (!item.querySelector('.form-group')) {
-                    continue;
-                }
                 const nameInput = item.querySelector('.server-name');
                 const addressInput = item.querySelector('.server-address');
                 const portInput = item.querySelector('.server-port');
                 const optionsInput = item.querySelector('.server-options');
 
-                const missingFields = [];
-                if (!nameInput) missingFields.push('name input');
-                if (!addressInput) missingFields.push('address input');
-                if (!portInput) missingFields.push('port input');
-
-                if (missingFields.length > 0) {
-                    showStatus(`Server configuration is incomplete. Missing: ${missingFields.join(', ')}`, 'error');
-                    console.error('Missing fields:', missingFields);
-                    console.error('Server item HTML:', item.innerHTML);
+                if (!nameInput || !addressInput || !portInput) {
+                    showStatus('Server configuration is incomplete', 'error');
                     return;
                 }
 
-                const missingValues = [];
-                if (!nameInput.value) missingValues.push('server name');
-                if (!addressInput.value) missingValues.push('server address');
-                if (!portInput.value) missingValues.push('server port');
-
-                if (missingValues.length > 0) {
-                    showStatus(`Please fill in all required server fields: ${missingValues.join(', ')}`, 'error');
+                if (!nameInput.value || !addressInput.value || !portInput.value) {
+                    showStatus('Please fill in all required server fields', 'error');
                     return;
                 }
 
@@ -205,14 +187,14 @@
                     name: nameInput.value,
                     address: addressInput.value,
                     port: parseInt(portInput.value),
-                    options: optionsInput ? optionsInput.value : ''
+                    options: optionsInput.value || "check"
                 });
             }
 
             const data = {
                 domain: domainInput.value,
                 backend_name: backendNameInput.value,
-                template_override: templateOverrideInput ? templateOverrideInput.value : null,
+                template_override: templateOverrideInput.value || null,
                 servers: servers
             };
 
@@ -225,15 +207,16 @@
                     body: JSON.stringify(data)
                 });
 
+                const responseData = await response.json();
+
                 if (response.ok) {
-                    showStatus('Domain added successfully!', 'success');
+                    showStatus(`Domain added successfully! Domain ID: ${responseData.domain_id}`, 'success');
                     document.getElementById('domainForm').reset();
                     document.getElementById('serverList').innerHTML = '';
         addServerField();
         loadDomains();
                 } else {
-                    const errorData = await response.json();
-                    showStatus('Failed to add domain: ' + (errorData.message || 'Unknown error'), 'error');
+                    showStatus('Failed to add domain: ' + (responseData.message || 'Unknown error'), 'error');
                 }
             } catch (error) {
                 showStatus('Error: ' + error.message, 'error');
@@ -309,7 +292,7 @@
             fetch('/api/domains')
                 .then(response => response.json())
                 .then(domains => {
-                    const domainList = document.querySelector('.domain-list');
+                    const domainList = document.getElementById('domainList');
                     domainList.innerHTML = '';
                     domains.forEach(domain => {
                         const domainDiv = document.createElement('div');
@@ -319,18 +302,19 @@
                             <p>Backend: ${domain.backend_name}</p>
                         <p>SSL: ${domain.ssl_enabled ? 'Enabled' : 'Disabled'}</p>
                         <button onclick="requestSSL('${domain.domain}')" class="ssl-btn">
-                                ${domain.ssl_enabled ? 'Disable' : 'Enable'} SSL
+                                ${domain.ssl_enabled ? 'Renew SSL' : 'Enable SSL'}
                         </button>
-                        <button onclick="deleteDomain('${domain.domain}')" class="delete-btn">Delete</button>
+                            <button onclick="deleteDomain('${domain.domain}')" class="delete-btn">Delete Domain</button>
                         `;
                         domainList.appendChild(domainDiv);
                     });
                 })
                 .catch(error => {
                     console.error('Error loading domains:', error);
-                    showStatus('Error loading domains', 'error');
+                    showStatus('Error loading domains: ' + error.message, 'error');
                 });
             }
+
         addServerField();
         loadDomains();
     </script>
