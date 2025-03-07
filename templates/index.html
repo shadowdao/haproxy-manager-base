@@ -84,9 +84,16 @@
     </style>
 </head>
 <body>
+    <script>
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+            console.log('Error: ' + msg + '\nURL: ' + url + '\nLine: ' + lineNo + '\nColumn: ' + columnNo + '\nError object: ' + JSON.stringify(error));
+            return false;
+        };
+    </script>
+
     <div class="container">
         <h1>HAProxy Domain Manager</h1>
-        
+
         <!-- Add Domain Form -->
         <h2>Add New Domain</h2>
         <form id="domainForm">
@@ -94,7 +101,7 @@
                 <label for="domain">Domain:</label>
                 <input type="text" id="domain" required placeholder="example.com">
             </div>
-            
+
             <div class="form-group">
                 <label for="backendName">Backend Name:</label>
                 <input type="text" id="backendName" required placeholder="example_backend">
@@ -107,7 +114,7 @@
 
             <h3>Backend Servers</h3>
             <div id="serverList" class="server-list"></div>
-            
+
             <button type="button" onclick="addServerField()">Add Server</button>
             <button type="submit">Add Domain</button>
         </form>
@@ -151,20 +158,52 @@
         document.getElementById('domainForm').addEventListener('submit', async (e) => {
             e.preventDefault();
 
-            const servers = Array.from(document.getElementsByClassName('server-item')).map(item => ({
-                name: item.querySelector('.server-name').value,
-                address: item.querySelector('.server-address').value,
-                port: parseInt(item.querySelector('.server-port').value),
-                options: item.querySelector('.server-options').value
-            }));
+            const domainInput = document.getElementById('domain');
+            const backendNameInput = document.getElementById('backendName');
+            const templateOverrideInput = document.getElementById('templateOverride');
+            const serverItems = document.getElementsByClassName('server-item');
+
+            if (!domainInput || !backendNameInput) {
+                showStatus('Required form fields are missing', 'error');
+                return;
+            }
+
+            if (serverItems.length === 0) {
+                showStatus('At least one server is required', 'error');
+                return;
+            }
+
+            const servers = [];
+            for (const item of serverItems) {
+                const nameInput = item.querySelector('.server-name');
+                const addressInput = item.querySelector('.server-address');
+                const portInput = item.querySelector('.server-port');
+                const optionsInput = item.querySelector('.server-options');
+
+                if (!nameInput || !addressInput || !portInput) {
+                    showStatus('Server configuration is incomplete', 'error');
+                    return;
+                }
+
+                if (!nameInput.value || !addressInput.value || !portInput.value) {
+                    showStatus('Please fill in all required server fields', 'error');
+                    return;
+                }
+
+                servers.push({
+                    name: nameInput.value,
+                    address: addressInput.value,
+                    port: parseInt(portInput.value),
+                    options: optionsInput ? optionsInput.value : ''
+                });
+            }
 
             const data = {
-                domain: document.getElementById('domain').value,
-                backend_name: document.getElementById('backendName').value,
-                template_override: document.getElementById('templateOverride').value || null,
+                domain: domainInput.value,
+                backend_name: backendNameInput.value,
+                template_override: templateOverrideInput ? templateOverrideInput.value : null,
                 servers: servers
             };
-
             try {
                 const response = await fetch('/api/domain', {
                     method: 'POST',
@@ -177,12 +216,16 @@
                 if (response.ok) {
                     showStatus('Domain added successfully!', 'success');
                     document.getElementById('domainForm').reset();
+                    document.getElementById('serverList').innerHTML = '';
+                    addServerField();
                     loadDomains();
                 } else {
-                    showStatus('Failed to add domain', 'error');
+                    const errorData = await response.json();
+                    showStatus('Failed to add domain: ' + (errorData.message || 'Unknown error'), 'error');
                 }
             } catch (error) {
                 showStatus('Error: ' + error.message, 'error');
+                console.error('Error details:', error);
             }
         });
 
@@ -234,13 +277,23 @@
             }
         }
 
-        // Show status message
         function showStatus(message, type) {
+            console.log(`Status [${type}]:`, message);
             const statusDiv = document.createElement('div');
             statusDiv.className = `status ${type}`;
             statusDiv.textContent = message;
-            document.querySelector('.container').insertBefore(statusDiv, document.querySelector('.domain-list'));
-            setTimeout(() => statusDiv.remove(), 5000);
+            const container = document.querySelector('.container');
+            const domainList = document.querySelector('.domain-list');
+            if (container && domainList) {
+                container.insertBefore(statusDiv, domainList);
+            } else {
+                document.body.appendChild(statusDiv);
+            }
+            setTimeout(() => {
+                if (statusDiv.parentNode) {
+                    statusDiv.remove();
+                }
+            }, 5000);
         }
 
         // Load existing domains
