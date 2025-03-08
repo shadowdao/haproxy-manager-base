@@ -87,11 +87,24 @@
             background-color: #f2dede;
             color: #a94442;
         }
+        .regenerate-btn {
+            background-color: #ff9800;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+        .regenerate-btn:hover {
+            background-color: #f57c00;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>HAProxy Domain Manager</h1>
+        <button onclick="regenerateConfig()" class="regenerate-btn">Regenerate HAProxy Config</button>
         <form id="domainForm">
             <div class="form-group">
                 <label for="domain">Domain:</label>
@@ -270,6 +283,83 @@
             }
         }
 
+        async function regenerateConfig() {
+            try {
+                const response = await fetch('/api/regenerate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+
+                if (response.ok) {
+                    showStatus('HAProxy configuration regenerated successfully', 'success');
+            } else {
+                    const data = await response.json();
+                    showStatus('Failed to regenerate configuration: ' + (data.message || 'Unknown error'), 'error');
+            }
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+                console.error('Error regenerating config:', error);
+                }
+        }
+
+        function showStatus(message, type) {
+            const statusDiv = document.createElement('div');
+            statusDiv.className = `status ${type}`;
+            statusDiv.textContent = message;
+            const container = document.querySelector('.container');
+            const domainList = document.querySelector('.domain-list');
+            if (container && domainList) {
+                container.insertBefore(statusDiv, domainList);
+            } else {
+                document.body.appendChild(statusDiv);
+            }
+            setTimeout(() => {
+                if (statusDiv.parentNode) {
+                    statusDiv.remove();
+                }
+            }, 5000);
+        }
+
+        function loadDomains() {
+            fetch('/api/domains')
+                .then(response => response.json())
+                .then(domains => {
+                    const domainList = document.getElementById('domainList');
+                    domainList.innerHTML = '';
+                    domains.forEach(domain => {
+                        const domainDiv = document.createElement('div');
+                        domainDiv.className = 'domain-list-item';
+                        domainDiv.innerHTML = `
+                            <h3>${domain.domain}</h3>
+                            <p>Backend: ${domain.backend_name}</p>
+                        <p>SSL: ${domain.ssl_enabled ? 'Enabled' : 'Disabled'}</p>
+                        <button onclick="requestSSL('${domain.domain}')" class="ssl-btn">
+                                ${domain.ssl_enabled ? 'Renew SSL' : 'Enable SSL'}
+                        </button>
+                            <button onclick="deleteDomain('${domain.domain}')" class="delete-btn">Delete Domain</button>
+                        `;
+                        domainList.appendChild(domainDiv);
+                    });
+                })
+                .catch(error => {
+                    console.error('Error loading domains:', error);
+                    showStatus('Error loading domains: ' + error.message, 'error');
+                });
+            }
+
+        addServerField();
+        loadDomains();
+    </script>
+</body>
+</html>
+                    const domainList = document.getElementById('domainList');
+                    domainList.innerHTML = '';
+                    domains.forEach(domain => {
+                        const domainDiv = document.createElement('div');
+                        domainDiv.className = 'domain-list-item';
+                        domainDiv.innerHTML = `
         function showStatus(message, type) {
             const statusDiv = document.createElement('div');
             statusDiv.className = `status ${type}`;
