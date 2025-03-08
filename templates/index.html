@@ -286,7 +286,7 @@
         async function regenerateConfig() {
             try {
                 const response = await fetch('/api/regenerate', {
-                    method: 'POST',
+                    method: 'GET',
                     headers: {
                         'Content-Type': 'application/json',
                     }
