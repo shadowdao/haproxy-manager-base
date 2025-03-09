@@ -154,7 +154,8 @@ def regenerate_conf():
 @app.route('/api/reload', methods=['GET'])
 def reload_haproxy():
     if is_process_running('haproxy'):
-        subprocess.run(['echo', '"reload"', '|', 'socat', 'stdio', '/tmp/haproxy-cli'])
+        result = subprocess.run(['echo', '"reload"', '|', 'socat', 'stdio', '/tmp/haproxy-cli'],check=True,capture_output=True, text=True, shell=True)
+        print(f"result.stdout, result.stderr, result.returncode")
         return jsonify({'status': 'success'}), 200
     else:
         try:
