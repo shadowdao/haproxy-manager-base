@@ -105,6 +105,7 @@
     <div class="container">
         <h1>HAProxy Domain Manager</h1>
         <button onclick="regenerateConfig()" class="regenerate-btn">Regenerate HAProxy Config</button>
+        <button onclick="reloadHAProxy()" class="regenerate-btn" style="background-color: #2196F3;">Reload HAProxy</button>
         <form id="domainForm">
             <div class="form-group">
                 <label for="domain">Domain:</label>
@@ -236,6 +237,27 @@
                 console.error('Error details:', error);
             }
         });
+
+        async function reloadHAProxy() {
+            try {
+                const response = await fetch('/api/reload', {
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+
+                if (response.ok) {
+                    showStatus('HAProxy reloaded successfully', 'success');
+                } else {
+                    const data = await response.json();
+                    showStatus('Failed to reload HAProxy: ' + (data.message || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+                console.error('Error reloading HAProxy:', error);
+            }
+        }
 
         async function requestSSL(domain) {
             try {

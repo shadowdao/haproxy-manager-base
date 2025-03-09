@@ -150,6 +150,31 @@ def regenerate_conf():
             'status': 'failed',
             'error': str(e)
         }), 500
+    
+@app.route('api/reload', methods=['POST'])
+def reload_haproxy():
+    if is_process_running('haproxy'):
+        subprocess.run(['echo', '"reload"', '|', 'socat', 'stdio', '/tmp/haproxy-cli'])
+    else:
+        try:
+            result = subprocess.run(
+                ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                print("HAProxy started successfully")
+                return jsonify({'status': 'success'}), 200
+            else:
+                print(f"HAProxy start command returned: {result.stdout}")
+                print(f"Error output: {result.stderr}")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to start HAProxy: {e.stdout}\n{e.stderr}")
+            return jsonify({
+            'status': 'failed',
+            'error': f"Failed to start HAProxy: {e.stdout}\n{e.stderr}"
+        }), 500
 
 @app.route('/api/domain', methods=['POST'])
 def add_domain():
