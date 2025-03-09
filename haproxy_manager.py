@@ -155,6 +155,7 @@ def regenerate_conf():
 def reload_haproxy():
     if is_process_running('haproxy'):
         subprocess.run(['echo', '"reload"', '|', 'socat', 'stdio', '/tmp/haproxy-cli'])
+        return jsonify({'status': 'success'}), 200
     else:
         try:
             result = subprocess.run(
