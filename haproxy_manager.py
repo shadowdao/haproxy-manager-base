@@ -151,7 +151,7 @@ def regenerate_conf():
             'error': str(e)
         }), 500
     
-@app.route('/api/reload', methods=['POST'])
+@app.route('/api/reload', methods=['GET'])
 def reload_haproxy():
     if is_process_running('haproxy'):
         subprocess.run(['echo', '"reload"', '|', 'socat', 'stdio', '/tmp/haproxy-cli'])
