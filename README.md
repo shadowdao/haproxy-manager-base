@@ -34,6 +34,17 @@ The HAProxy Manager includes a web-based user interface accessible at port 8000,
 - Domain and backend server management interface
 - SSL certificate status monitoring
 
+__Do Not Expose port 8000 to the open internet__
+If you need to have it exposed to the internet, restrict it to an IP Address via IPTABLES or other firewalls.
+```bash
+# Allow access from the specific IP address (replace 192.168.1.100 with your IP)
+iptables -A INPUT -p tcp --dport 8000 -s {YOUR_PUBLIC_IP} -j ACCEPT
+
+# Drop all other connections to port 8000
+iptables -A INPUT -p tcp --dport 8000 -j DROP
+```
+If you need to be able to access the web interface from multiple locations, I recommend putting it behind an authenticated Proxy like Authentik
+
 ## API Endpoints
 
 ### Health Check
