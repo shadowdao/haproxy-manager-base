@@ -7,7 +7,7 @@ COPY haproxy_manager.py /haproxy/
 COPY scripts /haproxy/scripts
 RUN chmod +x /haproxy/scripts/*
 RUN pip install -r requirements.txt
-RUN echo "0 */12 * * * root test -x /usr/bin/certbot -a \! -d /run/systemd/system && perl -e 'sleep int(rand(43200))' && certbot -q renew --no-random-sleep-on-renew" > /var/spool/cron/crontabs/root
+RUN echo "0 */12 * * * root test -x /usr/bin/certbot && /usr/bin/certbot -q renew" > /var/spool/cron/crontabs/root
 EXPOSE 80 443 8000
 # Add health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
