@@ -1,18 +1,66 @@
 import sqlite3
 import os
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_file
 from pathlib import Path
 import subprocess
 import jinja2
 import socket
 import psutil
+import functools
+import logging
+from datetime import datetime
+import json
 
 app = Flask(__name__)
 
+# Configuration
 DB_FILE = '/etc/haproxy/haproxy_config.db'
 TEMPLATE_DIR = Path('templates')
 HAPROXY_CONFIG_PATH = '/etc/haproxy/haproxy.cfg'
 SSL_CERTS_DIR = '/etc/haproxy/certs'
+API_KEY = os.environ.get('HAPROXY_API_KEY')  # Optional API key for authentication
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/var/log/haproxy-manager.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def require_api_key(f):
+    """Decorator to require API key authentication if API_KEY is set"""
+    @functools.wraps(f)
+    def decorated_function(*args, **kwargs):
+        if API_KEY:
+            auth_header = request.headers.get('Authorization')
+            if not auth_header or auth_header != f'Bearer {API_KEY}':
+                return jsonify({'error': 'Unauthorized - Invalid or missing API key'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def log_operation(operation, success=True, error_message=None):
+    """Log operations for monitoring and alerting"""
+    log_entry = {
+        'timestamp': datetime.now().isoformat(),
+        'operation': operation,
+        'success': success,
+        'error': error_message
+    }
+    
+    if success:
+        logger.info(f"Operation {operation} completed successfully")
+    else:
+        logger.error(f"Operation {operation} failed: {error_message}")
+        # Here you could add additional alerting (email, webhook, etc.)
+        # For now, we'll just log to a dedicated error log
+        with open('/var/log/haproxy-manager-errors.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+    
+    return log_entry
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -102,6 +150,7 @@ template_loader = jinja2.FileSystemLoader(TEMPLATE_DIR)
 template_env = jinja2.Environment(loader=template_loader)
 
 @app.route('/api/domains', methods=['GET'])
+@require_api_key
 def get_domains():
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -113,8 +162,10 @@ def get_domains():
             LEFT JOIN backends b ON d.id = b.domain_id
         ''')
         domains = [dict(row) for row in cursor.fetchall()]
+        log_operation('get_domains', True)
         return jsonify(domains)
     except Exception as e:
+        log_operation('get_domains', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
@@ -141,27 +192,32 @@ def health_check():
         }), 500
 
 @app.route('/api/regenerate', methods=['GET'])
+@require_api_key
 def regenerate_conf():
     try:
         generate_config()
+        log_operation('regenerate_config', True)
         return jsonify({'status': 'success'}), 200
     except Exception as e:
+        log_operation('regenerate_config', False, str(e))
         return jsonify({
             'status': 'failed',
             'error': str(e)
         }), 500
     
 @app.route('/api/reload', methods=['GET'])
+@require_api_key
 def reload_haproxy():
-    if is_process_running('haproxy'):
-        # Use a proper shell command string when shell=True is set
-        result = subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli',
-                               check=True, capture_output=True, text=True, shell=True)
-        print(f"Reload result: {result.stdout}, {result.stderr}, {result.returncode}")
-        return jsonify({'status': 'success'}), 200
-    else:
-        # Start HAProxy if it's not running
-        try:
+    try:
+        if is_process_running('haproxy'):
+            # Use a proper shell command string when shell=True is set
+            result = subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli',
+                                   check=True, capture_output=True, text=True, shell=True)
+            print(f"Reload result: {result.stdout}, {result.stderr}, {result.returncode}")
+            log_operation('reload_haproxy', True)
+            return jsonify({'status': 'success'}), 200
+        else:
+            # Start HAProxy if it's not running
             result = subprocess.run(
                 ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
                 check=True,
@@ -170,18 +226,21 @@ def reload_haproxy():
             )
             if result.returncode == 0:
                 print("HAProxy started successfully")
+                log_operation('start_haproxy', True)
                 return jsonify({'status': 'success'}), 200
             else:
-                print(f"HAProxy start command returned: {result.stdout}")
-                print(f"Error output: {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to start HAProxy: {e.stdout}\n{e.stderr}")
-            return jsonify({
-            'status': 'failed',
-            'error': f"Failed to start HAProxy: {e.stdout}\n{e.stderr}"
-        }), 500
+                error_msg = f"HAProxy start command returned: {result.stdout}\nError output: {result.stderr}"
+                print(error_msg)
+                log_operation('start_haproxy', False, error_msg)
+                return jsonify({'status': 'failed', 'error': error_msg}), 500
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Failed to start HAProxy: {e.stdout}\n{e.stderr}"
+        print(error_msg)
+        log_operation('reload_haproxy', False, error_msg)
+        return jsonify({'status': 'failed', 'error': error_msg}), 500
 
 @app.route('/api/domain', methods=['POST'])
+@require_api_key
 def add_domain():
     data = request.get_json()
     domain = data.get('domain')
@@ -189,77 +248,257 @@ def add_domain():
     backend_name = data.get('backend_name')
     servers = data.get('servers', [])
 
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
+    if not domain or not backend_name:
+        log_operation('add_domain', False, 'Domain and backend_name are required')
+        return jsonify({'status': 'error', 'message': 'Domain and backend_name are required'}), 400
 
-        # Add domain
-        cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override))
-        domain_id = cursor.lastrowid
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
 
-        # Add backend
-        cursor.execute('INSERT INTO backends (name, domain_id) VALUES (?, ?)',
-                      (backend_name, domain_id))
-        backend_id = cursor.lastrowid
+            # Add domain
+            cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override))
+            domain_id = cursor.lastrowid
 
-        for server in servers:
-            cursor.execute('''
-                INSERT INTO backend_servers
-                (backend_id, server_name, server_address, server_port, server_options)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (backend_id, server['name'], server['address'],
-                 server['port'], server.get('options')))
-    # Close cursor and connection
-    cursor.close()
-    conn.close()
-    generate_config()
-    return jsonify({'status': 'success', 'domain_id': domain_id})
+            # Add backend
+            cursor.execute('INSERT INTO backends (name, domain_id) VALUES (?, ?)',
+                          (backend_name, domain_id))
+            backend_id = cursor.lastrowid
+
+            for server in servers:
+                cursor.execute('''
+                    INSERT INTO backend_servers
+                    (backend_id, server_name, server_address, server_port, server_options)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (backend_id, server['name'], server['address'],
+                     server['port'], server.get('options')))
+        # Close cursor and connection
+        cursor.close()
+        conn.close()
+        generate_config()
+        log_operation('add_domain', True, f'Domain {domain} added successfully')
+        return jsonify({'status': 'success', 'domain_id': domain_id})
+    except Exception as e:
+        log_operation('add_domain', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api/ssl', methods=['POST'])
+@require_api_key
 def request_ssl():
     data = request.get_json()
     domain = data.get('domain')
 
-    # Request Let's Encrypt certificate
-    result = subprocess.run([
-        'certbot', 'certonly', '-n', '--standalone',
-        '--preferred-challenges', 'http', '--http-01-port=8688',
-        '-d', domain
-    ])
+    if not domain:
+        log_operation('request_ssl', False, 'Domain not provided')
+        return jsonify({'status': 'error', 'message': 'Domain is required'}), 400
 
-    if result.returncode == 0:
-        # Combine cert files and copy to HAProxy certs directory
-        cert_path = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
-        key_path = f'/etc/letsencrypt/live/{domain}/privkey.pem'
-        combined_path = f'{SSL_CERTS_DIR}/{domain}.pem'
+    try:
+        # Request Let's Encrypt certificate
+        result = subprocess.run([
+            'certbot', 'certonly', '-n', '--standalone',
+            '--preferred-challenges', 'http', '--http-01-port=8688',
+            '-d', domain
+        ], capture_output=True, text=True)
 
-        with open(combined_path, 'w') as combined:
-            subprocess.run(['cat', cert_path, key_path], stdout=combined)
+        if result.returncode == 0:
+            # Combine cert files and copy to HAProxy certs directory
+            cert_path = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
+            key_path = f'/etc/letsencrypt/live/{domain}/privkey.pem'
+            combined_path = f'{SSL_CERTS_DIR}/{domain}.pem'
 
-        # Update database
+            with open(combined_path, 'w') as combined:
+                subprocess.run(['cat', cert_path, key_path], stdout=combined)
+
+            # Update database
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE domains
+                    SET ssl_enabled = 1, ssl_cert_path = ?
+                    WHERE domain = ?
+                ''', (combined_path, domain))
+            # Close cursor and connection
+            cursor.close()
+            conn.close()
+            generate_config()
+            log_operation('request_ssl', True, f'SSL certificate obtained for {domain}')
+            return jsonify({'status': 'success'})
+        else:
+            error_msg = f'Failed to obtain SSL certificate: {result.stderr}'
+            log_operation('request_ssl', False, error_msg)
+            return jsonify({'status': 'error', 'message': error_msg}), 500
+    except Exception as e:
+        log_operation('request_ssl', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/certificates/renew', methods=['POST'])
+@require_api_key
+def renew_certificates():
+    """Renew all certificates and reload HAProxy"""
+    try:
+        # Run certbot renew
+        result = subprocess.run([
+            'certbot', 'renew', '--quiet'
+        ], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            # Check if any certificates were renewed
+            if 'Congratulations' in result.stdout or 'renewed' in result.stdout:
+                # Update combined certificates for HAProxy
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT domain, ssl_cert_path FROM domains WHERE ssl_enabled = 1')
+                    domains = cursor.fetchall()
+                    
+                    for domain, cert_path in domains:
+                        if cert_path and os.path.exists(cert_path):
+                            # Recreate combined certificate
+                            letsencrypt_cert = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
+                            letsencrypt_key = f'/etc/letsencrypt/live/{domain}/privkey.pem'
+                            
+                            if os.path.exists(letsencrypt_cert) and os.path.exists(letsencrypt_key):
+                                with open(cert_path, 'w') as combined:
+                                    subprocess.run(['cat', letsencrypt_cert, letsencrypt_key], stdout=combined)
+                
+                # Regenerate config and reload HAProxy
+                generate_config()
+                reload_result = subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli',
+                                             capture_output=True, text=True, shell=True)
+                
+                if reload_result.returncode == 0:
+                    log_operation('renew_certificates', True, 'Certificates renewed and HAProxy reloaded')
+                    return jsonify({'status': 'success', 'message': 'Certificates renewed and HAProxy reloaded'})
+                else:
+                    error_msg = f'Certificates renewed but HAProxy reload failed: {reload_result.stderr}'
+                    log_operation('renew_certificates', False, error_msg)
+                    return jsonify({'status': 'partial_success', 'message': error_msg}), 500
+            else:
+                log_operation('renew_certificates', True, 'No certificates needed renewal')
+                return jsonify({'status': 'success', 'message': 'No certificates needed renewal'})
+        else:
+            error_msg = f'Certificate renewal failed: {result.stderr}'
+            log_operation('renew_certificates', False, error_msg)
+            return jsonify({'status': 'error', 'message': error_msg}), 500
+    except Exception as e:
+        log_operation('renew_certificates', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/certificates/<domain>/download', methods=['GET'])
+@require_api_key
+def download_certificate(domain):
+    """Download the combined certificate file for a domain"""
+    try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE domains
-                SET ssl_enabled = 1, ssl_cert_path = ?
-                WHERE domain = ?
-            ''', (combined_path, domain))
-        # Close cursor and connection
-        cursor.close()
-        conn.close()
-        generate_config()
-        return jsonify({'status': 'success'})
-    return jsonify({'status': 'error', 'message': 'Failed to obtain SSL certificate'})
+            cursor.execute('SELECT ssl_cert_path FROM domains WHERE domain = ? AND ssl_enabled = 1', (domain,))
+            result = cursor.fetchone()
+            
+            if not result or not result[0]:
+                return jsonify({'status': 'error', 'message': 'Certificate not found for domain'}), 404
+            
+            cert_path = result[0]
+            if not os.path.exists(cert_path):
+                return jsonify({'status': 'error', 'message': 'Certificate file not found'}), 404
+            
+            log_operation('download_certificate', True, f'Certificate downloaded for {domain}')
+            return send_file(cert_path, as_attachment=True, download_name=f'{domain}.pem')
+    except Exception as e:
+        log_operation('download_certificate', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/certificates/<domain>/key', methods=['GET'])
+@require_api_key
+def download_private_key(domain):
+    """Download the private key for a domain"""
+    try:
+        key_path = f'/etc/letsencrypt/live/{domain}/privkey.pem'
+        if not os.path.exists(key_path):
+            return jsonify({'status': 'error', 'message': 'Private key not found for domain'}), 404
+        
+        log_operation('download_private_key', True, f'Private key downloaded for {domain}')
+        return send_file(key_path, as_attachment=True, download_name=f'{domain}_key.pem')
+    except Exception as e:
+        log_operation('download_private_key', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/certificates/<domain>/cert', methods=['GET'])
+@require_api_key
+def download_cert_only(domain):
+    """Download only the certificate (without private key) for a domain"""
+    try:
+        cert_path = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
+        if not os.path.exists(cert_path):
+            return jsonify({'status': 'error', 'message': 'Certificate not found for domain'}), 404
+        
+        log_operation('download_cert_only', True, f'Certificate (only) downloaded for {domain}')
+        return send_file(cert_path, as_attachment=True, download_name=f'{domain}_cert.pem')
+    except Exception as e:
+        log_operation('download_cert_only', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/certificates/status', methods=['GET'])
+@require_api_key
+def get_certificate_status():
+    """Get status of all certificates including expiration dates"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT domain, ssl_enabled, ssl_cert_path FROM domains WHERE ssl_enabled = 1')
+            domains = cursor.fetchall()
+            
+            cert_status = []
+            for domain, ssl_enabled, cert_path in domains:
+                status = {
+                    'domain': domain,
+                    'ssl_enabled': bool(ssl_enabled),
+                    'cert_path': cert_path,
+                    'expires': None,
+                    'days_until_expiry': None
+                }
+                
+                if cert_path and os.path.exists(cert_path):
+                    # Check certificate expiration using openssl
+                    try:
+                        result = subprocess.run([
+                            'openssl', 'x509', '-in', cert_path, '-noout', '-dates'
+                        ], capture_output=True, text=True)
+                        
+                        if result.returncode == 0:
+                            # Parse the notAfter date
+                            for line in result.stdout.split('\n'):
+                                if 'notAfter=' in line:
+                                    expiry_date_str = line.split('=')[1].strip()
+                                    from datetime import datetime
+                                    expiry_date = datetime.strptime(expiry_date_str, '%b %d %H:%M:%S %Y %Z')
+                                    status['expires'] = expiry_date.isoformat()
+                                    
+                                    # Calculate days until expiry
+                                    days_until = (expiry_date - datetime.now()).days
+                                    status['days_until_expiry'] = days_until
+                                    break
+                    except Exception as e:
+                        status['error'] = str(e)
+                
+                cert_status.append(status)
+            
+            log_operation('get_certificate_status', True)
+            return jsonify({'certificates': cert_status})
+    except Exception as e:
+        log_operation('get_certificate_status', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/domain', methods=['DELETE'])
+@require_api_key
 def remove_domain():
     data = request.get_json()
     domain = data.get('domain')
 
     if not domain:
+        log_operation('remove_domain', False, 'Domain is required')
         return jsonify({'status': 'error', 'message': 'Domain is required'}), 400
 
     try:
@@ -271,6 +510,7 @@ def remove_domain():
             domain_result = cursor.fetchone()
 
             if not domain_result:
+                log_operation('remove_domain', False, f'Domain {domain} not found')
                 return jsonify({'status': 'error', 'message': 'Domain not found'}), 404
 
             domain_id = domain_result[0]
@@ -301,9 +541,11 @@ def remove_domain():
         # Regenerate HAProxy config
         generate_config()
 
+        log_operation('remove_domain', True, f'Domain {domain} removed successfully')
         return jsonify({'status': 'success', 'message': 'Domain configuration removed'})
 
     except Exception as e:
+        log_operation('remove_domain', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 def generate_config():
@@ -349,7 +591,7 @@ def generate_config():
 # Add domain configurations
         for domain in domains:
             if not domain['backend_name']:
-                print(f"Skipping domain {domain['domain']} - no backend name")  # Debug log
+                logger.warning(f"Skipping domain {domain['domain']} - no backend name")
                 continue
 
             # Add domain ACL
@@ -359,9 +601,9 @@ def generate_config():
                     name=domain['backend_name']
                 )
                 config_acls.append(domain_acl)
-                print(f"Added ACL for domain: {domain['domain']}")  # Debug log
+                logger.info(f"Added ACL for domain: {domain['domain']}")
             except Exception as e:
-                print(f"Error generating domain ACL for {domain['domain']}: {e}")
+                logger.error(f"Error generating domain ACL for {domain['domain']}: {e}")
                 continue
 
             # Add backend configuration
@@ -372,11 +614,11 @@ def generate_config():
                 servers = [dict(server) for server in cursor.fetchall()]
 
                 if not servers:
-                    print(f"No servers found for backend {domain['backend_name']}")  # Debug log
+                    logger.warning(f"No servers found for backend {domain['backend_name']}")
                     continue
 
                 if domain['template_override'] is not None:
-                    print(f"Template Override is set to: {domain['template_override']}")
+                    logger.info(f"Template Override is set to: {domain['template_override']}")
                     template_file = domain['template_override'] + ".tpl"
                     backend_block = template_env.get_template(template_file).render(
                         name=domain['backend_name'],
@@ -390,9 +632,9 @@ def generate_config():
                         servers=servers
                     )
                 config_backends.append(backend_block)
-                print(f"Added backend block for: {domain['backend_name']}")  # Debug log
+                logger.info(f"Added backend block for: {domain['backend_name']}")
             except Exception as e:
-                print(f"Error generating backend block for {domain['backend_name']}: {e}")
+                logger.error(f"Error generating backend block for {domain['backend_name']}: {e}")
                 continue
 
         # Add ACLS
@@ -406,17 +648,25 @@ def generate_config():
         temp_config_path = "/etc/haproxy/haproxy.cfg"
 
         config_content = '\n'.join(config_parts)
-        print("Final config content:", config_content)  # Debug log
+        logger.debug("Generated HAProxy configuration")
 
         # Write complete configuration to tmp
         # Check HAProxy Configuration, and reload if it works
         with open(temp_config_path, 'w') as f:
             f.write(config_content)
-        result = subprocess.run(['haproxy', '-c', '-f', temp_config_path], capture_output=True)
+        result = subprocess.run(['haproxy', '-c', '-f', temp_config_path], capture_output=True, text=True)
         if result.returncode == 0:
-            print("HAProxy configuration check passed")
+            logger.info("HAProxy configuration check passed")
             if is_process_running('haproxy'):
-                subprocess.run(['echo', '"reload"', '|', 'socat', 'stdio', '/tmp/haproxy-cli'])
+                reload_result = subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli',
+                                             capture_output=True, text=True, shell=True)
+                if reload_result.returncode == 0:
+                    logger.info("HAProxy reloaded successfully")
+                    log_operation('generate_config', True, 'Configuration generated and HAProxy reloaded')
+                else:
+                    error_msg = f"HAProxy reload failed: {reload_result.stderr}"
+                    logger.error(error_msg)
+                    log_operation('generate_config', False, error_msg)
             else:
                 try:
                     result = subprocess.run(
@@ -426,15 +676,26 @@ def generate_config():
                         text=True
                     )
                     if result.returncode == 0:
-                        print("HAProxy started successfully")
+                        logger.info("HAProxy started successfully")
+                        log_operation('generate_config', True, 'Configuration generated and HAProxy started')
                     else:
-                        print(f"HAProxy start command returned: {result.stdout}")
-                        print(f"Error output: {result.stderr}")
+                        error_msg = f"HAProxy start command returned: {result.stdout}\nError output: {result.stderr}"
+                        logger.error(error_msg)
+                        log_operation('generate_config', False, error_msg)
                 except subprocess.CalledProcessError as e:
-                    print(f"Failed to start HAProxy: {e.stdout}\n{e.stderr}")
+                    error_msg = f"Failed to start HAProxy: {e.stdout}\n{e.stderr}"
+                    logger.error(error_msg)
+                    log_operation('generate_config', False, error_msg)
                     raise
+        else:
+            error_msg = f"HAProxy configuration check failed: {result.stderr}"
+            logger.error(error_msg)
+            log_operation('generate_config', False, error_msg)
+            raise Exception(error_msg)
     except Exception as e:
-        print(f"Error generating config: {e}")
+        error_msg = f"Error generating config: {e}"
+        logger.error(error_msg)
+        log_operation('generate_config', False, error_msg)
         import traceback
         traceback.print_exc()
         raise
@@ -449,12 +710,16 @@ def start_haproxy():
                 text=True
             )
             if result.returncode == 0:
-                print("HAProxy started successfully")
+                logger.info("HAProxy started successfully")
+                log_operation('start_haproxy', True, 'HAProxy started successfully')
             else:
-                print(f"HAProxy start command returned: {result.stdout}")
-                print(f"Error output: {result.stderr}")
+                error_msg = f"HAProxy start command returned: {result.stdout}\nError output: {result.stderr}"
+                logger.error(error_msg)
+                log_operation('start_haproxy', False, error_msg)
         except subprocess.CalledProcessError as e:
-            print(f"Failed to start HAProxy: {e.stdout}\n{e.stderr}")
+            error_msg = f"Failed to start HAProxy: {e.stdout}\n{e.stderr}"
+            logger.error(error_msg)
+            log_operation('start_haproxy', False, error_msg)
             raise
 
 if __name__ == '__main__':
