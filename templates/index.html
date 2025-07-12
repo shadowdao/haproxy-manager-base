@@ -346,16 +346,34 @@
 
         function loadDomains() {
             fetch('/api/domains')
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    return response.json();
+                })
                 .then(domains => {
                     const domainList = document.getElementById('domainList');
                     domainList.innerHTML = '';
+                    
+                    // Ensure domains is an array
+                    if (!Array.isArray(domains)) {
+                        console.error('Expected array of domains, got:', typeof domains, domains);
+                        showStatus('Error: Invalid response format from server', 'error');
+                        return;
+                    }
+                    
+                    if (domains.length === 0) {
+                        domainList.innerHTML = '<div class="domain-list-item"><p>No domains configured yet. Add your first domain above.</p></div>';
+                        return;
+                    }
+                    
                     domains.forEach(domain => {
                         const domainDiv = document.createElement('div');
                         domainDiv.className = 'domain-list-item';
                         domainDiv.innerHTML = `
                             <h3>${domain.domain}</h3>
-                            <p>Backend: ${domain.backend_name}</p>
+                            <p>Backend: ${domain.backend_name || 'Not configured'}</p>
                         <p>SSL: ${domain.ssl_enabled ? 'Enabled' : 'Disabled'}</p>
                         <button onclick="requestSSL('${domain.domain}')" class="ssl-btn">
                                 ${domain.ssl_enabled ? 'Renew SSL' : 'Enable SSL'}

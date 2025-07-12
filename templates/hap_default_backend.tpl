@@ -7,6 +7,5 @@ backend default-backend
     http-request set-header X-Forwarded-For %[src]
     http-request set-header X-Real-IP %[src]
     
-    # Serve the default page HTML response
-    http-response set-header Content-Type text/html
-    http-response set-body "{{ default_page_content }}" 
+    # Serve the default page HTML response using a local server
+    server default-page 127.0.0.1:8080 

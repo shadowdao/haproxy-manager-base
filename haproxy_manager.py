@@ -286,6 +286,17 @@ def add_domain():
 def index():
     return render_template('index.html')
 
+@app.route('/default-page')
+def default_page():
+    """Serve the default page for unmatched domains"""
+    admin_email = os.environ.get('HAPROXY_ADMIN_EMAIL', 'admin@example.com')
+    
+    return render_template('default_page.html',
+        page_title=os.environ.get('HAPROXY_DEFAULT_PAGE_TITLE', 'Site Not Configured'),
+        main_message=os.environ.get('HAPROXY_DEFAULT_MAIN_MESSAGE', 'This domain has not been configured yet. Please contact your system administrator to set up this website.'),
+        secondary_message=os.environ.get('HAPROXY_DEFAULT_SECONDARY_MESSAGE', 'If you believe this is an error, please check the domain name and try again.')
+    )
+
 @app.route('/api/ssl', methods=['POST'])
 @require_api_key
 def request_ssl():
@@ -789,18 +800,7 @@ def generate_config():
         config_parts.append(letsencrypt_backend)
         # Add Default Backend
         try:
-            # Render the default page template with customizable content
-            default_page_template = template_env.get_template('default_page.html')
-            default_page_content = default_page_template.render(
-                page_title=os.environ.get('HAPROXY_DEFAULT_PAGE_TITLE', 'Site Not Configured'),
-                main_message=os.environ.get('HAPROXY_DEFAULT_MAIN_MESSAGE', 'This domain has not been configured yet. Please contact your system administrator to set up this website.'),
-                secondary_message=os.environ.get('HAPROXY_DEFAULT_SECONDARY_MESSAGE', 'If you believe this is an error, please check the domain name and try again.')
-            )
-            default_page_content = default_page_content.replace('"', '\\"').replace('\n', '\\n')
-            
-            default_backend = template_env.get_template('hap_default_backend.tpl').render(
-                default_page_content=default_page_content
-            )
+            default_backend = template_env.get_template('hap_default_backend.tpl').render()
             config_parts.append(default_backend)
         except Exception as e:
             logger.error(f"Error generating default backend: {e}")
@@ -809,8 +809,7 @@ def generate_config():
 backend default-backend
     mode http
     option http-server-close
-    http-response set-header Content-Type text/html
-    http-response set-body "<!DOCTYPE html><html><head><title>Site Not Configured</title></head><body><h1>Site Not Configured</h1><p>This domain has not been configured yet.</p></body></html>"'''
+    server default-page 127.0.0.1:8080'''
             config_parts.append(fallback_backend)
         # Add Backends
         config_parts.append('\n' .join(config_backends) + '\n')
@@ -898,4 +897,32 @@ if __name__ == '__main__':
     generate_self_signed_cert(SSL_CERTS_DIR)
     start_haproxy()
     certbot_register()
+    
+    # Run Flask app on port 8000 for API and port 8080 for default page
+    from threading import Thread
+    
+    def run_default_page_server():
+        """Run a separate Flask app on port 8080 for the default page"""
+        from flask import Flask, render_template
+        default_app = Flask(__name__)
+        default_app.template_folder = 'templates'
+        
+        @default_app.route('/')
+        def default_page():
+            """Serve the default page for unmatched domains"""
+            admin_email = os.environ.get('HAPROXY_ADMIN_EMAIL', 'admin@example.com')
+            
+            return render_template('default_page.html',
+                page_title=os.environ.get('HAPROXY_DEFAULT_PAGE_TITLE', 'Site Not Configured'),
+                main_message=os.environ.get('HAPROXY_DEFAULT_MAIN_MESSAGE', 'This domain has not been configured yet. Please contact your system administrator to set up this website.'),
+                secondary_message=os.environ.get('HAPROXY_DEFAULT_SECONDARY_MESSAGE', 'If you believe this is an error, please check the domain name and try again.')
+            )
+        
+        default_app.run(host='0.0.0.0', port=8080)
+    
+    # Start the default page server in a separate thread
+    default_server_thread = Thread(target=run_default_page_server, daemon=True)
+    default_server_thread.start()
+    
+    # Run the main API server
     app.run(host='0.0.0.0', port=8000)
