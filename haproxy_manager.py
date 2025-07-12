@@ -872,6 +872,46 @@ backend default-backend
 def start_haproxy():
     if not is_process_running('haproxy'):
         try:
+            # First check if the config file exists and is valid
+            if not os.path.exists(HAPROXY_CONFIG_PATH):
+                logger.warning("HAProxy config file not found, skipping HAProxy start")
+                return
+            
+            # Test the configuration before starting
+            test_result = subprocess.run(
+                ['haproxy', '-c', '-f', HAPROXY_CONFIG_PATH],
+                capture_output=True,
+                text=True
+            )
+            
+            if test_result.returncode != 0:
+                logger.error(f"HAProxy configuration is invalid: {test_result.stderr}")
+                logger.warning("Attempting to regenerate configuration...")
+                
+                # Try to regenerate the configuration
+                try:
+                    generate_config()
+                    logger.info("Configuration regenerated successfully")
+                except Exception as gen_error:
+                    logger.error(f"Failed to regenerate configuration: {gen_error}")
+                    logger.warning("HAProxy will not start due to configuration errors")
+                    log_operation('start_haproxy', False, f"Invalid config: {test_result.stderr}")
+                    return
+                
+                # Test the configuration again
+                test_result = subprocess.run(
+                    ['haproxy', '-c', '-f', HAPROXY_CONFIG_PATH],
+                    capture_output=True,
+                    text=True
+                )
+                
+                if test_result.returncode != 0:
+                    logger.error(f"HAProxy configuration is still invalid after regeneration: {test_result.stderr}")
+                    logger.warning("HAProxy will not start due to configuration errors")
+                    log_operation('start_haproxy', False, f"Invalid config: {test_result.stderr}")
+                    return
+            
+            # Configuration is valid, start HAProxy
             result = subprocess.run(
                 ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
                 check=True,
@@ -889,12 +929,27 @@ def start_haproxy():
             error_msg = f"Failed to start HAProxy: {e.stdout}\n{e.stderr}"
             logger.error(error_msg)
             log_operation('start_haproxy', False, error_msg)
-            raise
+            # Don't raise the exception - let the container continue without HAProxy
+            logger.warning("Container will continue without HAProxy running")
+        except Exception as e:
+            error_msg = f"Unexpected error starting HAProxy: {e}"
+            logger.error(error_msg)
+            log_operation('start_haproxy', False, error_msg)
+            logger.warning("Container will continue without HAProxy running")
 
 if __name__ == '__main__':
     init_db()
     certbot_register()
     generate_self_signed_cert(SSL_CERTS_DIR)
+    
+    # Always regenerate config before starting HAProxy to ensure compatibility
+    try:
+        generate_config()
+        logger.info("Configuration generated successfully before startup")
+    except Exception as e:
+        logger.error(f"Failed to generate initial configuration: {e}")
+        # Continue anyway, HAProxy will fail to start but the service will be available
+    
     start_haproxy()
     certbot_register()
     
