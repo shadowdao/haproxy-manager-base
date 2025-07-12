@@ -23,7 +23,19 @@ This document summarizes the new features and improvements added to the HAProxy 
   - Returns detailed status of renewal process
 - **Error Handling**: Comprehensive error logging and status reporting
 
-### 3. Certificate Download Endpoints
+### 3. Certificate Request API
+- **Endpoint**: `POST /api/certificates/request`
+- **Functionality**:
+  - Request certificate generation for one or more domains
+  - Support for multiple domains in a single request
+  - Optional www subdomain inclusion
+  - Force renewal option
+  - Automatic domain addition to database if not exists
+  - Batch processing with detailed results
+- **Use Case**: Allow other services to request certificate generation through the HAProxy service
+- **Response**: Detailed status for each domain with success/failure information
+
+### 4. Certificate Download Endpoints
 - **Endpoints**:
   - `GET /api/certificates/<domain>/download` - Combined certificate (cert + key)
   - `GET /api/certificates/<domain>/key` - Private key only
@@ -31,7 +43,7 @@ This document summarizes the new features and improvements added to the HAProxy 
 - **Use Case**: Allow other services to securely download certificates for their own use
 - **Security**: All endpoints require API key authentication
 
-### 4. Certificate Status Monitoring
+### 5. Certificate Status Monitoring
 - **Endpoint**: `GET /api/certificates/status`
 - **Functionality**:
   - Lists all certificates with expiration dates
@@ -39,7 +51,7 @@ This document summarizes the new features and improvements added to the HAProxy 
   - Provides certificate file paths
   - Enables proactive certificate management
 
-### 5. Comprehensive Error Logging and Alerting
+### 6. Comprehensive Error Logging and Alerting
 - **Logging System**:
   - Structured JSON logging for all operations
   - Separate error log file (`/var/log/haproxy-manager-errors.log`)
@@ -143,6 +155,7 @@ This document summarizes the new features and improvements added to the HAProxy 
 - `GET /api/reload` - Reload HAProxy
 
 ### New Endpoints
+- `POST /api/certificates/request` - Request certificate generation for domains
 - `POST /api/certificates/renew` - Renew all certificates
 - `GET /api/certificates/status` - Get certificate status
 - `GET /api/certificates/<domain>/download` - Download combined certificate

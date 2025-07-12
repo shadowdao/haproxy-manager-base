@@ -205,6 +205,47 @@ Authorization: Bearer your-api-key
 
 ## New Certificate Management Endpoints
 
+### Request Certificate Generation
+Request certificate generation for one or more domains.
+
+```bash
+POST /api/certificates/request
+Authorization: Bearer your-api-key
+Content-Type: application/json
+
+{
+    "domains": ["example.com", "api.example.com"],
+    "force_renewal": false,
+    "include_www": true
+}
+
+# Response
+{
+    "status": "completed",
+    "summary": {
+        "total": 2,
+        "successful": 2,
+        "failed": 0
+    },
+    "results": [
+        {
+            "domain": "example.com",
+            "status": "success",
+            "message": "Certificate obtained successfully",
+            "cert_path": "/etc/haproxy/certs/example.com.pem",
+            "domains_covered": ["example.com", "www.example.com"]
+        },
+        {
+            "domain": "api.example.com",
+            "status": "success",
+            "message": "Certificate obtained successfully",
+            "cert_path": "/etc/haproxy/certs/api.example.com.pem",
+            "domains_covered": ["api.example.com"]
+        }
+    ]
+}
+```
+
 ### Renew All Certificates
 Trigger renewal of all Let's Encrypt certificates and reload HAProxy.
 
@@ -320,6 +361,16 @@ curl -X POST http://localhost:8000/api/ssl \
 # Renew certificates
 curl -X POST http://localhost:8000/api/certificates/renew \
   -H "Authorization: Bearer your-secure-api-key-here"
+
+# Request certificate generation for another service
+curl -X POST http://localhost:8000/api/certificates/request \
+  -H "Authorization: Bearer your-secure-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domains": ["api.example.com"],
+    "force_renewal": false,
+    "include_www": false
+  }'
 
 # Download certificate for another service
 curl -H "Authorization: Bearer your-secure-api-key-here" \
