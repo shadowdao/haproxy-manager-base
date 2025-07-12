@@ -28,6 +28,7 @@ docker run -d -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt 
 - **NEW**: Certificate download endpoints for other services
 - **NEW**: Comprehensive error logging and alerting system
 - **NEW**: Certificate status monitoring with expiration dates
+- **NEW**: Default backend page for unmatched domains
 
 ## Security
 
@@ -326,6 +327,34 @@ tail -f /var/log/haproxy-manager-errors.log
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HAPROXY_API_KEY` | API key for authentication (optional) | None (no auth) |
+| `HAPROXY_DEFAULT_PAGE_TITLE` | Title for the default page | Site Not Configured |
+| `HAPROXY_DEFAULT_MAIN_MESSAGE` | Main message on the default page | This domain has not been configured yet. Please contact your system administrator to set up this website. |
+| `HAPROXY_DEFAULT_SECONDARY_MESSAGE` | Secondary message on the default page | If you believe this is an error, please check the domain name and try again. |
+
+## Default Backend Configuration
+
+When a domain is accessed that hasn't been configured in HAProxy, the system will serve a default page instead of showing an error. This default page:
+
+- Informs visitors that the site is not configured
+- Displays the domain name and current timestamp
+- Is fully customizable through environment variables
+
+### Customizing the Default Page
+
+You can customize the default page by setting environment variables:
+
+```bash
+docker run -d \
+  -p 80:80 -p 443:443 -p 8000:8000 \
+  -v lets-encrypt:/etc/letsencrypt \
+  -v haproxy:/etc/haproxy \
+  -e HAPROXY_API_KEY=your-secure-api-key-here \
+  -e HAPROXY_DEFAULT_PAGE_TITLE="Website Coming Soon" \
+  -e HAPROXY_DEFAULT_MAIN_MESSAGE="This website is currently under construction and will be available soon." \
+  -e HAPROXY_DEFAULT_SECONDARY_MESSAGE="Please check back later or contact us for more information." \
+  --name haproxy-manager \
+  repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
+```
 
 ## Example Usage
 

@@ -728,7 +728,12 @@ def generate_config():
         config_parts.append(letsencrypt_acl)
         config_acls = []
         config_backends = []
-# Add domain configurations
+        
+        # Add default backend rule (will be used when no domain matches)
+        default_rule = "    # Default backend for unmatched domains\n    default_backend default-backend\n"
+        config_parts.append(default_rule)
+        
+        # Add domain configurations
         for domain in domains:
             if not domain['backend_name']:
                 logger.warning(f"Skipping domain {domain['domain']} - no backend name")
@@ -782,6 +787,31 @@ def generate_config():
         # Add LetsEncrypt Backend
         letsencrypt_backend = template_env.get_template('hap_letsencrypt_backend.tpl').render()
         config_parts.append(letsencrypt_backend)
+        # Add Default Backend
+        try:
+            # Render the default page template with customizable content
+            default_page_template = template_env.get_template('default_page.html')
+            default_page_content = default_page_template.render(
+                page_title=os.environ.get('HAPROXY_DEFAULT_PAGE_TITLE', 'Site Not Configured'),
+                main_message=os.environ.get('HAPROXY_DEFAULT_MAIN_MESSAGE', 'This domain has not been configured yet. Please contact your system administrator to set up this website.'),
+                secondary_message=os.environ.get('HAPROXY_DEFAULT_SECONDARY_MESSAGE', 'If you believe this is an error, please check the domain name and try again.')
+            )
+            default_page_content = default_page_content.replace('"', '\\"').replace('\n', '\\n')
+            
+            default_backend = template_env.get_template('hap_default_backend.tpl').render(
+                default_page_content=default_page_content
+            )
+            config_parts.append(default_backend)
+        except Exception as e:
+            logger.error(f"Error generating default backend: {e}")
+            # Fallback to a simple default backend
+            fallback_backend = '''# Default backend for unmatched domains
+backend default-backend
+    mode http
+    option http-server-close
+    http-response set-header Content-Type text/html
+    http-response set-body "<!DOCTYPE html><html><head><title>Site Not Configured</title></head><body><h1>Site Not Configured</h1><p>This domain has not been configured yet.</p></body></html>"'''
+            config_parts.append(fallback_backend)
         # Add Backends
         config_parts.append('\n' .join(config_backends) + '\n')
         # Write complete configuration to tmp
