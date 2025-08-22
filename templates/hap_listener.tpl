@@ -7,8 +7,6 @@ frontend web
     # IP blocking using map file (no word limit, runtime updates supported)
     # Map file: /etc/haproxy/blocked_ips.map
     # Runtime updates: echo "add map #0 IP_ADDRESS" | socat stdio /var/run/haproxy.sock
-    http-request deny status 403 if { src -f /etc/haproxy/blocked_ips.map }
-    
-    # Alternative: redirect blocked IPs to blocked page instead of deny
-    # http-request set-path /blocked-ip if { src -f /etc/haproxy/blocked_ips.map }
-    # use_backend default-backend if { src -f /etc/haproxy/blocked_ips.map }
+    http-request set-path /blocked-ip if { src -f /etc/haproxy/blocked_ips.map }
+    http-request set-status 403 if { src -f /etc/haproxy/blocked_ips.map }
+    use_backend default-backend if { src -f /etc/haproxy/blocked_ips.map }

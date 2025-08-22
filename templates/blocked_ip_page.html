@@ -41,21 +41,6 @@
             margin-bottom: 15px;
             font-size: 1.1em;
         }
-        .contact {
-            background: linear-gradient(135deg, #3498db, #2980b9);
-            color: white;
-            padding: 12px 24px;
-            border-radius: 6px;
-            text-decoration: none;
-            display: inline-block;
-            margin-top: 25px;
-            font-weight: 500;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-        .contact:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4);
-        }
         .ip-info {
             background: #f8f9fa;
             border: 1px solid #e9ecef;
@@ -81,7 +66,7 @@
         <span class="icon">🚫</span>
         <h1>Access Denied</h1>
         <p>Your IP address has been blocked from accessing this website.</p>
-        <p>If you believe this block has been made in error, please contact our support team for assistance.</p>
+        <p>If you believe this block has been made in error, please contact support for assistance.</p>
         
         <div class="error-code">
             Error Code: 403 - Forbidden
@@ -93,7 +78,12 @@
             <strong>Domain:</strong> <span id="domain"></span>
         </div>
         
-        <a href="mailto:support@example.com" class="contact">Contact Support</a>
+        <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 20px; margin-top: 25px; color: #495057; text-align: left;">
+            <strong>To request unblocking:</strong><br>
+            • Contact your hosting provider's support team<br>
+            • Provide your IP address and the domain you're trying to access<br>
+            • Explain why you believe this block is in error
+        </div>
     </div>
     
     <script>
