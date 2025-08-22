@@ -760,6 +760,21 @@ def add_blocked_ip():
         # Add to runtime map for immediate effect
         add_ip_to_runtime_map(ip_address)
         
+        # Reload HAProxy to ensure consistency
+        try:
+            if is_process_running('haproxy'):
+                if os.path.exists(HAPROXY_SOCKET_PATH):
+                    socket_path = HAPROXY_SOCKET_PATH
+                else:
+                    socket_path = '/tmp/haproxy-cli'
+                
+                reload_result = subprocess.run(f'echo "reload" | socat stdio {socket_path}',
+                                             capture_output=True, text=True, shell=True)
+                if reload_result.returncode != 0:
+                    logger.warning(f"HAProxy reload failed after blocking IP {ip_address}: {reload_result.stderr}")
+        except Exception as e:
+            logger.warning(f"Error reloading HAProxy after blocking IP {ip_address}: {e}")
+        
         log_operation('add_blocked_ip', True, f'IP {ip_address} blocked successfully')
         return jsonify({'status': 'success', 'blocked_ip_id': blocked_ip_id, 'message': f'IP {ip_address} has been blocked'})
     except sqlite3.IntegrityError:
@@ -799,6 +814,21 @@ def remove_blocked_ip():
         
         # Remove from runtime map for immediate effect
         remove_ip_from_runtime_map(ip_address)
+        
+        # Reload HAProxy to ensure consistency
+        try:
+            if is_process_running('haproxy'):
+                if os.path.exists(HAPROXY_SOCKET_PATH):
+                    socket_path = HAPROXY_SOCKET_PATH
+                else:
+                    socket_path = '/tmp/haproxy-cli'
+                
+                reload_result = subprocess.run(f'echo "reload" | socat stdio {socket_path}',
+                                             capture_output=True, text=True, shell=True)
+                if reload_result.returncode != 0:
+                    logger.warning(f"HAProxy reload failed after unblocking IP {ip_address}: {reload_result.stderr}")
+        except Exception as e:
+            logger.warning(f"Error reloading HAProxy after unblocking IP {ip_address}: {e}")
         
         log_operation('remove_blocked_ip', True, f'IP {ip_address} unblocked successfully')
         return jsonify({'status': 'success', 'message': f'IP {ip_address} has been unblocked'})
@@ -1297,7 +1327,7 @@ if __name__ == '__main__':
         @default_app.route('/blocked-ip')
         def blocked_ip_page():
             """Serve the blocked IP page for blocked clients"""
-            return render_template('blocked_ip_page.html')
+            return render_template('blocked_ip_page.html'), 403
         
         default_app.run(host='0.0.0.0', port=8080)
     
