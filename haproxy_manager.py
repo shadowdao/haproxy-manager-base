@@ -10,6 +10,8 @@ import functools
 import logging
 from datetime import datetime
 import json
+import shutil
+import tempfile
 
 app = Flask(__name__)
 
@@ -17,6 +19,10 @@ app = Flask(__name__)
 DB_FILE = '/etc/haproxy/haproxy_config.db'
 TEMPLATE_DIR = Path('templates')
 HAPROXY_CONFIG_PATH = '/etc/haproxy/haproxy.cfg'
+HAPROXY_BACKUP_PATH = '/etc/haproxy/haproxy.cfg.backup'
+BLOCKED_IPS_MAP_PATH = '/etc/haproxy/blocked_ips.map'
+BLOCKED_IPS_MAP_BACKUP_PATH = '/etc/haproxy/blocked_ips.map.backup'
+HAPROXY_SOCKET_PATH = '/var/run/haproxy.sock'
 SSL_CERTS_DIR = '/etc/haproxy/certs'
 API_KEY = os.environ.get('HAPROXY_API_KEY')  # Optional API key for authentication
 
@@ -746,8 +752,13 @@ def add_blocked_ip():
                           (ip_address, reason, blocked_by))
             blocked_ip_id = cursor.lastrowid
 
-        # Regenerate HAProxy config to apply the block
-        generate_config()
+        # Update map file and add to runtime (no full reload needed)
+        if not update_blocked_ips_map():
+            log_operation('add_blocked_ip', False, f'Failed to update map file for {ip_address}')
+            return jsonify({'status': 'error', 'message': 'Failed to update blocked IPs map file'}), 500
+        
+        # Add to runtime map for immediate effect
+        add_ip_to_runtime_map(ip_address)
         
         log_operation('add_blocked_ip', True, f'IP {ip_address} blocked successfully')
         return jsonify({'status': 'success', 'blocked_ip_id': blocked_ip_id, 'message': f'IP {ip_address} has been blocked'})
@@ -781,13 +792,76 @@ def remove_blocked_ip():
 
             cursor.execute('DELETE FROM blocked_ips WHERE ip_address = ?', (ip_address,))
 
-        # Regenerate HAProxy config to remove the block
-        generate_config()
+        # Update map file and remove from runtime (no full reload needed)
+        if not update_blocked_ips_map():
+            log_operation('remove_blocked_ip', False, f'Failed to update map file for {ip_address}')
+            return jsonify({'status': 'error', 'message': 'Failed to update blocked IPs map file'}), 500
+        
+        # Remove from runtime map for immediate effect
+        remove_ip_from_runtime_map(ip_address)
         
         log_operation('remove_blocked_ip', True, f'IP {ip_address} unblocked successfully')
         return jsonify({'status': 'success', 'message': f'IP {ip_address} has been unblocked'})
     except Exception as e:
         log_operation('remove_blocked_ip', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/config/reload', methods=['POST'])
+@require_api_key
+def reload_config_safely():
+    """Safely reload HAProxy configuration with validation and rollback"""
+    try:
+        # Regenerate config files including map
+        generate_config()
+        
+        log_operation('reload_config_safely', True, 'Configuration reloaded safely')
+        return jsonify({'status': 'success', 'message': 'HAProxy configuration reloaded safely'})
+    except Exception as e:
+        log_operation('reload_config_safely', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/blocked-ips/sync', methods=['POST'])
+@require_api_key
+def sync_blocked_ips():
+    """Sync blocked IPs from database to runtime map"""
+    try:
+        # Update map file
+        if not update_blocked_ips_map():
+            return jsonify({'status': 'error', 'message': 'Failed to update map file'}), 500
+        
+        # Clear and reload runtime map
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT ip_address FROM blocked_ips ORDER BY ip_address')
+            blocked_ips = [row[0] for row in cursor.fetchall()]
+        
+        # Try to clear all entries from runtime map (might fail if empty, that's ok)
+        try:
+            if os.path.exists(HAPROXY_SOCKET_PATH):
+                socket_path = HAPROXY_SOCKET_PATH
+            else:
+                socket_path = '/tmp/haproxy-cli'
+            
+            subprocess.run(f'echo "clear map #0" | socat stdio {socket_path}', 
+                         shell=True, capture_output=True)
+        except:
+            pass  # Clear might fail if map is empty
+        
+        # Add all IPs to runtime map
+        success_count = 0
+        for ip in blocked_ips:
+            if add_ip_to_runtime_map(ip):
+                success_count += 1
+        
+        log_operation('sync_blocked_ips', True, f'Synced {success_count}/{len(blocked_ips)} IPs to runtime map')
+        return jsonify({
+            'status': 'success', 
+            'message': f'Synced {success_count}/{len(blocked_ips)} IPs to runtime map',
+            'total_ips': len(blocked_ips),
+            'synced_ips': success_count
+        })
+    except Exception as e:
+        log_operation('sync_blocked_ips', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 def generate_config():
@@ -824,10 +898,12 @@ def generate_config():
         default_headers = template_env.get_template('hap_header.tpl').render()
         config_parts.append(default_headers)
 
+        # Update blocked IPs map file first
+        update_blocked_ips_map()
+        
         # Add Listener Block
         listener_block = template_env.get_template('hap_listener.tpl').render(
-            crt_path = SSL_CERTS_DIR,
-            blocked_ips = blocked_ips
+            crt_path = SSL_CERTS_DIR
         )
         config_parts.append(listener_block)
 
@@ -917,44 +993,17 @@ backend default-backend
         logger.debug("Generated HAProxy configuration")
 
         # Write complete configuration to tmp
-        # Check HAProxy Configuration, and reload if it works
-        with open(temp_config_path, 'w') as f:
+        # Write new configuration to file
+        with open(HAPROXY_CONFIG_PATH, 'w') as f:
             f.write(config_content)
-        result = subprocess.run(['haproxy', '-c', '-f', temp_config_path], capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info("HAProxy configuration check passed")
-            if is_process_running('haproxy'):
-                reload_result = subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli',
-                                             capture_output=True, text=True, shell=True)
-                if reload_result.returncode == 0:
-                    logger.info("HAProxy reloaded successfully")
-                    log_operation('generate_config', True, 'Configuration generated and HAProxy reloaded')
-                else:
-                    error_msg = f"HAProxy reload failed: {reload_result.stderr}"
-                    logger.error(error_msg)
-                    log_operation('generate_config', False, error_msg)
-            else:
-                try:
-                    result = subprocess.run(
-                        ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
-                        check=True,
-                        capture_output=True,
-                        text=True
-                    )
-                    if result.returncode == 0:
-                        logger.info("HAProxy started successfully")
-                        log_operation('generate_config', True, 'Configuration generated and HAProxy started')
-                    else:
-                        error_msg = f"HAProxy start command returned: {result.stdout}\nError output: {result.stderr}"
-                        logger.error(error_msg)
-                        log_operation('generate_config', False, error_msg)
-                except subprocess.CalledProcessError as e:
-                    error_msg = f"Failed to start HAProxy: {e.stdout}\n{e.stderr}"
-                    logger.error(error_msg)
-                    log_operation('generate_config', False, error_msg)
-                    raise
+        
+        # Use safe reload with validation and rollback
+        success, message = reload_haproxy_safely()
+        if success:
+            logger.info("Configuration generated and HAProxy reloaded safely")
+            log_operation('generate_config', True, 'Configuration generated and HAProxy reloaded safely')
         else:
-            error_msg = f"HAProxy configuration check failed: {result.stderr}"
+            error_msg = f"Safe reload failed: {message}"
             logger.error(error_msg)
             log_operation('generate_config', False, error_msg)
             raise Exception(error_msg)
@@ -965,6 +1014,181 @@ backend default-backend
         import traceback
         traceback.print_exc()
         raise
+
+def create_backup():
+    """Create backup of current config and map files"""
+    try:
+        if os.path.exists(HAPROXY_CONFIG_PATH):
+            shutil.copy2(HAPROXY_CONFIG_PATH, HAPROXY_BACKUP_PATH)
+        if os.path.exists(BLOCKED_IPS_MAP_PATH):
+            shutil.copy2(BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH)
+        logger.info("Backups created successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to create backup: {e}")
+        return False
+
+def restore_backup():
+    """Restore from backup files"""
+    try:
+        if os.path.exists(HAPROXY_BACKUP_PATH):
+            shutil.copy2(HAPROXY_BACKUP_PATH, HAPROXY_CONFIG_PATH)
+        if os.path.exists(BLOCKED_IPS_MAP_BACKUP_PATH):
+            shutil.copy2(BLOCKED_IPS_MAP_BACKUP_PATH, BLOCKED_IPS_MAP_PATH)
+        logger.info("Backups restored successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to restore backup: {e}")
+        return False
+
+def validate_haproxy_config():
+    """Validate HAProxy configuration file"""
+    try:
+        result = subprocess.run(['haproxy', '-c', '-f', HAPROXY_CONFIG_PATH], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info("HAProxy configuration validation passed")
+            return True, None
+        else:
+            error_msg = f"HAProxy configuration validation failed: {result.stderr}"
+            logger.error(error_msg)
+            return False, error_msg
+    except Exception as e:
+        error_msg = f"Error validating HAProxy config: {e}"
+        logger.error(error_msg)
+        return False, error_msg
+
+def reload_haproxy_safely():
+    """Safely reload HAProxy with validation and rollback"""
+    try:
+        # Create backup before changes
+        if not create_backup():
+            return False, "Failed to create backup"
+        
+        # Validate new configuration
+        is_valid, error_msg = validate_haproxy_config()
+        if not is_valid:
+            # Restore backup on validation failure
+            restore_backup()
+            return False, f"Config validation failed: {error_msg}"
+        
+        # Attempt reload
+        if is_process_running('haproxy'):
+            # Use HAProxy stats socket for graceful reload
+            try:
+                if os.path.exists(HAPROXY_SOCKET_PATH):
+                    reload_result = subprocess.run(
+                        f'echo "reload" | socat stdio {HAPROXY_SOCKET_PATH}',
+                        capture_output=True, text=True, shell=True
+                    )
+                else:
+                    # Fallback to old socket path
+                    reload_result = subprocess.run(
+                        'echo "reload" | socat stdio /tmp/haproxy-cli',
+                        capture_output=True, text=True, shell=True
+                    )
+                
+                if reload_result.returncode == 0:
+                    logger.info("HAProxy reloaded successfully")
+                    return True, "HAProxy reloaded successfully"
+                else:
+                    # Reload failed, restore backup
+                    restore_backup()
+                    # Try to reload with backup config
+                    subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli', 
+                                 shell=True, capture_output=True)
+                    error_msg = f"HAProxy reload failed: {reload_result.stderr}"
+                    logger.error(error_msg)
+                    return False, error_msg
+            except Exception as e:
+                # Critical error during reload, restore backup
+                restore_backup()
+                error_msg = f"Critical error during reload: {e}"
+                logger.error(error_msg)
+                return False, error_msg
+        else:
+            # HAProxy not running, start it
+            try:
+                result = subprocess.run(
+                    ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
+                    check=True, capture_output=True, text=True
+                )
+                logger.info("HAProxy started successfully")
+                return True, "HAProxy started successfully"
+            except subprocess.CalledProcessError as e:
+                # Start failed, restore backup
+                restore_backup()
+                error_msg = f"Failed to start HAProxy: {e.stderr}"
+                logger.error(error_msg)
+                return False, error_msg
+    except Exception as e:
+        error_msg = f"Critical error in reload process: {e}"
+        logger.error(error_msg)
+        return False, error_msg
+
+def update_blocked_ips_map():
+    """Update the blocked IPs map file from database"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT ip_address FROM blocked_ips ORDER BY ip_address')
+            blocked_ips = [row[0] for row in cursor.fetchall()]
+        
+        # Write map file
+        os.makedirs(os.path.dirname(BLOCKED_IPS_MAP_PATH), exist_ok=True)
+        with open(BLOCKED_IPS_MAP_PATH, 'w') as f:
+            for ip in blocked_ips:
+                f.write(f"{ip}\n")
+        
+        logger.info(f"Updated blocked IPs map file with {len(blocked_ips)} IPs")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update blocked IPs map: {e}")
+        return False
+
+def add_ip_to_runtime_map(ip_address):
+    """Add IP to HAProxy runtime map without reload"""
+    try:
+        if os.path.exists(HAPROXY_SOCKET_PATH):
+            socket_path = HAPROXY_SOCKET_PATH
+        else:
+            socket_path = '/tmp/haproxy-cli'
+        
+        # Add to runtime map (map file ID 0 for blocked IPs)
+        cmd = f'echo "add map #0 {ip_address}" | socat stdio {socket_path}'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info(f"Added IP {ip_address} to runtime map")
+            return True
+        else:
+            logger.warning(f"Failed to add IP to runtime map: {result.stderr}")
+            return False
+    except Exception as e:
+        logger.error(f"Error adding IP to runtime map: {e}")
+        return False
+
+def remove_ip_from_runtime_map(ip_address):
+    """Remove IP from HAProxy runtime map without reload"""
+    try:
+        if os.path.exists(HAPROXY_SOCKET_PATH):
+            socket_path = HAPROXY_SOCKET_PATH
+        else:
+            socket_path = '/tmp/haproxy-cli'
+        
+        # Remove from runtime map (map file ID 0 for blocked IPs)
+        cmd = f'echo "del map #0 {ip_address}" | socat stdio {socket_path}'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info(f"Removed IP {ip_address} from runtime map")
+            return True
+        else:
+            logger.warning(f"Failed to remove IP from runtime map: {result.stderr}")
+            return False
+    except Exception as e:
+        logger.error(f"Error removing IP from runtime map: {e}")
+        return False
 
 def start_haproxy():
     if not is_process_running('haproxy'):

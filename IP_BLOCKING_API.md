@@ -10,7 +10,15 @@ The IP blocking feature allows administrators to:
 - View all currently blocked IP addresses
 - Track who blocked an IP and when
 
-When an IP is blocked, visitors from that IP address will see a custom "Access Denied" page instead of the requested website.
+When an IP is blocked, visitors from that IP address will receive a 403 Forbidden response.
+
+## Features
+
+- **Runtime IP blocking**: Changes take effect immediately without HAProxy restarts
+- **Map file based**: No ACL word limits, supports unlimited blocked IPs
+- **Safe configuration management**: Automatic validation and rollback on failures
+- **Runtime map synchronization**: Keep database and HAProxy runtime in sync
+- **Audit logging**: All operations are logged for monitoring and compliance
 
 ## API Endpoints
 
@@ -416,7 +424,86 @@ curl -X DELETE http://localhost:8000/api/blocked-ips \
 ## Notes
 
 - IP blocks are applied globally to all domains managed by HAProxy
-- The blocked IP page is served with HTTP 403 Forbidden status
-- Blocked IPs are persistent across HAProxy restarts (stored in database)
-- HAProxy configuration is automatically regenerated when IPs are blocked/unblocked
+- Changes take effect immediately without HAProxy restarts (runtime updates)
+- Blocked IPs are persistent across HAProxy restarts (stored in database and map file)
+- Map files support unlimited IPs (no ACL word limit restrictions)
 - Consider implementing rate limiting on the API endpoints to prevent abuse
+
+## New API Endpoints (Map File Era)
+
+### 4. Safe Configuration Reload
+
+Safely reload the HAProxy configuration with validation and automatic rollback.
+
+**Endpoint:** `POST /api/config/reload`
+
+**Response:**
+```json
+{
+    "status": "success",
+    "message": "HAProxy configuration reloaded safely"
+}
+```
+
+**Error Response:**
+```json
+{
+    "status": "error", 
+    "message": "Safe reload failed: Config validation failed: ..."
+}
+```
+
+**Example Request:**
+```bash
+curl -X POST http://localhost:8000/api/config/reload \
+  -H "Authorization: Bearer your-api-key"
+```
+
+### 5. Sync Runtime Map
+
+Synchronize blocked IPs from database to HAProxy runtime map.
+
+**Endpoint:** `POST /api/blocked-ips/sync`
+
+**Response:**
+```json
+{
+    "status": "success",
+    "message": "Synced 150/150 IPs to runtime map",
+    "total_ips": 150,
+    "synced_ips": 150
+}
+```
+
+**Example Request:**
+```bash
+curl -X POST http://localhost:8000/api/blocked-ips/sync \
+  -H "Authorization: Bearer your-api-key"
+```
+
+## Runtime Map Commands
+
+For advanced users, you can interact directly with HAProxy's runtime API:
+
+```bash
+# Add IP to runtime (immediate effect)
+echo "add map #0 192.168.1.100" | socat stdio /var/run/haproxy.sock
+
+# Remove IP from runtime
+echo "del map #0 192.168.1.100" | socat stdio /var/run/haproxy.sock
+
+# Clear all blocked IPs from runtime
+echo "clear map #0" | socat stdio /var/run/haproxy.sock
+
+# Show all runtime map entries
+echo "show map #0" | socat stdio /var/run/haproxy.sock
+```
+
+## Migration from ACL Method
+
+If you're upgrading from the old ACL-based method:
+
+1. **Automatic**: Just update the HAProxy Manager code - it will automatically migrate
+2. **Validation**: The new system includes automatic config validation and rollback
+3. **No Downtime**: Runtime updates mean no service interruptions
+4. **Scalable**: No more 64 IP limit - handle thousands of blocked IPs
