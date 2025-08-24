@@ -1,0 +1,153 @@
+global
+    daemon
+    log stdout local0 info
+    chroot /var/lib/haproxy
+    stats socket /var/run/haproxy.sock mode 600 level admin
+    stats timeout 30s
+    user haproxy
+    group haproxy
+
+    # SSL/TLS settings if using HTTPS
+    ssl-default-bind-ciphers ECDHE+AESGCM:ECDHE+CHACHA20:RSA+AESGCM:RSA+AES:!aNULL:!MD5:!DSS
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+
+defaults
+    mode http
+    timeout connect 5000ms
+    timeout client 50000ms
+    timeout server 50000ms
+    timeout tarpit 60s  # Maximum tarpit time
+    option httplog
+    option dontlognull
+    option log-health-checks
+    retries 3
+
+    # Error files (optional - customize as needed)
+    errorfile 400 /usr/local/etc/haproxy/errors/400.http
+    errorfile 403 /usr/local/etc/haproxy/errors/403.http
+    errorfile 408 /usr/local/etc/haproxy/errors/408.http
+    errorfile 500 /usr/local/etc/haproxy/errors/500.http
+    errorfile 502 /usr/local/etc/haproxy/errors/502.http
+    errorfile 503 /usr/local/etc/haproxy/errors/503.http
+    errorfile 504 /usr/local/etc/haproxy/errors/504.http
+
+frontend web_frontend
+    bind *:80
+    bind *:443 ssl crt /etc/ssl/certs/haproxy.pem
+    
+    # Stick table for tracking attacks with escalating timeouts
+    # gpc0 = total scan attempts
+    # gpc1 = escalation level (0=none, 1=level1, 2=level2, 3=level3)  
+    # gpc2 = total tarpit/block actions taken
+    stick-table type ip size 200k expire 2h store gpc0,gpc1,gpc2,http_err_rate(30s),http_err_rate(300s),http_err_rate(3600s)
+    
+    # Whitelist trusted networks and monitoring systems
+    acl trusted_networks src 127.0.0.1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
+    acl monitoring_systems src -f /etc/haproxy/monitoring_ips.txt
+    acl health_check path_beg /health /ping /status /.well-known/
+    
+    # Allow trusted traffic to bypass all protection
+    http-request allow if trusted_networks or monitoring_systems or health_check
+    
+    # Define threat levels based on scan attempts and rates
+    acl low_threat sc_get_gpc0(0) ge 3 sc_get_gpc0(0) lt 10
+    acl medium_threat sc_get_gpc0(0) ge 10 sc_get_gpc0(0) lt 25
+    acl high_threat sc_get_gpc0(0) ge 25 sc_get_gpc0(0) lt 50
+    acl critical_threat sc_get_gpc0(0) ge 50
+    
+    # Rate-based detection (burst attacks)
+    acl burst_attack sc_http_err_rate(0,30s) gt 8     # >8 errors in 30 seconds
+    acl sustained_attack sc_http_err_rate(0,300s) gt 3 # >3 errors/min for 5 minutes
+    acl persistent_attack sc_http_err_rate(0,3600s) gt 1 # >1 error/min for 1 hour
+    
+    # Escalation levels (tracks how many times we've escalated this IP)
+    acl escalation_level_0 sc_get_gpc1(0) eq 0
+    acl escalation_level_1 sc_get_gpc1(0) eq 1
+    acl escalation_level_2 sc_get_gpc1(0) eq 2
+    acl escalation_level_3 sc_get_gpc1(0) ge 3
+    
+    # ESCALATING TARPIT RULES
+    # Level 1: Short tarpit (2-5 seconds) for first offense
+    http-request tarpit timeout 2s if low_threat escalation_level_0
+    http-request tarpit timeout 3s if medium_threat escalation_level_0
+    http-request tarpit timeout 5s if burst_attack escalation_level_0
+    
+    # Level 2: Medium tarpit (8-15 seconds) for second offense  
+    http-request tarpit timeout 8s if low_threat escalation_level_1
+    http-request tarpit timeout 12s if medium_threat escalation_level_1
+    http-request tarpit timeout 15s if high_threat escalation_level_1
+    http-request tarpit timeout 10s if sustained_attack escalation_level_1
+    
+    # Level 3: Long tarpit (20-45 seconds) for repeat offenders
+    http-request tarpit timeout 20s if low_threat escalation_level_2
+    http-request tarpit timeout 30s if medium_threat escalation_level_2
+    http-request tarpit timeout 45s if high_threat escalation_level_2
+    http-request tarpit timeout 25s if persistent_attack escalation_level_2
+    
+    # Level 4: Maximum tarpit (60 seconds) for persistent attackers
+    http-request tarpit timeout 60s if escalation_level_3
+    
+    # Complete block for critical threats regardless of escalation level
+    http-request deny deny_status 429 if critical_threat
+    
+    # Increment escalation level when we apply tarpit/block
+    http-request sc-inc-gpc1(0) if low_threat or medium_threat or high_threat or burst_attack or sustained_attack or persistent_attack
+    http-request sc-inc-gpc2(0) if low_threat or medium_threat or high_threat or critical_threat or burst_attack or sustained_attack or persistent_attack
+    
+    # Capture useful headers for logging
+    capture request header User-Agent len 150
+    capture request header X-Forwarded-For len 30
+    capture request header Referer len 100
+    
+    # Enhanced logging format with protection metrics
+    log-format "%ci:%cp [%t] %ft %b/%s %Tq/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS \"%r\" \"%[capture.req.hdr(0)]\" gpc0:%[sc_get_gpc0(0)] gpc1:%[sc_get_gpc1(0)] gpc2:%[sc_get_gpc2(0)] err_rate_30s:%[sc_http_err_rate(0,30s)]"
+    
+    # Redirect HTTP to HTTPS (optional)
+    redirect scheme https if !{ ssl_fc }
+    
+    default_backend web_servers
+
+backend web_servers
+    balance roundrobin
+    option httpchk GET /health HTTP/1.1\r\nHost:\ localhost
+    
+    # Define scanning attempt patterns
+    acl is_404_error status 404
+    acl is_403_error status 403  
+    acl is_401_error status 401
+    acl is_400_error status 400
+    acl is_scan_attempt status 400 401 403 404
+    
+    # Additional suspicious patterns (optional)
+    acl suspicious_path path_reg -i \.(php|asp|aspx|jsp|cgi)$
+    acl suspicious_path path_reg -i /(wp-admin|phpmyadmin|admin|login|xmlrpc)
+    acl suspicious_path path_reg -i \.(env|git|svn|backup|bak|old)
+    
+    # Track scan attempts in the frontend stick table
+    http-response sc-inc-gpc0(0) if is_scan_attempt
+    
+    # Optional: Track suspicious paths even if they return 200
+    # http-response sc-inc-gpc0(0) if suspicious_path
+    
+    # Optional: Different weights for different error types
+    # http-response sc-add-gpc0(0) 2 if is_403_error  # 403s count as 2 points
+    # http-response sc-add-gpc0(0) 3 if is_401_error  # 401s count as 3 points
+    
+    # Server definitions - adjust as needed
+    server web1 backend-server-1:80 check maxconn 200 weight 100
+    server web2 backend-server-2:80 check maxconn 200 weight 100
+    # server web3 backend-server-3:80 check maxconn 200 weight 100
+
+# Optional: Stats page for monitoring
+frontend stats
+    bind *:8404
+    # Restrict access to stats page
+    acl allowed_ips src 127.0.0.1 192.168.0.0/16 10.0.0.0/8
+    http-request allow if allowed_ips
+    http-request deny
+    
+    stats enable
+    stats uri /stats
+    stats refresh 30s
+    stats show-legends
+    stats show-node
