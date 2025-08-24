@@ -17,6 +17,8 @@ backend {{ name }}-backend
     acl suspicious_path path_reg -i \.(env|git|svn|backup|bak|old)
     
     # Track scan attempts in the frontend stick table
+    # This increments the counter AFTER the backend responds with an error
+    # The frontend will check this counter on SUBSEQUENT requests
     http-response sc-inc-gpc0(0) if is_scan_attempt
     
     {% for server in servers %}

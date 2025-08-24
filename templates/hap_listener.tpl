@@ -25,25 +25,23 @@ frontend web
     http-request set-path /blocked-ip if { src -f /etc/haproxy/blocked_ips.map }
     use_backend default-backend if { src -f /etc/haproxy/blocked_ips.map }
     
-    # Define threat levels based on scan attempts and rates
-    acl has_scan_attempts sc0_get_gpc0 gt 0
-    acl low_threat sc0_get_gpc0 ge 3 sc0_get_gpc0 lt 10
-    acl medium_threat sc0_get_gpc0 ge 10 sc0_get_gpc0 lt 25  
-    acl high_threat sc0_get_gpc0 ge 25 sc0_get_gpc0 lt 50
-    acl critical_threat sc0_get_gpc0 ge 50
+    # Define threat levels based on accumulated error responses from backends
+    # These will be checked on subsequent requests after errors are tracked
+    acl scanner_low sc0_get_gpc0 ge 5          # 5+ errors = potential scanner
+    acl scanner_medium sc0_get_gpc0 ge 15      # 15+ errors = likely scanner
+    acl scanner_high sc0_get_gpc0 ge 30        # 30+ errors = confirmed scanner
+    acl scanner_critical sc0_get_gpc0 ge 50    # 50+ errors = aggressive scanner
     
-    # Rate-based detection (burst attacks)
-    acl burst_attack sc0_http_err_rate gt 5     # >5 errors in 10 seconds
+    # Rate-based detection (burst of errors)
+    acl burst_scanner sc0_http_err_rate gt 5   # >5 errors in 10 seconds
     
-    # Combined threat detection
-    acl is_threat has_scan_attempts
-    acl needs_tarpit low_threat or medium_threat or high_threat or burst_attack
+    # BLOCKING RULES - Block aggressive scanners completely
+    # Only block after significant error accumulation
+    http-request deny deny_status 429 if scanner_critical
     
-    # TARPIT RULES - Only apply to actual threats
-    # Apply tarpit only if there are scan attempts
-    http-request tarpit if needs_tarpit
+    # TARPIT RULES - Slow down detected scanners
+    # Apply progressive delays based on error count
+    http-request tarpit if scanner_high
+    http-request tarpit if scanner_medium burst_scanner
     
-    # Complete block for critical threats
-    http-request deny deny_status 429 if critical_threat
-    
-    # Increment scan counter when tarpit is applied (this happens after response in backend)
+    # Note: The backend will increment sc0_get_gpc0 when it sees 400/401/403/404 responses
