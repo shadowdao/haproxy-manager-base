@@ -1,7 +1,9 @@
 
 backend {{ name }}-backend
     option forwardfor
-    http-request add-header X-CLIENT-IP %[src]
+    # Pass the real client IP to backend (from proxy headers or direct connection)
+    http-request add-header X-CLIENT-IP %[var(txn.real_ip)]
+    http-request set-header X-Real-IP %[var(txn.real_ip)]
     {% if ssl_enabled %}http-request set-header X-Forwarded-Proto https if { ssl_fc }{% endif %}
     
     # Define scanning attempt patterns
