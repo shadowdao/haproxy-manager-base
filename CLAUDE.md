@@ -79,3 +79,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Exposes ports 80 (HTTP), 443 (HTTPS), and 8000 (management API/UI)
 - Management interface on port 8000 should be firewall-protected in production
 - Supports deployment on servers with git directory at `/root/whp` and web file sync via rsync to `/docker/whp/web/`
+- HAProxy is version 3.0.11

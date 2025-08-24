@@ -7,7 +7,7 @@ frontend web
     # Stick table for tracking attacks with escalating timeouts
     # gpc0 = total scan attempts
     # gpc1 = escalation level (0=none, 1=level1, 2=level2, 3=level3)  
-    stick-table type ip size 200k expire 2h store gpc0,gpc1,http_err_rate(30s),http_err_rate(300s),http_err_rate(3600s)
+    stick-table type ip size 200k expire 2h store gpc0,gpc1,http_err_rate(10s)
     
     # Whitelist trusted networks and monitoring systems
     acl trusted_networks src 127.0.0.1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
@@ -32,9 +32,9 @@ frontend web
     acl critical_threat sc0_get_gpc0 ge 50
     
     # Rate-based detection (burst attacks)
-    acl burst_attack sc0_http_err_rate(30s) gt 8     # >8 errors in 30 seconds
-    acl sustained_attack sc0_http_err_rate(300s) gt 3 # >3 errors/min for 5 minutes
-    acl persistent_attack sc0_http_err_rate(3600s) gt 1 # >1 error/min for 1 hour
+    acl burst_attack sc0_http_err_rate gt 8     # >8 errors in 10 seconds
+    acl sustained_attack sc0_get_gpc0 ge 15  # Multiple sustained errors
+    acl persistent_attack sc0_get_gpc0 ge 30  # Persistent scanning
     
     # Escalation levels (tracks how many times we've escalated this IP)
     acl escalation_level_0 sc0_get_gpc1 eq 0
