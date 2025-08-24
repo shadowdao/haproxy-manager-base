@@ -26,45 +26,24 @@ frontend web
     use_backend default-backend if { src -f /etc/haproxy/blocked_ips.map }
     
     # Define threat levels based on scan attempts and rates
-    acl low_threat sc0_get_gpc0 ge 3
-    acl medium_threat sc0_get_gpc0 ge 10
-    acl high_threat sc0_get_gpc0 ge 25
+    acl has_scan_attempts sc0_get_gpc0 gt 0
+    acl low_threat sc0_get_gpc0 ge 3 sc0_get_gpc0 lt 10
+    acl medium_threat sc0_get_gpc0 ge 10 sc0_get_gpc0 lt 25  
+    acl high_threat sc0_get_gpc0 ge 25 sc0_get_gpc0 lt 50
     acl critical_threat sc0_get_gpc0 ge 50
     
     # Rate-based detection (burst attacks)
-    acl burst_attack sc0_http_err_rate gt 8     # >8 errors in 10 seconds
-    acl sustained_attack sc0_get_gpc0 ge 15  # Multiple sustained errors
-    acl persistent_attack sc0_get_gpc0 ge 30  # Persistent scanning
+    acl burst_attack sc0_http_err_rate gt 5     # >5 errors in 10 seconds
     
-    # Escalation levels (tracks how many times we've escalated this IP)
-    acl escalation_level_0 sc0_get_gpc1 eq 0
-    acl escalation_level_1 sc0_get_gpc1 eq 1
-    acl escalation_level_2 sc0_get_gpc1 eq 2
-    acl escalation_level_3 sc0_get_gpc1 ge 3
+    # Combined threat detection
+    acl is_threat has_scan_attempts
+    acl needs_tarpit low_threat or medium_threat or high_threat or burst_attack
     
-    # ESCALATING TARPIT RULES
-    # Level 1: Short tarpit (2-5 seconds) for first offense
-    http-request tarpit if low_threat escalation_level_0
-    http-request tarpit if medium_threat escalation_level_0
-    http-request tarpit if burst_attack escalation_level_0
+    # TARPIT RULES - Only apply to actual threats
+    # Apply tarpit only if there are scan attempts
+    http-request tarpit if needs_tarpit
     
-    # Level 2: Medium tarpit (8-15 seconds) for second offense  
-    http-request tarpit if low_threat escalation_level_1
-    http-request tarpit if medium_threat escalation_level_1
-    http-request tarpit if high_threat escalation_level_1
-    http-request tarpit if sustained_attack escalation_level_1
-    
-    # Level 3: Long tarpit (20-45 seconds) for repeat offenders
-    http-request tarpit if low_threat escalation_level_2
-    http-request tarpit if medium_threat escalation_level_2
-    http-request tarpit if high_threat escalation_level_2
-    http-request tarpit if persistent_attack escalation_level_2
-    
-    # Level 4: Maximum tarpit (60 seconds) for persistent attackers
-    http-request tarpit if escalation_level_3
-    
-    # Complete block for critical threats regardless of escalation level
+    # Complete block for critical threats
     http-request deny deny_status 429 if critical_threat
     
-    # Increment escalation level when we apply tarpit/block
-    http-request sc-inc-gpc1(0) if low_threat or medium_threat or high_threat or burst_attack or sustained_attack or persistent_attack
+    # Increment scan counter when tarpit is applied (this happens after response in backend)
