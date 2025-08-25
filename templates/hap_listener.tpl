@@ -12,9 +12,13 @@ frontend web
     # Whitelist trusted networks and monitoring systems
     acl trusted_networks src 127.0.0.1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
     acl health_check path_beg /health /ping /status /.well-known/
+    acl common_missing path /favicon.ico /robots.txt /sitemap.xml /apple-touch-icon.png
     
     # Allow trusted traffic to bypass all protection
     http-request allow if trusted_networks or health_check
+    
+    # Don't count common missing files against the error count
+    http-request return status 404 if common_missing
     
     # Detect real client IP from proxy headers if they exist
     # Priority: CF-Connecting-IP (Cloudflare) > X-Real-IP > X-Forwarded-For > src
