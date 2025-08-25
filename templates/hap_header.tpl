@@ -45,6 +45,6 @@ defaults
     timeout server          10m
     timeout http-keep-alive 120s
     timeout check           10s
-    timeout tarpit          60s  # Maximum tarpit time for exploit scanners
+    timeout tarpit          30s  # Tarpit delay for detected scanners (fixed in HAProxy 3.0)
     maxconn                 3000
     
