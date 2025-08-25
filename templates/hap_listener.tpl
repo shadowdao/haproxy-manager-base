@@ -7,7 +7,7 @@ frontend web
     # Stick table for tracking attacks with escalating timeouts
     # gpc0 = total scan attempts
     # gpc1 = escalation level (0=none, 1=level1, 2=level2, 3=level3)  
-    stick-table type ip size 200k expire 2h store gpc0,gpc1,http_err_rate(10s)
+    stick-table type ip size 200k expire 1h store gpc0,gpc1,http_err_rate(10s)
     
     # Whitelist trusted networks and monitoring systems
     acl trusted_networks src 127.0.0.1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
@@ -40,21 +40,51 @@ frontend web
     
     # Define threat levels based on accumulated error responses from backends
     # These will be checked on subsequent requests after errors are tracked
-    acl scanner_low sc0_get_gpc0 ge 5          # 5+ errors = potential scanner
-    acl scanner_medium sc0_get_gpc0 ge 15      # 15+ errors = likely scanner
-    acl scanner_high sc0_get_gpc0 ge 30        # 30+ errors = confirmed scanner
+    acl scanner_low sc0_get_gpc0 ge 10         # 10+ errors = potential scanner
+    acl scanner_medium sc0_get_gpc0 ge 20      # 20+ errors = likely scanner
+    acl scanner_high sc0_get_gpc0 ge 35        # 35+ errors = confirmed scanner
     acl scanner_critical sc0_get_gpc0 ge 50    # 50+ errors = aggressive scanner
     
     # Rate-based detection (burst of errors)
     acl burst_scanner sc0_http_err_rate gt 5   # >5 errors in 10 seconds
     
+    # Escalation levels (tracks how many times we've escalated this IP)
+    acl escalation_level_0 sc0_get_gpc1 eq 0   # First offense
+    acl escalation_level_1 sc0_get_gpc1 eq 1   # Second offense
+    acl escalation_level_2 sc0_get_gpc1 eq 2   # Third offense
+    acl escalation_level_3 sc0_get_gpc1 ge 3   # Repeat offender
+    
     # BLOCKING RULES - Block aggressive scanners completely
     # Only block after significant error accumulation
     http-request deny deny_status 429 if scanner_critical
     
-    # TARPIT RULES - Slow down detected scanners
-    # Apply progressive delays based on error count
-    http-request tarpit if scanner_high
-    http-request tarpit if scanner_medium burst_scanner
+    # ESCALATING TARPIT RULES - Progressive delays based on offense level
+    # Level 0 (first offense): Short delays
+    http-request tarpit deny_status 429 timeout 2s if scanner_low escalation_level_0
+    http-request tarpit deny_status 429 timeout 3s if scanner_medium escalation_level_0
+    http-request tarpit deny_status 429 timeout 5s if scanner_high escalation_level_0
+    http-request tarpit deny_status 429 timeout 5s if burst_scanner escalation_level_0
+    
+    # Level 1 (second offense): Medium delays
+    http-request tarpit deny_status 429 timeout 8s if scanner_low escalation_level_1
+    http-request tarpit deny_status 429 timeout 12s if scanner_medium escalation_level_1
+    http-request tarpit deny_status 429 timeout 15s if scanner_high escalation_level_1
+    http-request tarpit deny_status 429 timeout 10s if burst_scanner escalation_level_1
+    
+    # Level 2 (third offense): Long delays
+    http-request tarpit deny_status 429 timeout 20s if scanner_low escalation_level_2
+    http-request tarpit deny_status 429 timeout 30s if scanner_medium escalation_level_2
+    http-request tarpit deny_status 429 timeout 45s if scanner_high escalation_level_2
+    http-request tarpit deny_status 429 timeout 25s if burst_scanner escalation_level_2
+    
+    # Level 3+ (repeat offender): Maximum delays
+    http-request tarpit deny_status 429 timeout 60s if scanner_low escalation_level_3
+    http-request tarpit deny_status 429 timeout 60s if scanner_medium escalation_level_3
+    http-request tarpit deny_status 429 timeout 60s if scanner_high escalation_level_3
+    http-request tarpit deny_status 429 timeout 60s if burst_scanner escalation_level_3
+    
+    # Increment escalation level when we apply tarpit
+    # This tracks how many times this IP has been tarpitted
+    http-request sc-inc-gpc1(0) if scanner_low or scanner_medium or scanner_high or burst_scanner
     
     # Note: The backend will increment sc0_get_gpc0 when it sees 400/401/403/404 responses
