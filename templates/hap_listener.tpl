@@ -44,10 +44,10 @@ frontend web
     
     # Define threat levels based on accumulated error responses from backends
     # These will be checked on subsequent requests after errors are tracked
-    acl scanner_low sc0_get_gpc0 ge 10         # 10+ errors = potential scanner
-    acl scanner_medium sc0_get_gpc0 ge 20      # 20+ errors = likely scanner
-    acl scanner_high sc0_get_gpc0 ge 35        # 35+ errors = confirmed scanner
-    acl scanner_critical sc0_get_gpc0 ge 50    # 50+ errors = aggressive scanner
+    acl scanner_low sc0_get_gpc0 ge 25         # 25+ errors = potential scanner
+    acl scanner_medium sc0_get_gpc0 ge 40      # 40+ errors = likely scanner
+    acl scanner_high sc0_get_gpc0 ge 60        # 60+ errors = confirmed scanner
+    acl scanner_critical sc0_get_gpc0 ge 100   # 100+ errors = aggressive scanner
     
     # Rate-based detection (burst of errors)
     acl burst_scanner sc0_http_err_rate gt 5   # >5 errors in 10 seconds

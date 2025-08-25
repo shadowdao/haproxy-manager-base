@@ -75,17 +75,17 @@ printf "@!%s show table web\n" "${PROCESS_ID}" | socat stdio "$SOCKET" 2>/dev/nu
             
             # Determine status based on scan count and escalation
             status=""
-            if [ "$gpc0" -ge 50 ]; then
+            if [ "$gpc0" -ge 100 ]; then
                 status="BLOCKED (429)"
-            elif [ "$gpc0" -ge 35 ]; then
+            elif [ "$gpc0" -ge 60 ]; then
                 status="SILENT-DROP"
-            elif [ "$gpc0" -ge 20 ]; then
+            elif [ "$gpc0" -ge 40 ]; then
                 if [ "$gpc1" -ge 2 ]; then
                     status="SILENT-DROP (repeat)"
                 else
                     status="TARPIT 10s"
                 fi
-            elif [ "$gpc0" -ge 10 ]; then
+            elif [ "$gpc0" -ge 25 ]; then
                 status="TARPIT 10s"
             else
                 status="Normal"
@@ -104,12 +104,13 @@ printf "@!%s show table web\n" "${PROCESS_ID}" | socat stdio "$SOCKET" 2>/dev/nu
 echo
 echo "==================================================================="
 echo "Legend:"
-echo "  - Scan Count 10-19: Low scanner → TARPIT 10s delay"
-echo "  - Scan Count 20-34: Medium scanner → TARPIT 10s (1st), SILENT-DROP (repeat)"
-echo "  - Scan Count 35-49: High scanner → SILENT-DROP (immediate disconnect)"
-echo "  - Scan Count 50+:   Critical scanner → BLOCKED (429 response)"
+echo "  - Scan Count 25-39: Low scanner → TARPIT 10s delay"
+echo "  - Scan Count 40-59: Medium scanner → TARPIT 10s (1st), SILENT-DROP (repeat)"
+echo "  - Scan Count 60-99: High scanner → SILENT-DROP (immediate disconnect)"
+echo "  - Scan Count 100+:  Critical scanner → BLOCKED (429 response)"
 echo "  - Burst (5+ in 10s): → TARPIT 10s (1st), SILENT-DROP (repeat)"
 echo "==================================================================="
+echo "Note: Only counts suspicious scripts/configs, NOT missing images/fonts/CSS"
 echo "Note: IPs are tracked for 1 hour since last activity"
 echo
 echo "To clear a specific IP from the table:"
