@@ -20,25 +20,21 @@ backend {{ name }}-backend
     acl scan_backups path_reg -i \.(backup|bak|old|orig|save|swp|sql|db|dump|tar|zip|rar|7z)
     acl scan_vulns path_reg -i /(cgi-bin|fckeditor|tiny_mce|ckfinder|userfiles|filemanager)
     
-    # Combine all scan patterns
-    acl is_suspicious_request scan_scripts or scan_admin or scan_configs or scan_backups or scan_vulns
-    
     # Define legitimate static assets that should NOT count as scan attempts
     acl legitimate_assets path_reg -i \.(css|js|jpg|jpeg|png|gif|svg|ico|woff|woff2|ttf|eot|otf|map|webp|mp4|webm|pdf)$
     acl legitimate_paths path_beg /static/ /assets/ /media/ /images/ /fonts/ /css/ /js/
     
-    # Only count as scan attempt if it's:
-    # - A suspicious request with 404 status, OR
-    # - Any 401/403 error (auth failures are always suspicious)
-    # Exclude legitimate asset 404s (like missing fonts, images, etc.)
-    acl is_scan_attempt is_suspicious_request is_404_error !legitimate_assets !legitimate_paths
-    acl is_scan_attempt is_403_error !legitimate_assets !legitimate_paths
-    acl is_scan_attempt is_401_error
-    
     # Track scan attempts in the frontend stick table
-    # This increments the counter AFTER the backend responds with an error
-    # The frontend will check this counter on SUBSEQUENT requests
-    http-response sc-inc-gpc0(0) if is_scan_attempt
+    # Only count suspicious 404s and auth failures
+    # Multiple ACL conditions on same line = AND, multiple lines = OR
+    http-response sc-inc-gpc0(0) if scan_scripts is_404_error !legitimate_assets !legitimate_paths
+    http-response sc-inc-gpc0(0) if scan_admin is_404_error !legitimate_assets !legitimate_paths
+    http-response sc-inc-gpc0(0) if scan_configs is_404_error !legitimate_assets !legitimate_paths
+    http-response sc-inc-gpc0(0) if scan_backups is_404_error !legitimate_assets !legitimate_paths
+    http-response sc-inc-gpc0(0) if scan_vulns is_404_error !legitimate_assets !legitimate_paths
+    http-response sc-inc-gpc0(0) if is_403_error !legitimate_assets !legitimate_paths
+    http-response sc-inc-gpc0(0) if is_401_error
+    
     
     {% for server in servers %}
     server {{ server.server_name }} {{ server.server_address }}:{{ server.server_port }} {{ server.server_options }}
