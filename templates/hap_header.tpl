@@ -45,6 +45,6 @@ defaults
     timeout server          10m
     timeout http-keep-alive 120s
     timeout check           10s
-    timeout tarpit          30s  # Tarpit delay for detected scanners (fixed in HAProxy 3.0)
+    timeout tarpit          10s  # Tarpit delay for low-level scanners (before silent-drop)
     maxconn                 3000
     

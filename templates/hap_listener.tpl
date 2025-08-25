@@ -54,20 +54,30 @@ frontend web
     acl escalation_level_2 sc0_get_gpc1 eq 2   # Third offense
     acl escalation_level_3 sc0_get_gpc1 ge 3   # Repeat offender
     
-    # BLOCKING RULES - Block aggressive scanners completely
-    # Only block after significant error accumulation
+    # BLOCKING RULES - Progressive response based on threat level
+    
+    # Level 4: Complete block for critical threats (50+ errors)
     http-request deny deny_status 429 if scanner_critical
     
-    # TARPIT RULES - Apply tarpit to detected scanners
-    # HAProxy 3.0 uses global 'timeout tarpit' (60s) for all tarpit actions
-    # We track escalation level but all tarpits use same timeout
-    # The escalation level helps identify repeat offenders
+    # Level 3: Silent drop for obvious scanners and burst attacks
+    # This immediately closes the connection without any response
+    http-request silent-drop if scanner_high              # 35+ errors
+    http-request silent-drop if scanner_medium burst_scanner  # 20+ errors with burst
+    http-request silent-drop if scanner_medium escalation_level_2  # Repeat medium scanner
+    http-request silent-drop if burst_scanner escalation_level_1   # Repeat burst scanner
     
-    # Apply tarpit to any detected scanner
-    http-request tarpit deny_status 429 if scanner_low or scanner_medium or scanner_high or burst_scanner
+    # Level 2: Tarpit for medium scanners (first offense)
+    # 10 second delay before closing connection
+    http-request tarpit deny_status 429 if scanner_medium escalation_level_0
+    http-request tarpit deny_status 429 if scanner_medium escalation_level_1
     
-    # Increment escalation level when we apply tarpit
-    # This tracks how many times this IP has been tarpitted
+    # Level 1: Tarpit for low-level scanners
+    # 10 second delay to slow them down
+    http-request tarpit deny_status 429 if scanner_low
+    http-request tarpit deny_status 429 if burst_scanner escalation_level_0
+    
+    # Increment escalation level when we apply any protection
+    # This tracks how many times this IP has been actioned
     http-request sc-inc-gpc1(0) if scanner_low or scanner_medium or scanner_high or burst_scanner
     
     # Note: The backend will increment sc0_get_gpc0 when it sees 400/401/403/404 responses

@@ -73,16 +73,20 @@ printf "@!%s show table web\n" "${PROCESS_ID}" | socat stdio "$SOCKET" 2>/dev/nu
             gpc1=${gpc1:-0}
             err_rate=${err_rate:-0}
             
-            # Determine status based on scan count
+            # Determine status based on scan count and escalation
             status=""
             if [ "$gpc0" -ge 50 ]; then
-                status="BLOCKED (critical)"
+                status="BLOCKED (429)"
             elif [ "$gpc0" -ge 35 ]; then
-                status="TARPITTED (high)"
+                status="SILENT-DROP"
             elif [ "$gpc0" -ge 20 ]; then
-                status="TARPITTED (medium)"
+                if [ "$gpc1" -ge 2 ]; then
+                    status="SILENT-DROP (repeat)"
+                else
+                    status="TARPIT 10s"
+                fi
             elif [ "$gpc0" -ge 10 ]; then
-                status="MONITORED (low)"
+                status="TARPIT 10s"
             else
                 status="Normal"
             fi
@@ -100,10 +104,11 @@ printf "@!%s show table web\n" "${PROCESS_ID}" | socat stdio "$SOCKET" 2>/dev/nu
 echo
 echo "==================================================================="
 echo "Legend:"
-echo "  - Scan Count 10-19: Potential scanner (monitored/low tarpit)"
-echo "  - Scan Count 20-34: Likely scanner (tarpitted with medium delay)"
-echo "  - Scan Count 35-49: Confirmed scanner (tarpitted with high delay)"
-echo "  - Scan Count 50+:   Aggressive scanner (blocked with 429 status)"
+echo "  - Scan Count 10-19: Low scanner → TARPIT 10s delay"
+echo "  - Scan Count 20-34: Medium scanner → TARPIT 10s (1st), SILENT-DROP (repeat)"
+echo "  - Scan Count 35-49: High scanner → SILENT-DROP (immediate disconnect)"
+echo "  - Scan Count 50+:   Critical scanner → BLOCKED (429 response)"
+echo "  - Burst (5+ in 10s): → TARPIT 10s (1st), SILENT-DROP (repeat)"
 echo "==================================================================="
 echo "Note: IPs are tracked for 1 hour since last activity"
 echo
