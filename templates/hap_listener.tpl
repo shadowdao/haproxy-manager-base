@@ -59,29 +59,34 @@ frontend web
     http-request deny deny_status 429 if scanner_critical
     
     # ESCALATING TARPIT RULES - Progressive delays based on offense level
-    # Level 0 (first offense): Short delays
-    http-request tarpit deny_status 429 timeout 2s if scanner_low escalation_level_0
-    http-request tarpit deny_status 429 timeout 3s if scanner_medium escalation_level_0
-    http-request tarpit deny_status 429 timeout 5s if scanner_high escalation_level_0
-    http-request tarpit deny_status 429 timeout 5s if burst_scanner escalation_level_0
+    # HAProxy 3.0 requires setting timeout before tarpit action
     
-    # Level 1 (second offense): Medium delays
-    http-request tarpit deny_status 429 timeout 8s if scanner_low escalation_level_1
-    http-request tarpit deny_status 429 timeout 12s if scanner_medium escalation_level_1
-    http-request tarpit deny_status 429 timeout 15s if scanner_high escalation_level_1
-    http-request tarpit deny_status 429 timeout 10s if burst_scanner escalation_level_1
+    # Level 0 (first offense): Short delays (2-5 seconds)
+    http-request set-timeout tarpit 2s if scanner_low escalation_level_0
+    http-request set-timeout tarpit 3s if scanner_medium escalation_level_0
+    http-request set-timeout tarpit 5s if scanner_high escalation_level_0
+    http-request set-timeout tarpit 5s if burst_scanner escalation_level_0
     
-    # Level 2 (third offense): Long delays
-    http-request tarpit deny_status 429 timeout 20s if scanner_low escalation_level_2
-    http-request tarpit deny_status 429 timeout 30s if scanner_medium escalation_level_2
-    http-request tarpit deny_status 429 timeout 45s if scanner_high escalation_level_2
-    http-request tarpit deny_status 429 timeout 25s if burst_scanner escalation_level_2
+    # Level 1 (second offense): Medium delays (8-15 seconds)
+    http-request set-timeout tarpit 8s if scanner_low escalation_level_1
+    http-request set-timeout tarpit 12s if scanner_medium escalation_level_1
+    http-request set-timeout tarpit 15s if scanner_high escalation_level_1
+    http-request set-timeout tarpit 10s if burst_scanner escalation_level_1
     
-    # Level 3+ (repeat offender): Maximum delays
-    http-request tarpit deny_status 429 timeout 60s if scanner_low escalation_level_3
-    http-request tarpit deny_status 429 timeout 60s if scanner_medium escalation_level_3
-    http-request tarpit deny_status 429 timeout 60s if scanner_high escalation_level_3
-    http-request tarpit deny_status 429 timeout 60s if burst_scanner escalation_level_3
+    # Level 2 (third offense): Long delays (20-45 seconds)
+    http-request set-timeout tarpit 20s if scanner_low escalation_level_2
+    http-request set-timeout tarpit 30s if scanner_medium escalation_level_2
+    http-request set-timeout tarpit 45s if scanner_high escalation_level_2
+    http-request set-timeout tarpit 25s if burst_scanner escalation_level_2
+    
+    # Level 3+ (repeat offender): Maximum delays (60 seconds)
+    http-request set-timeout tarpit 60s if scanner_low escalation_level_3
+    http-request set-timeout tarpit 60s if scanner_medium escalation_level_3
+    http-request set-timeout tarpit 60s if scanner_high escalation_level_3
+    http-request set-timeout tarpit 60s if burst_scanner escalation_level_3
+    
+    # Apply the tarpit action after setting the appropriate timeout
+    http-request tarpit deny_status 429 if scanner_low or scanner_medium or scanner_high or burst_scanner
     
     # Increment escalation level when we apply tarpit
     # This tracks how many times this IP has been tarpitted
