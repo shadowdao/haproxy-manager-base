@@ -201,12 +201,12 @@ frontend web
     # Other auth: 5 requests per 10s (stricter for non-WordPress)
     # XMLRPC: 20 requests per 10s (can be legitimately high for some plugins)
     acl auth_abuse sc0_http_req_rate gt 5
-    acl xmlrpc_abuse is_xmlrpc sc0_http_req_rate gt 20
+    acl xmlrpc_rate_abuse sc0_http_req_rate gt 20
 
     # Rate limiting for non-WordPress authentication endpoints
     http-request deny if is_login auth_abuse
     http-request deny if is_api_auth auth_abuse
-    http-request deny if xmlrpc_abuse !legitimate_bot !wordpress_app
+    http-request deny if is_xmlrpc xmlrpc_rate_abuse !legitimate_bot !wordpress_app
 
     # 8. HAProxy 3.0.11 Enhanced Logging with Threat Intelligence
     http-request capture var(txn.real_ip) len 40
