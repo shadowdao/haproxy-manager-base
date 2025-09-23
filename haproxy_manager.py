@@ -1170,6 +1170,14 @@ def generate_config():
         # Add LetsEncrypt Backend
         letsencrypt_backend = template_env.get_template('hap_letsencrypt_backend.tpl').render()
         config_parts.append(letsencrypt_backend)
+
+        # Add Security Tables
+        try:
+            security_tables = template_env.get_template('hap_security_tables.tpl').render()
+            config_parts.append(security_tables)
+        except Exception as e:
+            logger.warning(f"Security tables template not found: {e}")
+
         # Add Default Backend
         try:
             default_backend = template_env.get_template('hap_default_backend.tpl').render()

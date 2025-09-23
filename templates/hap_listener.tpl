@@ -4,15 +4,8 @@ frontend web
     # crt can now be a path, so it will load all .pem files in the path
     bind 0.0.0.0:443 ssl crt {{ crt_path }} alpn h2,http/1.1
     
-    # Multi-table tracking strategy for better performance and separation of concerns
     # Main rate limiting table (short-term, high-frequency tracking)
     stick-table type ip size 100k expire 10m store http_req_rate(10s),conn_rate(10s),http_err_rate(10s),gpc0
-
-    # Blacklist table for persistent offenders (long-term tracking)
-    stick-table type ip size 20k expire 24h store gpc0,gpc1 table security_blacklist
-
-    # WordPress-specific 403 tracking table
-    stick-table type ip size 50k expire 15m store http_err_rate(10s) table wp_403_track
     
     # Whitelist trusted networks and monitoring systems
     acl trusted_networks src 127.0.0.1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
@@ -51,7 +44,8 @@ frontend web
     acl suspicious_method method TRACE TRACK OPTIONS CONNECT PROPFIND
     acl dangerous_methods method PUT DELETE PATCH
     acl old_protocol req.proto_http -m str "HTTP/1.0"
-    acl missing_browser_headers !hdr(accept) !hdr(accept-language)
+    acl missing_accept_header hdr_cnt(accept) eq 0
+    acl missing_lang_header hdr_cnt(accept-language) eq 0
     acl excessive_params url_len gt 2000
     acl suspicious_referrer hdr_reg(referer) -i "(poker|casino|pharmacy|xxx)"
 
@@ -82,7 +76,7 @@ frontend web
     acl error_abuse sc0_http_err_rate gt 10
     acl wp_403_abuse sc1_http_err_rate(wp_403_track) gt 5
     acl blacklisted sc1_get_gpc0(security_blacklist) gt 0
-    acl auto_blacklist_candidate rate_severe !legitimate_bot !wordpress_app !browser_ua
+    acl auto_blacklist_candidate sc0_http_req_rate(0) gt 100
     acl marked_bad sc0_get_gpc0 gt 0
     acl repeat_offender sc1_get_gpc1(security_blacklist) gt 2
 
@@ -92,46 +86,41 @@ frontend web
 
     # Combine conditions to identify actual attacks vs legitimate use
     # Only block WordPress paths when combined with clear malicious indicators
-    acl wordpress_scanner is_wordpress_path bot_scanner !legitimate_bot !wordpress_app !browser_ua
-    acl wordpress_brute_force wp_403_abuse !legitimate_bot !wordpress_app !browser_ua
-    acl wordpress_suspicious is_wordpress_path bot_empty !legitimate_bot !wordpress_app
+    acl wordpress_scanner_attack is_wordpress_path bot_scanner
+    acl wordpress_brute_force_attack wp_403_abuse
+    acl wordpress_suspicious_access is_wordpress_path bot_empty
 
     # WordPress brute force detection now based on actual 403 failures (5+ in 10s)
     # This catches real authentication failures, not just POST requests
 
-    # Dynamic threat scoring system (inspired by HAProxy 2.6.12 best practices)
-    http-request set-var(txn.threat_score) int(0)
-    http-request add-var(txn.threat_score) int(10) if rate_abuse
-    http-request add-var(txn.threat_score) int(20) if conn_abuse
-    http-request add-var(txn.threat_score) int(30) if bot_scanner
-    http-request add-var(txn.threat_score) int(25) if scan_admin or scan_shells
-    http-request add-var(txn.threat_score) int(15) if sql_injection or directory_traversal
-    http-request add-var(txn.threat_score) int(10) if suspicious_method or missing_browser_headers
-    http-request add-var(txn.threat_score) int(40) if wordpress_brute_force
-    http-request add-var(txn.threat_score) int(50) if blacklisted
+    # Simplified threat detection for HAProxy 3.0 compatibility
+    # We'll use individual flags instead of cumulative scoring
+    acl high_threat bot_scanner or scan_admin or scan_shells
+    acl medium_threat sql_injection or directory_traversal or wordpress_brute_force_attack
+    acl low_threat rate_abuse or suspicious_method or missing_accept_header
+    acl critical_threat blacklisted or auto_blacklist_candidate
 
-    # 5. Dynamic blacklisting based on threat score and behavior
+    # 5. Dynamic blacklisting based on threat level
     http-request sc-inc-gpc0(1) 1 if auto_blacklist_candidate
-    http-request sc-inc-gpc1(1) 1 if { var(txn.threat_score) ge 40 }
+    http-request sc-inc-gpc1(1) 1 if high_threat or critical_threat
 
-    # Mark current session as bad based on threat score
-    http-request sc-set-gpc0(0) 1 if { var(txn.threat_score) ge 30 }
+    # Mark current session as bad based on threat level
+    http-request sc-set-gpc0(0) 1 if medium_threat or high_threat or critical_threat
 
-    # 6. Graduated response system based on threat score
-    # Low threat (10-19): Warning header only
-    http-request set-header X-Security-Warning "rate-limit-approaching" if { var(txn.threat_score) ge 10 } { var(txn.threat_score) lt 20 }
+    # 6. Graduated response system based on threat level
+    # Low threat: Warning header only
+    http-request set-header X-Security-Warning "rate-limit-approaching" if low_threat !legitimate_bot !wordpress_app !browser_ua
 
-    # Medium threat (20-39): Tarpit delay
-    http-request tarpit if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 40 }
+    # Medium threat: Tarpit delay
+    http-request tarpit if medium_threat !legitimate_bot !wordpress_app !browser_ua
 
-    # High threat (40-69): Immediate deny
-    http-request deny deny_status 403 if { var(txn.threat_score) ge 40 } { var(txn.threat_score) lt 70 }
+    # High threat: Immediate deny
+    http-request deny deny_status 403 if high_threat !legitimate_bot !wordpress_app !browser_ua
 
-    # Critical threat (70+): Blacklist and deny
-    http-request deny deny_status 403 if { var(txn.threat_score) ge 70 }
+    # Critical threat: Blacklist and deny
+    http-request deny deny_status 403 if critical_threat
 
-    # Legacy rules for immediate threats
-    http-request deny if blacklisted
+    # Additional immediate threat rules
     http-request deny if repeat_offender
     http-request deny if dangerous_methods !trusted_networks
 
@@ -153,15 +142,14 @@ frontend web
     http-request deny if is_api_auth auth_abuse
     http-request deny if xmlrpc_abuse !legitimate_bot !wordpress_app
 
-    # 8. Enhanced logging with threat scoring
+    # 8. Enhanced logging with threat level tracking
     http-request capture var(txn.real_ip) len 40
     http-request capture req.hdr(user-agent) len 150
-    http-request capture var(txn.threat_score) len 10
 
-    # Set log level based on threat score
-    http-request set-log-level info if { var(txn.threat_score) ge 10 } { var(txn.threat_score) lt 20 }
-    http-request set-log-level warning if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 40 }
-    http-request set-log-level alert if { var(txn.threat_score) ge 40 }
+    # Set log level based on threat level
+    http-request set-log-level info if low_threat
+    http-request set-log-level warning if medium_threat
+    http-request set-log-level alert if high_threat or critical_threat
 
     # Track WordPress paths for 403 response monitoring
     http-request set-var(txn.is_wp_path) int(1) if is_wordpress_path
