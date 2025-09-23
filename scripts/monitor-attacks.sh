@@ -42,17 +42,19 @@ show_threats() {
 show_recent_blocks() {
     echo "Recent Blocked Requests:"
     tail -100 "$LOG_FILE" 2>/dev/null | \
-        grep -E "(high_threat|medium_threat|low_threat|critical_threat|tarpit|denied|403)" | \
+        grep -E "(bot_scanner|scan_admin|scan_shells|sql_injection|directory_traversal|rate_abuse|tarpit|denied|403)" | \
         tail -10 | \
         awk '{
             if (match($0, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+/)) {
                 ip = substr($0, RSTART, RLENGTH)
                 gsub(/:.*/, "", ip)
                 reason = ""
-                if ($0 ~ /high_threat/) reason = "HIGH_THREAT"
-                else if ($0 ~ /critical_threat/) reason = "CRITICAL_THREAT"
-                else if ($0 ~ /medium_threat/) reason = "MEDIUM_THREAT"
-                else if ($0 ~ /low_threat/) reason = "LOW_THREAT"
+                if ($0 ~ /bot_scanner/) reason = "BOT_SCANNER"
+                else if ($0 ~ /scan_admin/) reason = "ADMIN_SCAN"
+                else if ($0 ~ /scan_shells/) reason = "SHELL_SCAN"
+                else if ($0 ~ /sql_injection/) reason = "SQL_INJECTION"
+                else if ($0 ~ /directory_traversal/) reason = "DIR_TRAVERSAL"
+                else if ($0 ~ /rate_abuse/) reason = "RATE_ABUSE"
                 else if ($0 ~ /tarpit/) reason = "TARPIT"
                 else if ($0 ~ /denied/) reason = "DENIED"
                 else if ($0 ~ /403/) reason = "BLOCKED"
