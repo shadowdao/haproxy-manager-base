@@ -165,21 +165,21 @@ frontend web
 
     # Graduated response system based on composite threat score
     # Level 1: Low threat (0-19) - Warning headers only
-    http-request set-header X-Threat-Level "LOW" if { var(txn.threat_score) lt 20 }
-    http-request set-header X-Security-Warning "monitoring" if { var(txn.threat_score) ge 1 } { var(txn.threat_score) lt 20 }
+    http-request set-header X-Threat-Level "LOW" if { var(txn.threat_score) -m int lt 20 }
+    http-request set-header X-Security-Warning "monitoring" if { var(txn.threat_score) -m int ge 1 } { var(txn.threat_score) -m int lt 20 }
 
     # Level 2: Medium threat (20-49) - Tarpit delays
-    http-request set-header X-Threat-Level "MEDIUM" if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 50 }
-    http-request tarpit if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 50 } !legitimate_bot !wordpress_app !browser_ua
+    http-request set-header X-Threat-Level "MEDIUM" if { var(txn.threat_score) -m int ge 20 } { var(txn.threat_score) -m int lt 50 }
+    http-request tarpit if { var(txn.threat_score) -m int ge 20 } { var(txn.threat_score) -m int lt 50 } !legitimate_bot !wordpress_app !browser_ua
 
     # Level 3: High threat (50-99) - Immediate deny
-    http-request set-header X-Threat-Level "HIGH" if { var(txn.threat_score) ge 50 } { var(txn.threat_score) lt 100 }
-    http-request deny deny_status 403 if { var(txn.threat_score) ge 50 } { var(txn.threat_score) lt 100 } !legitimate_bot !wordpress_app !browser_ua
+    http-request set-header X-Threat-Level "HIGH" if { var(txn.threat_score) -m int ge 50 } { var(txn.threat_score) -m int lt 100 }
+    http-request deny deny_status 403 if { var(txn.threat_score) -m int ge 50 } { var(txn.threat_score) -m int lt 100 } !legitimate_bot !wordpress_app !browser_ua
 
     # Level 4: Critical threat (100+) - Immediate blacklist and deny
-    http-request set-header X-Threat-Level "CRITICAL" if { var(txn.threat_score) ge 100 }
-    http-request sc-set-gpt(1,0) 1 if { var(txn.threat_score) ge 100 }  # Mark as manually blacklisted
-    http-request deny deny_status 403 if { var(txn.threat_score) ge 100 }
+    http-request set-header X-Threat-Level "CRITICAL" if { var(txn.threat_score) -m int ge 100 }
+    http-request sc-set-gpt(1,0) 1 if { var(txn.threat_score) -m int ge 100 }  # Mark as manually blacklisted
+    http-request deny deny_status 403 if { var(txn.threat_score) -m int ge 100 }
 
     # HTTP/2 specific protections
     http-request tarpit deny_status 400 if high_glitch_rate
@@ -223,9 +223,9 @@ frontend web
         %(threat_level)[res.hdr(X-Threat-Level)]"
 
     # Set log level based on threat score
-    http-request set-log-level info if { var(txn.threat_score) lt 20 }
-    http-request set-log-level warning if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 50 }
-    http-request set-log-level alert if { var(txn.threat_score) ge 50 }
+    http-request set-log-level info if { var(txn.threat_score) -m int lt 20 }
+    http-request set-log-level warning if { var(txn.threat_score) -m int ge 20 } { var(txn.threat_score) -m int lt 50 }
+    http-request set-log-level alert if { var(txn.threat_score) -m int ge 50 }
 
     # Track WordPress paths for authentication failure monitoring
     http-request set-var(txn.is_wp_path) int(1) if is_wordpress_path
