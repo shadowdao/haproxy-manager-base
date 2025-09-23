@@ -11,30 +11,65 @@ echo "HAProxy Security Monitor - Real-time Attack Detection"
 echo "==================================================="
 echo ""
 
-# Function to show current threats
+# Function to show current threats with HAProxy 3.0.11 metrics
 show_threats() {
-    echo "Current Threat IPs (Rate Limiting Table):"
+    echo "HAProxy 3.0.11 Threat Intelligence Dashboard:"
     echo "show table web" | socat stdio "$SOCKET" 2>/dev/null | \
-        awk '$4 > 0 || $5 > 20 || $6 > 5 || $7 > 10 {
-            printf "%-15s req_rate:%-3s err_rate:%-3s conn_rate:%-3s marked:%s\n",
-                   $1, $5, $6, $7, $4
-        }' | head -10
+        awk 'NR>1 {
+            # Parse the stick table output for array-based GPC values
+            ip = $1
+            # Look for GPC array values in the data
+            auth_fail = 0; authz_fail = 0; rate_viol = 0; scanner = 0
+            sql_inj = 0; traversal = 0; wp_brute = 0; admin_scan = 0
+            shell_att = 0; repeat_off = 0; manual_bl = 0; auto_bl = 0
+            glitch_rate = 0; threat_score = 0
+
+            # Extract relevant metrics (simplified parsing)
+            if ($0 ~ /gpc\(0\)=([0-9]+)/) {
+                match($0, /gpc\(0\)=([0-9]+)/, arr); auth_fail = arr[1]
+            }
+            if ($0 ~ /gpc\(1\)=([0-9]+)/) {
+                match($0, /gpc\(1\)=([0-9]+)/, arr); authz_fail = arr[1]
+            }
+            if ($0 ~ /gpc\(3\)=([0-9]+)/) {
+                match($0, /gpc\(3\)=([0-9]+)/, arr); scanner = arr[1]
+            }
+            if ($0 ~ /gpc\(12\)=([0-9]+)/) {
+                match($0, /gpc\(12\)=([0-9]+)/, arr); repeat_off = arr[1]
+            }
+            if ($0 ~ /gpc\(13\)=([0-9]+)/) {
+                match($0, /gpc\(13\)=([0-9]+)/, arr); manual_bl = arr[1]
+            }
+            if ($0 ~ /glitch_rate\(300s\)=([0-9]+)/) {
+                match($0, /glitch_rate\(300s\)=([0-9]+)/, arr); glitch_rate = arr[1]
+            }
+
+            # Calculate composite threat score (simplified)
+            threat_score = auth_fail*10 + authz_fail*8 + scanner*12 + repeat_off*25 + manual_bl*100
+
+            # Only show IPs with significant threat indicators
+            if (auth_fail > 0 || authz_fail > 0 || scanner > 0 || repeat_off > 0 || manual_bl > 0 || glitch_rate > 0) {
+                threat_level = "LOW"
+                if (threat_score >= 100) threat_level = "CRITICAL"
+                else if (threat_score >= 50) threat_level = "HIGH"
+                else if (threat_score >= 20) threat_level = "MEDIUM"
+
+                printf "%-15s [%8s] Score:%-3d Auth:%-2d Authz:%-2d Scanner:%-1d Repeat:%-1d Glitch:%-2d\n",
+                       ip, threat_level, threat_score, auth_fail, authz_fail, scanner, repeat_off, glitch_rate
+            }
+        }' | head -15
 
     echo ""
-    echo "Blacklisted IPs (24h tracking):"
-    echo "show table security_blacklist" | socat stdio "$SOCKET" 2>/dev/null | \
-        awk '$4 > 0 || $5 > 0 {
-            printf "%-15s blacklisted:%s violations:%s\n",
-                   $1, $4, $5
-        }' | head -10
-
-    echo ""
-    echo "WordPress 403 Failures:"
-    echo "show table wp_403_track" | socat stdio "$SOCKET" 2>/dev/null | \
-        awk '$4 > 2 {
-            printf "%-15s 403_rate:%-3s\n",
-                   $1, $4
-        }' | head -10
+    echo "Top HTTP/2 Protocol Violators:"
+    echo "show table web" | socat stdio "$SOCKET" 2>/dev/null | \
+        awk 'NR>1 && $0 ~ /glitch/ {
+            if ($0 ~ /glitch_rate\(300s\)=([0-9]+)/) {
+                match($0, /glitch_rate\(300s\)=([0-9]+)/, arr)
+                if (arr[1] > 2) {
+                    printf "%-15s glitch_rate:%-3s\n", $1, arr[1]
+                }
+            }
+        }' | head -5
     echo "---------------------------------------------------"
 }
 

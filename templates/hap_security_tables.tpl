@@ -1,6 +1,7 @@
-# Security stick tables for multi-table tracking
-backend security_blacklist
-    stick-table type ip size 20k expire 24h store gpc0,gpc1
+# HAProxy 3.0.11 eliminates need for separate security tables
+# All threat intelligence is now consolidated in the main frontend table
+# using array-based GPC system with 15 threat indicators
 
-backend wp_403_track
-    stick-table type ip size 50k expire 15m store http_err_rate(10s)
+# Placeholder for future security extensions
+# The main table in hap_listener.tpl now provides comprehensive
+# multi-dimensional threat tracking with weighted scoring

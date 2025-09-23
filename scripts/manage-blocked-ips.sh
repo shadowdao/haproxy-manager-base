@@ -50,14 +50,28 @@ case "$1" in
         ;;
 
     stats)
-        echo "=== Rate Limiting Table ==="
-        echo "show table web" | socat stdio "$SOCKET" | head -20
+        echo "=== HAProxy 3.0.11 Threat Intelligence Dashboard ==="
+        echo "show table web" | socat stdio "$SOCKET" | awk 'NR<=21'
         echo ""
-        echo "=== Security Blacklist (24h) ==="
-        echo "show table security_blacklist" | socat stdio "$SOCKET" | head -20
-        echo ""
-        echo "=== WordPress 403 Tracking ==="
-        echo "show table wp_403_track" | socat stdio "$SOCKET" | head -20
+        echo "=== Top Threat Scores ==="
+        echo "show table web" | socat stdio "$SOCKET" | awk '
+        NR>1 {
+            ip = $1
+            auth_fail = 0; authz_fail = 0; scanner = 0; repeat_off = 0; manual_bl = 0
+
+            if ($0 ~ /gpc\(0\)=([0-9]+)/) { match($0, /gpc\(0\)=([0-9]+)/, arr); auth_fail = arr[1] }
+            if ($0 ~ /gpc\(1\)=([0-9]+)/) { match($0, /gpc\(1\)=([0-9]+)/, arr); authz_fail = arr[1] }
+            if ($0 ~ /gpc\(3\)=([0-9]+)/) { match($0, /gpc\(3\)=([0-9]+)/, arr); scanner = arr[1] }
+            if ($0 ~ /gpc\(12\)=([0-9]+)/) { match($0, /gpc\(12\)=([0-9]+)/, arr); repeat_off = arr[1] }
+            if ($0 ~ /gpc\(13\)=([0-9]+)/) { match($0, /gpc\(13\)=([0-9]+)/, arr); manual_bl = arr[1] }
+
+            threat_score = auth_fail*10 + authz_fail*8 + scanner*12 + repeat_off*25 + manual_bl*100
+
+            if (threat_score > 0) {
+                printf "%-15s Score:%-3d (Auth:%d Authz:%d Scanner:%d Repeat:%d Manual:%d)\n",
+                       ip, threat_score, auth_fail, authz_fail, scanner, repeat_off, manual_bl
+            }
+        }' | sort -k2 -nr | head -10
         ;;
 
     blacklist)
@@ -65,9 +79,9 @@ case "$1" in
             echo "Usage: $0 blacklist IP_ADDRESS"
             exit 1
         fi
-        # Add to permanent blacklist table
-        echo "set table security_blacklist key $2 data.gpc0 1" | socat stdio "$SOCKET"
-        echo "Permanently blacklisted IP: $2"
+        # Add to manual blacklist using GPC(13)
+        echo "set table web key $2 data.gpc(13) 1" | socat stdio "$SOCKET"
+        echo "Manually blacklisted IP: $2 (GPC(13) = 1)"
         ;;
 
     unblacklist)
@@ -75,22 +89,52 @@ case "$1" in
             echo "Usage: $0 unblacklist IP_ADDRESS"
             exit 1
         fi
-        # Remove from blacklist table
-        echo "clear table security_blacklist key $2" | socat stdio "$SOCKET"
-        echo "Removed IP from blacklist: $2"
+        # Clear manual blacklist flag
+        echo "set table web key $2 data.gpc(13) 0" | socat stdio "$SOCKET"
+        echo "Removed manual blacklist for IP: $2"
+        ;;
+
+    auto-blacklist)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 auto-blacklist IP_ADDRESS"
+            exit 1
+        fi
+        # Add to auto-blacklist using GPC(14)
+        echo "set table web key $2 data.gpc(14) 1" | socat stdio "$SOCKET"
+        echo "Auto-blacklisted IP: $2 (GPC(14) = 1)"
+        ;;
+
+    threat-score)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 threat-score IP_ADDRESS"
+            exit 1
+        fi
+        # Show detailed threat breakdown for specific IP
+        echo "Threat analysis for $2:"
+        echo "show table web key $2" | socat stdio "$SOCKET"
         ;;
 
     *)
-        echo "Usage: $0 {block|unblock|list|clear|blacklist|unblacklist|stats} [IP_ADDRESS]"
+        echo "Usage: $0 {block|unblock|list|clear|blacklist|unblacklist|auto-blacklist|threat-score|stats} [IP_ADDRESS]"
         echo ""
-        echo "Commands:"
-        echo "  block IP       - Block an IP address (map file)"
-        echo "  unblock IP     - Unblock an IP address (map file)"
-        echo "  blacklist IP   - Add to permanent blacklist (24h table)"
-        echo "  unblacklist IP - Remove from permanent blacklist"
-        echo "  list           - List all blocked IPs (map file)"
-        echo "  clear          - Clear all blocked IPs (map file)"
-        echo "  stats          - Show current stick table stats"
+        echo "HAProxy 3.0.11 Enhanced Security Commands:"
+        echo "  block IP         - Block IP via map file (immediate)"
+        echo "  unblock IP       - Unblock IP from map file"
+        echo "  blacklist IP     - Manual blacklist via GPC(13) array"
+        echo "  unblacklist IP   - Remove manual blacklist flag"
+        echo "  auto-blacklist IP - Auto-blacklist via GPC(14) array"
+        echo "  threat-score IP  - Show detailed threat analysis for IP"
+        echo "  list             - List all blocked IPs (map file)"
+        echo "  clear            - Clear all blocked IPs (map file)"
+        echo "  stats            - Show threat intelligence dashboard"
+        echo ""
+        echo "Array-Based GPC Threat Matrix:"
+        echo "  gpc(0):  Authentication failures (401s)     × 10"
+        echo "  gpc(1):  Authorization failures (403s)      × 8"
+        echo "  gpc(3):  Scanner/Bot detection              × 12"
+        echo "  gpc(12): Repeat offender flag               × 25"
+        echo "  gpc(13): Manual blacklist flag              × 100"
+        echo "  gpc(14): Auto-blacklist candidate           × 50"
         exit 1
         ;;
 esac

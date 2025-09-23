@@ -4,8 +4,28 @@ frontend web
     # crt can now be a path, so it will load all .pem files in the path
     bind 0.0.0.0:443 ssl crt {{ crt_path }} alpn h2,http/1.1
     
-    # Main rate limiting table (short-term, high-frequency tracking)
-    stick-table type ip size 100k expire 10m store http_req_rate(10s),conn_rate(10s),http_err_rate(10s),gpc0
+    # HAProxy 3.0.11 Enhanced Security with Array-Based GPC System
+    # Multi-dimensional threat scoring with weighted analysis
+    stick-table type ipv6 size 200k expire 30m store \
+        gpc(15),gpc_rate(15,60s),gpt(5),glitch_cnt,glitch_rate(300s),\
+        http_req_rate(60s),http_err_rate(300s),conn_rate(10s),bytes_out_rate(60s)
+
+    # Threat Scoring Matrix (GPC Array Indices):
+    # gpc(0):  Authentication failures (401s)     - Weight: 10
+    # gpc(1):  Authorization failures (403s)      - Weight: 8
+    # gpc(2):  Rate limit violations              - Weight: 4
+    # gpc(3):  Scanner/Bot detection              - Weight: 12
+    # gpc(4):  SQL injection attempts             - Weight: 15
+    # gpc(5):  Directory traversal attempts       - Weight: 10
+    # gpc(6):  WordPress brute force attempts     - Weight: 8
+    # gpc(7):  Admin panel scanning               - Weight: 12
+    # gpc(8):  Shell/exploit attempts             - Weight: 20
+    # gpc(9):  Suspicious HTTP methods            - Weight: 6
+    # gpc(10): Protocol violations (HTTP/2)       - Weight: 15
+    # gpc(11): Bandwidth abuse patterns           - Weight: 5
+    # gpc(12): Repeat offender flag               - Weight: 25
+    # gpc(13): Manual blacklist flag              - Weight: 100
+    # gpc(14): Auto-blacklist candidate           - Weight: 50
     
     # Whitelist trusted networks and monitoring systems
     acl trusted_networks src 127.0.0.1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
@@ -69,57 +89,114 @@ frontend web
     # APPLY SECURITY RULES
     # ============================================
 
-    # 4. Enhanced rate limiting and blacklist checking
+    # 4. HAProxy 3.0.11 Enhanced Threat Detection with Array-Based Scoring
+    # Rate and connection abuse detection
     acl rate_abuse sc0_http_req_rate gt 30
     acl rate_severe sc0_http_req_rate gt 100
     acl conn_abuse sc0_conn_rate gt 20
     acl error_abuse sc0_http_err_rate gt 10
-    acl wp_403_abuse sc1_http_err_rate(wp_403_track) gt 5
-    acl blacklisted sc1_get_gpc0(security_blacklist) gt 0
-    acl auto_blacklist_candidate sc0_http_req_rate(0) gt 100
-    acl marked_bad sc0_get_gpc0 gt 0
-    acl repeat_offender sc1_get_gpc1(security_blacklist) gt 2
+    acl bandwidth_abuse sc0_bytes_out_rate gt 10485760  # 10MB/s
+
+    # HTTP/2 Protocol violations and glitch detection
+    acl protocol_violations sc0_glitch_rate gt 5
+    acl glitch_abuse fc_glitches gt 100
+    acl high_glitch_rate sc0_glitch_rate gt 10
+
+    # Array-based threat flags (using GPC indices from matrix above)
+    acl auth_failures sc0_get_gpc(0) gt 5               # 401 errors
+    acl authz_failures sc0_get_gpc(1) gt 5              # 403 errors
+    acl rate_violations sc0_get_gpc(2) gt 10            # Rate limit hits
+    acl scanner_detected sc0_get_gpc(3) gt 0            # Bot/scanner flag
+    acl sql_injection_attempts sc0_get_gpc(4) gt 0      # SQL injection flag
+    acl traversal_attempts sc0_get_gpc(5) gt 0          # Directory traversal
+    acl wp_brute_force sc0_get_gpc(6) gt 3              # WordPress attacks
+    acl admin_scanning sc0_get_gpc(7) gt 0              # Admin panel scans
+    acl shell_attempts sc0_get_gpc(8) gt 0              # Shell/exploit attempts
+    acl method_violations sc0_get_gpc(9) gt 2           # Suspicious methods
+    acl protocol_violator sc0_get_gpc(10) gt 3          # HTTP/2 violations
+    acl bandwidth_violator sc0_get_gpc(11) gt 5         # Bandwidth abuse
+    acl repeat_offender sc0_get_gpc(12) gt 0            # Repeat offender flag
+    acl manually_blacklisted sc0_get_gpc(13) gt 0       # Manual blacklist
+    acl auto_blacklist_candidate sc0_get_gpc(14) gt 0   # Auto-blacklist flag
 
     # WordPress-specific detection logic
     # We focus on clear scanner indicators rather than all errors for WordPress paths
     # since 404s on wp-admin are normal (CSS, JS files, etc.)
 
-    # WordPress brute force detection now based on actual 403 failures (5+ in 10s)
-    # This catches real authentication failures, not just POST requests
+    # 5. HAProxy 3.0.11 Array-Based GPC Threat Tracking System
+    # Track individual threat indicators in their dedicated GPC array slots
 
-    # All threat detection will be done directly in http-request rules
-    # using the base ACLs defined above to avoid ACL-reference issues
+    # Rate limit violations tracking
+    http-request sc-inc-gpc(2,0) if rate_abuse
 
-    # 5. Dynamic blacklisting based on threat level (using base ACLs directly)
-    http-request sc-inc-gpc0(1) if auto_blacklist_candidate
-    http-request sc-inc-gpc1(1) if bot_scanner or scan_admin or scan_shells
-    http-request sc-inc-gpc1(1) if blacklisted
+    # Scanner and bot detection
+    http-request sc-inc-gpc(3,0) if bot_scanner
 
-    # Mark current session as bad based on threat level
-    http-request sc-set-gpc0(0) 1 if sql_injection or directory_traversal or wp_403_abuse
-    http-request sc-set-gpc0(0) 1 if bot_scanner or scan_admin or scan_shells
-    http-request sc-set-gpc0(0) 1 if blacklisted or auto_blacklist_candidate
+    # Attack pattern detection
+    http-request sc-inc-gpc(4,0) if sql_injection
+    http-request sc-inc-gpc(5,0) if directory_traversal
+    http-request sc-inc-gpc(7,0) if scan_admin
+    http-request sc-inc-gpc(8,0) if scan_shells
+    http-request sc-inc-gpc(9,0) if suspicious_method
 
-    # 6. Graduated response system based on threat level
-    # Low threat: Warning header only
-    http-request set-header X-Security-Warning "rate-limit-approaching" if rate_abuse !legitimate_bot !wordpress_app !browser_ua
-    http-request set-header X-Security-Warning "suspicious-method" if suspicious_method !legitimate_bot !wordpress_app !browser_ua
-    http-request set-header X-Security-Warning "missing-headers" if missing_accept_header !legitimate_bot !wordpress_app !browser_ua
+    # HTTP/2 protocol violations tracking
+    http-request sc-inc-gpc(10,0) if protocol_violations
+    http-request sc-inc-gpc(10,0) if glitch_abuse
 
-    # Medium threat: Tarpit delay
-    http-request tarpit if sql_injection !legitimate_bot !wordpress_app !browser_ua
-    http-request tarpit if directory_traversal !legitimate_bot !wordpress_app !browser_ua
-    http-request tarpit if wp_403_abuse !legitimate_bot !wordpress_app !browser_ua
+    # Bandwidth abuse tracking
+    http-request sc-inc-gpc(11,0) if bandwidth_abuse
 
-    # High threat: Immediate deny
-    http-request deny deny_status 403 if bot_scanner !legitimate_bot !wordpress_app !browser_ua
-    http-request deny deny_status 403 if scan_admin !legitimate_bot !wordpress_app !browser_ua
-    http-request deny deny_status 403 if scan_shells !legitimate_bot !wordpress_app !browser_ua
-    http-request deny deny_status 403 if is_wordpress_path bot_scanner !legitimate_bot !wordpress_app !browser_ua
+    # Auto-blacklist candidate marking
+    http-request sc-set-gpc(14,0) 1 if rate_severe
 
-    # Critical threat: Blacklist and deny
-    http-request deny deny_status 403 if blacklisted
-    http-request deny deny_status 403 if auto_blacklist_candidate
+    # Repeat offender escalation (increment when multiple threats detected)
+    http-request sc-inc-gpc(12,0) if scanner_detected sql_injection_attempts
+    http-request sc-inc-gpc(12,0) if admin_scanning shell_attempts
+
+    # 6. HAProxy 3.0.11 Composite Threat Scoring and Graduated Response System
+    # Calculate weighted threat score using array GPC values
+    http-request set-var(txn.threat_score) int(0)
+    http-request add-var(txn.threat_score) sc0_get_gpc(0),mul(10)   # Auth failures × 10
+    http-request add-var(txn.threat_score) sc0_get_gpc(1),mul(8)    # Authz failures × 8
+    http-request add-var(txn.threat_score) sc0_get_gpc(2),mul(4)    # Rate violations × 4
+    http-request add-var(txn.threat_score) sc0_get_gpc(3),mul(12)   # Scanner detection × 12
+    http-request add-var(txn.threat_score) sc0_get_gpc(4),mul(15)   # SQL injection × 15
+    http-request add-var(txn.threat_score) sc0_get_gpc(5),mul(10)   # Directory traversal × 10
+    http-request add-var(txn.threat_score) sc0_get_gpc(6),mul(8)    # WP brute force × 8
+    http-request add-var(txn.threat_score) sc0_get_gpc(7),mul(12)   # Admin scanning × 12
+    http-request add-var(txn.threat_score) sc0_get_gpc(8),mul(20)   # Shell attempts × 20
+    http-request add-var(txn.threat_score) sc0_get_gpc(9),mul(6)    # Method violations × 6
+    http-request add-var(txn.threat_score) sc0_get_gpc(10),mul(15)  # Protocol violations × 15
+    http-request add-var(txn.threat_score) sc0_get_gpc(11),mul(5)   # Bandwidth abuse × 5
+    http-request add-var(txn.threat_score) sc0_get_gpc(12),mul(25)  # Repeat offender × 25
+    http-request add-var(txn.threat_score) sc0_get_gpc(13),mul(100) # Manual blacklist × 100
+    http-request add-var(txn.threat_score) sc0_get_gpc(14),mul(50)  # Auto-blacklist × 50
+
+    # Add HTTP/2 glitch score
+    http-request add-var(txn.threat_score) fc_glitches,mul(2)       # Glitches × 2
+
+    # Graduated response system based on composite threat score
+    # Level 1: Low threat (0-19) - Warning headers only
+    http-request set-header X-Threat-Level "LOW" if { var(txn.threat_score) lt 20 }
+    http-request set-header X-Security-Warning "monitoring" if { var(txn.threat_score) ge 1 } { var(txn.threat_score) lt 20 }
+
+    # Level 2: Medium threat (20-49) - Tarpit delays
+    http-request set-header X-Threat-Level "MEDIUM" if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 50 }
+    http-request tarpit if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 50 } !legitimate_bot !wordpress_app !browser_ua
+
+    # Level 3: High threat (50-99) - Immediate deny
+    http-request set-header X-Threat-Level "HIGH" if { var(txn.threat_score) ge 50 } { var(txn.threat_score) lt 100 }
+    http-request deny deny_status 403 if { var(txn.threat_score) ge 50 } { var(txn.threat_score) lt 100 } !legitimate_bot !wordpress_app !browser_ua
+
+    # Level 4: Critical threat (100+) - Immediate blacklist and deny
+    http-request set-header X-Threat-Level "CRITICAL" if { var(txn.threat_score) ge 100 }
+    http-request sc-set-gpc(13,0) 1 if { var(txn.threat_score) ge 100 }  # Mark as manually blacklisted
+    http-request deny deny_status 403 if { var(txn.threat_score) ge 100 }
+
+    # HTTP/2 specific protections
+    http-request tarpit deny_status 400 if high_glitch_rate
+    http-request deny if glitch_abuse
+    http-request silent-drop if protocol_violator
 
     # Additional immediate threat rules
     http-request deny if repeat_offender
@@ -143,21 +220,37 @@ frontend web
     http-request deny if is_api_auth auth_abuse
     http-request deny if xmlrpc_abuse !legitimate_bot !wordpress_app
 
-    # 8. Enhanced logging with threat level tracking
+    # 8. HAProxy 3.0.11 Enhanced Logging with Threat Intelligence
     http-request capture var(txn.real_ip) len 40
     http-request capture req.hdr(user-agent) len 150
+    http-request capture var(txn.threat_score) len 10
 
-    # Set log level based on threat level (using base ACLs directly)
-    http-request set-log-level info if rate_abuse or suspicious_method or missing_accept_header
-    http-request set-log-level warning if sql_injection or directory_traversal or wp_403_abuse
-    http-request set-log-level alert if bot_scanner or scan_admin or scan_shells
-    http-request set-log-level alert if blacklisted or auto_blacklist_candidate
+    # Enhanced logging format with glitch information
+    log-format "%{+json}o \
+        %(client_ip)[var(txn.real_ip)] \
+        %(threat_score)[var(txn.threat_score)] \
+        %(glitches)[fc_glitches] \
+        %(h2_streams)[fc_nb_streams] \
+        %(user_agent)[capture.req.hdr(1)] \
+        %(threat_level)[res.hdr(X-Threat-Level)]"
 
-    # Track WordPress paths for 403 response monitoring
+    # Set log level based on threat score
+    http-request set-log-level info if { var(txn.threat_score) lt 20 }
+    http-request set-log-level warning if { var(txn.threat_score) ge 20 } { var(txn.threat_score) lt 50 }
+    http-request set-log-level alert if { var(txn.threat_score) ge 50 }
+
+    # Track WordPress paths for authentication failure monitoring
     http-request set-var(txn.is_wp_path) int(1) if is_wordpress_path
 
-    # 9. Response-phase tracking for WordPress 403 failures
-    http-response track-sc1 var(txn.real_ip) table wp_403_track if { var(txn.is_wp_path) -m int 1 } { status 403 }
+    # 9. Response-phase tracking for authentication and authorization failures
+    # Track 401 authentication failures in gpc(0)
+    http-response sc-inc-gpc(0,0) if { status 401 }
+
+    # Track 403 authorization failures in gpc(1) - includes WordPress brute force
+    http-response sc-inc-gpc(1,0) if { status 403 }
+
+    # Track WordPress-specific 403 failures in gpc(6)
+    http-response sc-inc-gpc(6,0) if { var(txn.is_wp_path) -m int 1 } { status 403 }
     
     # IP blocking using map file (no word limit, runtime updates supported)
     # Map file: /etc/haproxy/blocked_ips.map
