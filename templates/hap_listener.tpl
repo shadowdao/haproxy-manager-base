@@ -79,9 +79,8 @@ frontend web
     http-request set-var(txn.real_ip) req.hdr(X-Forwarded-For) if !has_cf_connecting_ip !has_x_real_ip has_x_forwarded_for
     http-request set-var(txn.real_ip) src if !has_cf_connecting_ip !has_x_real_ip !has_x_forwarded_for
     
-    # Multi-table tracking for comprehensive security monitoring
+    # Single table tracking for comprehensive security monitoring
     http-request track-sc0 var(txn.real_ip)
-    http-request track-sc1 var(txn.real_ip) table security_blacklist
 
     # ============================================
     # APPLY SECURITY RULES
@@ -214,7 +213,7 @@ frontend web
     http-request capture var(txn.threat_score) len 10
 
     # Enhanced logging format with glitch information
-    log-format "%{+json}o %(client_ip)[var(txn.real_ip)] %(threat_score)[var(txn.threat_score)] %(glitches)[fc_glitches] %(h2_streams)[fc_nb_streams] %(user_agent)[capture.req.hdr(1)] %(threat_level)[res.hdr(X-Threat-Level)]"
+    log-format "%{+json}o %(client_ip)[var(txn.real_ip)] %(threat_score)[var(txn.threat_score)] %(glitches)[fc_glitches] %(h2_streams)[fc_nb_streams] %(user_agent)[capture.req.hdr(1)]"
 
     # Set log level based on threat score
     http-request set-log-level info if { var(txn.threat_score) -m int lt 20 }
