@@ -30,7 +30,7 @@ global
     http-fail-codes 500-503     # Server errors for monitoring
 
     # HTTP/2 Security and Performance Tuning
-    tune.h2.fe-max-total-streams 2000        # Connection cycling for security
+    tune.h2.fe.max-total-streams 2000        # Connection cycling for security
     tune.h2.fe.glitches-threshold 50         # Protocol violation detection
     tune.h2.fe.max-concurrent-streams 100    # Balanced security/performance
     tune.bufsize 32768                       # Enhanced HTTP/2 protection

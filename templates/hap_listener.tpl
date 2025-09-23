@@ -6,9 +6,7 @@ frontend web
     
     # HAProxy 3.0.11 Enhanced Security with Array-Based GPC System
     # Multi-dimensional threat scoring with weighted analysis
-    stick-table type ipv6 size 200k expire 30m store \
-        gpc(15),gpc_rate(15,60s),gpt(5),glitch_cnt,glitch_rate(300s),\
-        http_req_rate(60s),http_err_rate(300s),conn_rate(10s),bytes_out_rate(60s)
+    stick-table type ipv6 size 200k expire 30m store gpc(15),gpc_rate(15,60s),gpt(5),glitch_cnt,glitch_rate(300s),http_req_rate(60s),http_err_rate(300s),conn_rate(10s),bytes_out_rate(60s)
 
     # Threat Scoring Matrix (GPC Array Indices):
     # gpc(0):  Authentication failures (401s)     - Weight: 10
@@ -103,21 +101,21 @@ frontend web
     acl high_glitch_rate sc0_glitch_rate gt 10
 
     # Array-based threat flags (using GPC indices from matrix above)
-    acl auth_failures sc0_get_gpc(0) gt 5               # 401 errors
-    acl authz_failures sc0_get_gpc(1) gt 5              # 403 errors
-    acl rate_violations sc0_get_gpc(2) gt 10            # Rate limit hits
-    acl scanner_detected sc0_get_gpc(3) gt 0            # Bot/scanner flag
-    acl sql_injection_attempts sc0_get_gpc(4) gt 0      # SQL injection flag
-    acl traversal_attempts sc0_get_gpc(5) gt 0          # Directory traversal
-    acl wp_brute_force sc0_get_gpc(6) gt 3              # WordPress attacks
-    acl admin_scanning sc0_get_gpc(7) gt 0              # Admin panel scans
-    acl shell_attempts sc0_get_gpc(8) gt 0              # Shell/exploit attempts
-    acl method_violations sc0_get_gpc(9) gt 2           # Suspicious methods
-    acl protocol_violator sc0_get_gpc(10) gt 3          # HTTP/2 violations
-    acl bandwidth_violator sc0_get_gpc(11) gt 5         # Bandwidth abuse
-    acl repeat_offender sc0_get_gpc(12) gt 0            # Repeat offender flag
-    acl manually_blacklisted sc0_get_gpc(13) gt 0       # Manual blacklist
-    acl auto_blacklist_candidate sc0_get_gpc(14) gt 0   # Auto-blacklist flag
+    acl auth_failures sc_get_gpc(0,0) gt 5               # 401 errors
+    acl authz_failures sc_get_gpc(1,0) gt 5              # 403 errors
+    acl rate_violations sc_get_gpc(2,0) gt 10            # Rate limit hits
+    acl scanner_detected sc_get_gpc(3,0) gt 0            # Bot/scanner flag
+    acl sql_injection_attempts sc_get_gpc(4,0) gt 0      # SQL injection flag
+    acl traversal_attempts sc_get_gpc(5,0) gt 0          # Directory traversal
+    acl wp_brute_force sc_get_gpc(6,0) gt 3              # WordPress attacks
+    acl admin_scanning sc_get_gpc(7,0) gt 0              # Admin panel scans
+    acl shell_attempts sc_get_gpc(8,0) gt 0              # Shell/exploit attempts
+    acl method_violations sc_get_gpc(9,0) gt 2           # Suspicious methods
+    acl protocol_violator sc_get_gpc(10,0) gt 3          # HTTP/2 violations
+    acl bandwidth_violator sc_get_gpc(11,0) gt 5         # Bandwidth abuse
+    acl repeat_offender sc_get_gpc(12,0) gt 0            # Repeat offender flag
+    acl manually_blacklisted sc_get_gpt(1,0) gt 0       # Manual blacklist
+    acl auto_blacklist_candidate sc_get_gpt(0,0) gt 0   # Auto-blacklist flag
 
     # WordPress-specific detection logic
     # We focus on clear scanner indicators rather than all errors for WordPress paths
@@ -146,34 +144,24 @@ frontend web
     # Bandwidth abuse tracking
     http-request sc-inc-gpc(11,0) if bandwidth_abuse
 
-    # Auto-blacklist candidate marking
-    http-request sc-set-gpc(14,0) 1 if rate_severe
+    # Auto-blacklist candidate marking (using GPT instead of GPC for setting values)
+    http-request sc-set-gpt(0,0) 1 if rate_severe
 
     # Repeat offender escalation (increment when multiple threats detected)
     http-request sc-inc-gpc(12,0) if scanner_detected sql_injection_attempts
     http-request sc-inc-gpc(12,0) if admin_scanning shell_attempts
 
     # 6. HAProxy 3.0.11 Composite Threat Scoring and Graduated Response System
-    # Calculate weighted threat score using array GPC values
+    # Calculate weighted threat score using array GPC values (simplified approach)
     http-request set-var(txn.threat_score) int(0)
-    http-request add-var(txn.threat_score) sc0_get_gpc(0),mul(10)   # Auth failures × 10
-    http-request add-var(txn.threat_score) sc0_get_gpc(1),mul(8)    # Authz failures × 8
-    http-request add-var(txn.threat_score) sc0_get_gpc(2),mul(4)    # Rate violations × 4
-    http-request add-var(txn.threat_score) sc0_get_gpc(3),mul(12)   # Scanner detection × 12
-    http-request add-var(txn.threat_score) sc0_get_gpc(4),mul(15)   # SQL injection × 15
-    http-request add-var(txn.threat_score) sc0_get_gpc(5),mul(10)   # Directory traversal × 10
-    http-request add-var(txn.threat_score) sc0_get_gpc(6),mul(8)    # WP brute force × 8
-    http-request add-var(txn.threat_score) sc0_get_gpc(7),mul(12)   # Admin scanning × 12
-    http-request add-var(txn.threat_score) sc0_get_gpc(8),mul(20)   # Shell attempts × 20
-    http-request add-var(txn.threat_score) sc0_get_gpc(9),mul(6)    # Method violations × 6
-    http-request add-var(txn.threat_score) sc0_get_gpc(10),mul(15)  # Protocol violations × 15
-    http-request add-var(txn.threat_score) sc0_get_gpc(11),mul(5)   # Bandwidth abuse × 5
-    http-request add-var(txn.threat_score) sc0_get_gpc(12),mul(25)  # Repeat offender × 25
-    http-request add-var(txn.threat_score) sc0_get_gpc(13),mul(100) # Manual blacklist × 100
-    http-request add-var(txn.threat_score) sc0_get_gpc(14),mul(50)  # Auto-blacklist × 50
 
-    # Add HTTP/2 glitch score
-    http-request add-var(txn.threat_score) fc_glitches,mul(2)       # Glitches × 2
+    # Individual threat component tracking (we'll use ACLs for graduated response)
+    # Simplified scoring for critical threats only
+    http-request set-var(txn.threat_score) int(100) if manually_blacklisted
+    http-request set-var(txn.threat_score) int(50) if auto_blacklist_candidate !manually_blacklisted
+    http-request set-var(txn.threat_score) int(25) if repeat_offender !auto_blacklist_candidate !manually_blacklisted
+    http-request set-var(txn.threat_score) int(20) if shell_attempts !repeat_offender !auto_blacklist_candidate !manually_blacklisted
+    http-request set-var(txn.threat_score) int(15) if sql_injection_attempts !shell_attempts !repeat_offender !auto_blacklist_candidate !manually_blacklisted
 
     # Graduated response system based on composite threat score
     # Level 1: Low threat (0-19) - Warning headers only
@@ -190,7 +178,7 @@ frontend web
 
     # Level 4: Critical threat (100+) - Immediate blacklist and deny
     http-request set-header X-Threat-Level "CRITICAL" if { var(txn.threat_score) ge 100 }
-    http-request sc-set-gpc(13,0) 1 if { var(txn.threat_score) ge 100 }  # Mark as manually blacklisted
+    http-request sc-set-gpt(1,0) 1 if { var(txn.threat_score) ge 100 }  # Mark as manually blacklisted
     http-request deny deny_status 403 if { var(txn.threat_score) ge 100 }
 
     # HTTP/2 specific protections
