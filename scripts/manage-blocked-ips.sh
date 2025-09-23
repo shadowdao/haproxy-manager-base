@@ -50,19 +50,47 @@ case "$1" in
         ;;
 
     stats)
-        echo "Stick table statistics (showing potential bad actors):"
-        echo "show table web" | socat stdio "$SOCKET" | head -50
+        echo "=== Rate Limiting Table ==="
+        echo "show table web" | socat stdio "$SOCKET" | head -20
+        echo ""
+        echo "=== Security Blacklist (24h) ==="
+        echo "show table security_blacklist" | socat stdio "$SOCKET" | head -20
+        echo ""
+        echo "=== WordPress 403 Tracking ==="
+        echo "show table wp_403_track" | socat stdio "$SOCKET" | head -20
+        ;;
+
+    blacklist)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 blacklist IP_ADDRESS"
+            exit 1
+        fi
+        # Add to permanent blacklist table
+        echo "set table security_blacklist key $2 data.gpc0 1" | socat stdio "$SOCKET"
+        echo "Permanently blacklisted IP: $2"
+        ;;
+
+    unblacklist)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 unblacklist IP_ADDRESS"
+            exit 1
+        fi
+        # Remove from blacklist table
+        echo "clear table security_blacklist key $2" | socat stdio "$SOCKET"
+        echo "Removed IP from blacklist: $2"
         ;;
 
     *)
-        echo "Usage: $0 {block|unblock|list|clear|stats} [IP_ADDRESS]"
+        echo "Usage: $0 {block|unblock|list|clear|blacklist|unblacklist|stats} [IP_ADDRESS]"
         echo ""
         echo "Commands:"
-        echo "  block IP     - Block an IP address"
-        echo "  unblock IP   - Unblock an IP address"
-        echo "  list         - List all blocked IPs"
-        echo "  clear        - Clear all blocked IPs"
-        echo "  stats        - Show current stick table stats"
+        echo "  block IP       - Block an IP address (map file)"
+        echo "  unblock IP     - Unblock an IP address (map file)"
+        echo "  blacklist IP   - Add to permanent blacklist (24h table)"
+        echo "  unblacklist IP - Remove from permanent blacklist"
+        echo "  list           - List all blocked IPs (map file)"
+        echo "  clear          - Clear all blocked IPs (map file)"
+        echo "  stats          - Show current stick table stats"
         exit 1
         ;;
 esac

@@ -13,12 +13,28 @@ echo ""
 
 # Function to show current threats
 show_threats() {
-    echo "Current Threat IPs (from stick table):"
+    echo "Current Threat IPs (Rate Limiting Table):"
     echo "show table web" | socat stdio "$SOCKET" 2>/dev/null | \
-        awk '$4 > 0 || $5 > 0 || $6 > 30 || $7 > 5 || $8 > 10 {
-            printf "%-15s req_rate:%-3s err_rate:%-3s conn_rate:%-3s blocked:%s repeat:%s\n",
-                   $1, $6, $7, $8, $4, $5
-        }' | head -20
+        awk '$4 > 0 || $5 > 20 || $6 > 5 || $7 > 10 {
+            printf "%-15s req_rate:%-3s err_rate:%-3s conn_rate:%-3s marked:%s\n",
+                   $1, $5, $6, $7, $4
+        }' | head -10
+
+    echo ""
+    echo "Blacklisted IPs (24h tracking):"
+    echo "show table security_blacklist" | socat stdio "$SOCKET" 2>/dev/null | \
+        awk '$4 > 0 || $5 > 0 {
+            printf "%-15s blacklisted:%s violations:%s\n",
+                   $1, $4, $5
+        }' | head -10
+
+    echo ""
+    echo "WordPress 403 Failures:"
+    echo "show table wp_403_track" | socat stdio "$SOCKET" 2>/dev/null | \
+        awk '$4 > 2 {
+            printf "%-15s 403_rate:%-3s\n",
+                   $1, $4
+        }' | head -10
     echo "---------------------------------------------------"
 }
 
