@@ -57,7 +57,11 @@ case "$1" in
         echo "show table web" | socat stdio "$SOCKET" | awk '
         NR>1 {
             ip = $1
-            auth_fail = 0; authz_fail = 0; scanner = 0; repeat_off = 0; manual_bl = 0
+            auth_fail = 0
+            authz_fail = 0
+            scanner = 0
+            repeat_off = 0
+            manual_bl = 0
 
             if ($0 ~ /gpc\(0\)=([0-9]+)/) { match($0, /gpc\(0\)=([0-9]+)/, arr); auth_fail = arr[1] }
             if ($0 ~ /gpc\(1\)=([0-9]+)/) { match($0, /gpc\(1\)=([0-9]+)/, arr); authz_fail = arr[1] }

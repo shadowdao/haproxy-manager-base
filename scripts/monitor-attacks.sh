@@ -19,10 +19,20 @@ show_threats() {
             # Parse the stick table output for array-based GPC values
             ip = $1
             # Look for GPC array values in the data
-            auth_fail = 0; authz_fail = 0; rate_viol = 0; scanner = 0
-            sql_inj = 0; traversal = 0; wp_brute = 0; admin_scan = 0
-            shell_att = 0; repeat_off = 0; manual_bl = 0; auto_bl = 0
-            glitch_rate = 0; threat_score = 0
+            auth_fail = 0
+            authz_fail = 0
+            rate_viol = 0
+            scanner = 0
+            sql_inj = 0
+            traversal = 0
+            wp_brute = 0
+            admin_scan = 0
+            shell_att = 0
+            repeat_off = 0
+            manual_bl = 0
+            auto_bl = 0
+            glitch_rate = 0
+            threat_score = 0
 
             # Extract relevant metrics (simplified parsing)
             if ($0 ~ /gpc\(0\)=([0-9]+)/) {
