@@ -85,40 +85,58 @@ frontend web
     # since 404s on wp-admin are normal (CSS, JS files, etc.)
 
     # Combine conditions to identify actual attacks vs legitimate use
-    # Only block WordPress paths when combined with clear malicious indicators
-    acl wordpress_scanner_attack is_wordpress_path bot_scanner
-    acl wordpress_brute_force_attack wp_403_abuse
-    acl wordpress_suspicious_access is_wordpress_path bot_empty
+    # WordPress-specific attack detection (combining path + threat indicators)
+    acl wp_scanner_detected is_wordpress_path bot_scanner
+    acl wp_brute_force_detected wp_403_abuse
+    acl wp_suspicious_detected is_wordpress_path bot_empty
 
     # WordPress brute force detection now based on actual 403 failures (5+ in 10s)
     # This catches real authentication failures, not just POST requests
 
     # Simplified threat detection for HAProxy 3.0 compatibility
-    # We'll use individual flags instead of cumulative scoring
-    acl high_threat bot_scanner or scan_admin or scan_shells
-    acl medium_threat sql_injection or directory_traversal or wordpress_brute_force_attack
-    acl low_threat rate_abuse or suspicious_method or missing_accept_header
-    acl critical_threat blacklisted or auto_blacklist_candidate
+    # Direct threat level classification based on individual indicators
+    acl high_threat_detected bot_scanner
+    acl high_threat_scan scan_admin
+    acl high_threat_shells scan_shells
+    acl medium_threat_injection sql_injection
+    acl medium_threat_traversal directory_traversal
+    acl medium_threat_wp_attack wp_brute_force_detected
+    acl low_threat_rate rate_abuse
+    acl low_threat_method suspicious_method
+    acl low_threat_headers missing_accept_header
+    acl critical_threat_blacklist blacklisted
+    acl critical_threat_autoban auto_blacklist_candidate
 
     # 5. Dynamic blacklisting based on threat level
-    http-request sc-inc-gpc0(1) 1 if auto_blacklist_candidate
-    http-request sc-inc-gpc1(1) 1 if high_threat or critical_threat
+    http-request sc-inc-gpc0(1) if auto_blacklist_candidate
+    http-request sc-inc-gpc1(1) if high_threat_detected or high_threat_scan or high_threat_shells
+    http-request sc-inc-gpc1(1) if critical_threat_blacklist or critical_threat_autoban
 
     # Mark current session as bad based on threat level
-    http-request sc-set-gpc0(0) 1 if medium_threat or high_threat or critical_threat
+    http-request sc-set-gpc0(0) 1 if medium_threat_injection or medium_threat_traversal or medium_threat_wp_attack
+    http-request sc-set-gpc0(0) 1 if high_threat_detected or high_threat_scan or high_threat_shells
+    http-request sc-set-gpc0(0) 1 if critical_threat_blacklist or critical_threat_autoban
 
     # 6. Graduated response system based on threat level
     # Low threat: Warning header only
-    http-request set-header X-Security-Warning "rate-limit-approaching" if low_threat !legitimate_bot !wordpress_app !browser_ua
+    http-request set-header X-Security-Warning "rate-limit-approaching" if low_threat_rate !legitimate_bot !wordpress_app !browser_ua
+    http-request set-header X-Security-Warning "suspicious-method" if low_threat_method !legitimate_bot !wordpress_app !browser_ua
+    http-request set-header X-Security-Warning "missing-headers" if low_threat_headers !legitimate_bot !wordpress_app !browser_ua
 
     # Medium threat: Tarpit delay
-    http-request tarpit if medium_threat !legitimate_bot !wordpress_app !browser_ua
+    http-request tarpit if medium_threat_injection !legitimate_bot !wordpress_app !browser_ua
+    http-request tarpit if medium_threat_traversal !legitimate_bot !wordpress_app !browser_ua
+    http-request tarpit if medium_threat_wp_attack !legitimate_bot !wordpress_app !browser_ua
 
     # High threat: Immediate deny
-    http-request deny deny_status 403 if high_threat !legitimate_bot !wordpress_app !browser_ua
+    http-request deny deny_status 403 if high_threat_detected !legitimate_bot !wordpress_app !browser_ua
+    http-request deny deny_status 403 if high_threat_scan !legitimate_bot !wordpress_app !browser_ua
+    http-request deny deny_status 403 if high_threat_shells !legitimate_bot !wordpress_app !browser_ua
+    http-request deny deny_status 403 if wp_scanner_detected !legitimate_bot !wordpress_app !browser_ua
 
     # Critical threat: Blacklist and deny
-    http-request deny deny_status 403 if critical_threat
+    http-request deny deny_status 403 if critical_threat_blacklist
+    http-request deny deny_status 403 if critical_threat_autoban
 
     # Additional immediate threat rules
     http-request deny if repeat_offender
@@ -147,9 +165,10 @@ frontend web
     http-request capture req.hdr(user-agent) len 150
 
     # Set log level based on threat level
-    http-request set-log-level info if low_threat
-    http-request set-log-level warning if medium_threat
-    http-request set-log-level alert if high_threat or critical_threat
+    http-request set-log-level info if low_threat_rate or low_threat_method or low_threat_headers
+    http-request set-log-level warning if medium_threat_injection or medium_threat_traversal or medium_threat_wp_attack
+    http-request set-log-level alert if high_threat_detected or high_threat_scan or high_threat_shells
+    http-request set-log-level alert if critical_threat_blacklist or critical_threat_autoban
 
     # Track WordPress paths for 403 response monitoring
     http-request set-var(txn.is_wp_path) int(1) if is_wordpress_path

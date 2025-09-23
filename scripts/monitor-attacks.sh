@@ -42,20 +42,20 @@ show_threats() {
 show_recent_blocks() {
     echo "Recent Blocked Requests:"
     tail -100 "$LOG_FILE" 2>/dev/null | \
-        grep -E "(scanner|exploit|ratelimit|repeat|tarpit|denied|dropped)" | \
+        grep -E "(high_threat|medium_threat|low_threat|critical_threat|tarpit|denied|403)" | \
         tail -10 | \
         awk '{
             if (match($0, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+/)) {
                 ip = substr($0, RSTART, RLENGTH)
                 gsub(/:.*/, "", ip)
                 reason = ""
-                if ($0 ~ /scanner/) reason = "SCANNER"
-                else if ($0 ~ /exploit/) reason = "EXPLOIT"
-                else if ($0 ~ /ratelimit/) reason = "RATE_LIMIT"
-                else if ($0 ~ /repeat/) reason = "REPEAT_OFFENDER"
+                if ($0 ~ /high_threat/) reason = "HIGH_THREAT"
+                else if ($0 ~ /critical_threat/) reason = "CRITICAL_THREAT"
+                else if ($0 ~ /medium_threat/) reason = "MEDIUM_THREAT"
+                else if ($0 ~ /low_threat/) reason = "LOW_THREAT"
                 else if ($0 ~ /tarpit/) reason = "TARPIT"
                 else if ($0 ~ /denied/) reason = "DENIED"
-                else if ($0 ~ /dropped/) reason = "DROPPED"
+                else if ($0 ~ /403/) reason = "BLOCKED"
                 printf "[%s] %-15s %s\n", strftime("%H:%M:%S"), ip, reason
             }
         }'
