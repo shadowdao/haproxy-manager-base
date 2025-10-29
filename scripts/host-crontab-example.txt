@@ -1,0 +1,26 @@
+# HAProxy Manager - Host-side Crontab Example
+# Add this to your host machine's crontab to schedule certificate renewals
+#
+# Edit your crontab with: crontab -e
+# View your crontab with: crontab -l
+#
+# The script will run inside the container and handle all logging internally.
+# Host-side logs will be written to /var/log/haproxy-manager-host-renewal.log
+
+# Run certificate renewal every 12 hours at the top of the hour
+0 */12 * * * /path/to/haproxy-manager-base/scripts/host-renew-certificates.sh
+
+# Alternative: Run at specific times (e.g., 2 AM and 2 PM daily)
+# 0 2,14 * * * /path/to/haproxy-manager-base/scripts/host-renew-certificates.sh
+
+# Alternative: Run once daily at 3 AM
+# 0 3 * * * /path/to/haproxy-manager-base/scripts/host-renew-certificates.sh
+
+# Custom container name example (if your container has a different name):
+# 0 */12 * * * CONTAINER_NAME=my-haproxy /path/to/haproxy-manager-base/scripts/host-renew-certificates.sh
+
+# Custom log file location example:
+# 0 */12 * * * LOG_FILE=/custom/path/renewal.log /path/to/haproxy-manager-base/scripts/host-renew-certificates.sh
+
+# With both custom settings:
+# 0 */12 * * * CONTAINER_NAME=my-haproxy LOG_FILE=/custom/path/renewal.log /path/to/haproxy-manager-base/scripts/host-renew-certificates.sh

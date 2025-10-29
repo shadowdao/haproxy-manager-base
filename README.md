@@ -299,6 +299,54 @@ GET /api/certificates/example.com/cert
 Authorization: Bearer your-api-key
 ```
 
+## Certificate Renewal
+
+The HAProxy Manager includes automatic certificate renewal with multiple scheduling options:
+
+### Automatic Renewal (Container-based)
+By default, a cron job runs inside the container every 12 hours to check and renew certificates:
+- Runs at minute 0 of every 12th hour (12:00 AM, 12:00 PM)
+- Automatically reloads HAProxy if certificates are renewed
+- Logs all renewal attempts to `/var/log/haproxy-manager.log`
+- Errors logged to `/var/log/haproxy-manager-errors.log`
+
+### Manual Renewal via API
+Trigger certificate renewal manually using the API:
+```bash
+curl -X POST http://localhost:8000/api/certificates/renew \
+  -H "Authorization: Bearer your-api-key"
+```
+
+### Host-side Renewal (Recommended for Production)
+For more control over scheduling, run renewals from the host machine using the provided script:
+
+```bash
+# Make the script executable
+chmod +x scripts/host-renew-certificates.sh
+
+# Add to host crontab (edit with: crontab -e)
+0 */12 * * * /path/to/haproxy-manager-base/scripts/host-renew-certificates.sh
+
+# Or run manually
+./scripts/host-renew-certificates.sh
+```
+
+The host-side script:
+- Executes the renewal process inside the running container
+- Maintains separate host-side logs at `/var/log/haproxy-manager-host-renewal.log`
+- Automatically detects if the container is running
+- Supports custom container names via `CONTAINER_NAME` environment variable
+
+See [scripts/host-crontab-example.txt](scripts/host-crontab-example.txt) for more crontab configuration examples.
+
+### Renewal Script Features
+The renewal script ([scripts/renew-certificates.sh](scripts/renew-certificates.sh)) includes:
+- Comprehensive logging with timestamps
+- Retry logic for HAProxy reload (3 attempts with 5-second delays)
+- HAProxy socket health checks before reload
+- Proper error handling and exit codes
+- Detection of whether certificates actually needed renewal
+
 ## Logging and Monitoring
 
 The HAProxy Manager includes comprehensive logging and error tracking:
@@ -306,6 +354,7 @@ The HAProxy Manager includes comprehensive logging and error tracking:
 ### Log Files
 - `/var/log/haproxy-manager.log` - General application logs
 - `/var/log/haproxy-manager-errors.log` - Error logs for alerting
+- `/var/log/haproxy-manager-host-renewal.log` - Host-side renewal logs (when using host script)
 
 ### Logged Operations
 All API operations are logged with timestamps and success/failure status:

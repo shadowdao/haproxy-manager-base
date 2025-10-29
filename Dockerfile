@@ -7,10 +7,15 @@ COPY haproxy_manager.py /haproxy/
 COPY scripts /haproxy/scripts
 RUN chmod +x /haproxy/scripts/*
 RUN pip install -r requirements.txt
-RUN echo "0 */12 * * * root test -x /usr/bin/certbot && /usr/bin/certbot -q renew && echo \"reload\" | socat stdio /tmp/haproxy-cli" > /var/spool/cron/crontabs/root
 # Create log directories
 RUN mkdir -p /var/log && touch /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
 RUN chmod 755 /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
+# Set up cron for certificate renewal with proper permissions and environment
+RUN mkdir -p /var/spool/cron/crontabs && \
+    echo 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' > /var/spool/cron/crontabs/root && \
+    echo '0 */12 * * * /haproxy/scripts/renew-certificates.sh >> /var/log/haproxy-manager.log 2>&1' >> /var/spool/cron/crontabs/root && \
+    chmod 600 /var/spool/cron/crontabs/root && \
+    chown root:crontab /var/spool/cron/crontabs/root
 EXPOSE 80 443 8000
 # Add health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
