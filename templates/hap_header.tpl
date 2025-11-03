@@ -24,19 +24,7 @@ global
     group       haproxy
     daemon
 
-    # HAProxy 3.0.11 Enhanced Security Configuration
-    # Selective status code tracking for reduced false positives
-    http-err-codes 401,403,429  # Only track security-relevant errors
-    http-fail-codes 500-503     # Server errors for monitoring
-
-    # HTTP/2 Security and Performance Tuning
-    tune.h2.fe.max-total-streams 2000        # Connection cycling for security
-    tune.h2.fe.glitches-threshold 50         # Protocol violation detection
-    tune.h2.fe.max-concurrent-streams 100    # Balanced security/performance
-    tune.bufsize 32768                       # Enhanced HTTP/2 protection
-    tune.ring.queues 16                      # Performance optimization
-
-    # SSL and General Performance
+    # SSL and Performance
     tune.ssl.default-dh-param 2048
 
     # Stats persistence for zero-downtime reloads
