@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Certificate Renewal Script for HAProxy Manager
-# This script handles Let's Encrypt certificate renewal with proper logging and error handling
+# Certificate Sync Script for HAProxy Manager
+# This script syncs all Let's Encrypt certificates to HAProxy format
+# Use this to update all certificates regardless of renewal status
 
 set -e
 
@@ -26,12 +27,6 @@ log_error() {
 log_warning() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] $*" | tee -a "$LOG_FILE"
 }
-
-# Check if certbot is available
-if ! command -v certbot &> /dev/null; then
-    log_error "certbot command not found"
-    exit 1
-fi
 
 # Check if HAProxy socket exists and is accessible
 check_haproxy_socket() {
@@ -76,9 +71,9 @@ reload_haproxy() {
     return 1
 }
 
-# Update combined certificate files for HAProxy
-update_combined_certificates() {
-    log_info "Updating combined certificate files for HAProxy"
+# Sync all certificate files for HAProxy
+sync_all_certificates() {
+    log_info "Syncing all certificate files to HAProxy format"
 
     # Check if database exists
     if [ ! -f "$DB_FILE" ]; then
@@ -106,6 +101,7 @@ update_combined_certificates() {
 
     local updated_count=0
     local error_count=0
+    local skipped_count=0
 
     # Process each domain
     while IFS='|' read -r domain cert_path; do
@@ -121,77 +117,88 @@ update_combined_certificates() {
         # Check if Let's Encrypt certificate files exist
         if [ ! -f "$letsencrypt_cert" ]; then
             log_warning "Certificate not found for $domain at $letsencrypt_cert"
-            error_count=$((error_count + 1))
+            skipped_count=$((skipped_count + 1))
             continue
         fi
 
         if [ ! -f "$letsencrypt_key" ]; then
             log_warning "Private key not found for $domain at $letsencrypt_key"
-            error_count=$((error_count + 1))
+            skipped_count=$((skipped_count + 1))
             continue
         fi
 
-        # Combine certificate and key into single file for HAProxy
-        if cat "$letsencrypt_cert" "$letsencrypt_key" > "$cert_path"; then
-            log_info "Updated combined certificate for $domain at $cert_path"
-            updated_count=$((updated_count + 1))
+        # Get modification times to check if update is needed
+        local needs_update=false
+        if [ ! -f "$cert_path" ]; then
+            log_info "Combined certificate does not exist for $domain, creating it"
+            needs_update=true
         else
-            log_error "Failed to combine certificate files for $domain"
-            error_count=$((error_count + 1))
+            # Check if source files are newer than the combined file
+            if [ "$letsencrypt_cert" -nt "$cert_path" ] || [ "$letsencrypt_key" -nt "$cert_path" ]; then
+                log_info "Let's Encrypt certificate is newer than combined file for $domain"
+                needs_update=true
+            else
+                log_info "Certificate for $domain is already up to date"
+            fi
+        fi
+
+        # Combine certificate and key into single file for HAProxy
+        if [ "$needs_update" = true ]; then
+            if cat "$letsencrypt_cert" "$letsencrypt_key" > "$cert_path"; then
+                log_info "Updated combined certificate for $domain at $cert_path"
+                updated_count=$((updated_count + 1))
+            else
+                log_error "Failed to combine certificate files for $domain"
+                error_count=$((error_count + 1))
+            fi
         fi
     done <<< "$domains"
 
-    log_info "Certificate update completed: $updated_count updated, $error_count errors"
+    log_info "Certificate sync completed: $updated_count updated, $skipped_count skipped, $error_count errors"
 
     if [ $error_count -gt 0 ]; then
         return 1
     fi
 
-    return 0
+    # Return success if we updated any certificates
+    if [ $updated_count -gt 0 ]; then
+        return 0
+    fi
+
+    # Return special code (2) if nothing needed updating
+    return 2
 }
 
-# Main renewal process
-log_info "Starting certificate renewal process"
+# Main sync process
+log_info "Starting certificate sync process"
 
-# Run certbot renewal
-if certbot renew --quiet --no-random-sleep-on-renew 2>&1 | tee -a "$LOG_FILE"; then
-    RENEWAL_EXIT_CODE=${PIPESTATUS[0]}
+if sync_all_certificates; then
+    SYNC_RESULT=$?
 
-    if [ $RENEWAL_EXIT_CODE -eq 0 ]; then
-        log_info "Certificate renewal completed successfully"
-
-        # Always update combined certificate files after renewal
-        # (certbot may have renewed some certificates even if the message says otherwise)
-        log_info "Updating combined certificate files for HAProxy"
-        if update_combined_certificates; then
-            log_info "Combined certificates updated successfully"
-
-            # Reload HAProxy to pick up the updated certificates
-            log_info "Reloading HAProxy"
-            if reload_haproxy; then
-                log_info "Certificate renewal and HAProxy reload completed successfully"
-            else
-                log_error "Certificate renewal succeeded but HAProxy reload failed"
-                exit 1
-            fi
+    if [ $SYNC_RESULT -eq 0 ]; then
+        log_info "Certificates were updated, reloading HAProxy"
+        if reload_haproxy; then
+            log_info "Certificate sync and HAProxy reload completed successfully"
+            exit 0
         else
-            log_warning "Certificate update completed with some errors, but attempting HAProxy reload"
-            # Still try to reload HAProxy even if some certificates failed
-            if reload_haproxy; then
-                log_warning "HAProxy reloaded successfully despite certificate update errors"
-            else
-                log_error "Certificate update had errors and HAProxy reload failed"
-                exit 1
-            fi
+            log_error "Certificate sync succeeded but HAProxy reload failed"
+            exit 1
         fi
-    else
-        log_error "Certificate renewal failed with exit code $RENEWAL_EXIT_CODE"
-        exit $RENEWAL_EXIT_CODE
+    elif [ $SYNC_RESULT -eq 2 ]; then
+        log_info "All certificates are already up to date, no reload needed"
+        exit 0
     fi
 else
-    log_error "Certificate renewal command failed"
-    exit 1
+    SYNC_RESULT=$?
+
+    if [ $SYNC_RESULT -eq 2 ]; then
+        log_info "All certificates are already up to date, no reload needed"
+        exit 0
+    else
+        log_error "Certificate sync failed"
+        exit 1
+    fi
 fi
 
-log_info "Certificate renewal process completed"
+log_info "Certificate sync process completed"
 exit 0
