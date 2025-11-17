@@ -5,12 +5,23 @@ This document describes the IP blocking functionality added to HAProxy Manager, 
 ## Overview
 
 The IP blocking feature allows administrators to:
-- Block specific IP addresses from accessing any sites managed by HAProxy
-- Unblock previously blocked IP addresses
-- View all currently blocked IP addresses
-- Track who blocked an IP and when
+- Block specific IP addresses or CIDR ranges from accessing any sites managed by HAProxy
+- Unblock previously blocked IP addresses or CIDR ranges
+- View all currently blocked IP addresses and CIDR ranges
+- Track who blocked an IP/CIDR and when
 
-When an IP is blocked, visitors from that IP address will receive a 403 Forbidden response.
+When an IP is blocked (or falls within a blocked CIDR range), visitors from that IP address will receive a 403 Forbidden response.
+
+### CIDR Range Support
+
+The IP blocking system supports CIDR notation for blocking entire network ranges:
+- **Single IP**: `192.168.1.100` (blocks only this IP)
+- **CIDR Range**: `192.168.1.0/24` (blocks 256 IPs from 192.168.1.0 to 192.168.1.255)
+- **Common CIDR Masks**:
+  - `/32` - Single IP (1 address)
+  - `/24` - Standard subnet (256 addresses)
+  - `/16` - Large network (65,536 addresses)
+  - `/8` - Very large network (16,777,216 addresses)
 
 ## Features
 
@@ -78,7 +89,7 @@ Add an IP address to the blocked list.
 ```
 
 **Parameters:**
-- `ip_address` (required): The IP address to block (e.g., "192.168.1.100")
+- `ip_address` (required): The IP address or CIDR range to block (e.g., "192.168.1.100" or "192.168.1.0/24")
 - `reason` (optional): Reason for blocking (default: "No reason provided")
 - `blocked_by` (optional): Who/what initiated the block (default: "API")
 
@@ -96,7 +107,7 @@ Add an IP address to the blocked list.
 - `409 Conflict`: IP address is already blocked
 - `500 Internal Server Error`: Configuration generation failed
 
-**Example Request:**
+**Example Request (Single IP):**
 ```bash
 curl -X POST http://localhost:8000/api/blocked-ips \
   -H "Authorization: Bearer your-api-key" \
@@ -108,9 +119,21 @@ curl -X POST http://localhost:8000/api/blocked-ips \
   }'
 ```
 
-### 3. Unblock an IP Address
+**Example Request (CIDR Range):**
+```bash
+curl -X POST http://localhost:8000/api/blocked-ips \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ip_address": "192.168.1.0/24",
+    "reason": "DDoS attack from compromised ISP",
+    "blocked_by": "WHP Security Module"
+  }'
+```
 
-Remove an IP address from the blocked list.
+### 3. Unblock an IP Address or CIDR Range
+
+Remove an IP address or CIDR range from the blocked list.
 
 **Endpoint:** `DELETE /api/blocked-ips`
 
@@ -122,7 +145,7 @@ Remove an IP address from the blocked list.
 ```
 
 **Parameters:**
-- `ip_address` (required): The IP address to unblock
+- `ip_address` (required): The IP address or CIDR range to unblock (must match exactly as it was blocked)
 
 **Response:**
 ```json

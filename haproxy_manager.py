@@ -1340,13 +1340,15 @@ def update_blocked_ips_map():
             cursor = conn.cursor()
             cursor.execute('SELECT ip_address FROM blocked_ips ORDER BY ip_address')
             blocked_ips = [row[0] for row in cursor.fetchall()]
-        
-        # Write map file
+
+        # Write map file in HAProxy map format: <key> <value>
+        # For IP blocking, we use: <ip_or_cidr> 1
+        # This allows map_ip() to work with both single IPs and CIDR ranges
         os.makedirs(os.path.dirname(BLOCKED_IPS_MAP_PATH), exist_ok=True)
         with open(BLOCKED_IPS_MAP_PATH, 'w') as f:
             for ip in blocked_ips:
-                f.write(f"{ip}\n")
-        
+                f.write(f"{ip} 1\n")
+
         logger.info(f"Updated blocked IPs map file with {len(blocked_ips)} IPs")
         return True
     except Exception as e:
@@ -1360,11 +1362,13 @@ def add_ip_to_runtime_map(ip_address):
             socket_path = HAPROXY_SOCKET_PATH
         else:
             socket_path = '/tmp/haproxy-cli'
-        
+
         # Add to runtime map (map file ID 0 for blocked IPs)
-        cmd = f'echo "add map #0 {ip_address}" | socat stdio {socket_path}'
+        # Format: add map #<id> <key> <value>
+        # For IP blocking, value is always "1"
+        cmd = f'echo "add map #0 {ip_address} 1" | socat stdio {socket_path}'
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        
+
         if result.returncode == 0:
             logger.info(f"Added IP {ip_address} to runtime map")
             return True
