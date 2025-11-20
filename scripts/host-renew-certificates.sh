@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 
 # Host-side Certificate Renewal Script
-# This script can be run from the host machine via cron to trigger certificate renewal
-# inside the HAProxy Manager container using docker exec
+# Run this from the host machine via cron to trigger certificate renewal inside the container
 
 set -e
 
-# Configuration - Customize these values
+# Configuration
 CONTAINER_NAME="${CONTAINER_NAME:-haproxy-manager}"
 LOG_FILE="${LOG_FILE:-/var/log/haproxy-manager-host-renewal.log}"
 
-# Logging functions
+# Logging
 log_info() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*" | tee -a "$LOG_FILE"
 }
@@ -19,8 +18,7 @@ log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a "$LOG_FILE"
 }
 
-# Main execution
-log_info "Starting host-side certificate renewal process"
+log_info "Starting certificate renewal"
 
 # Check if container is running
 if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
@@ -28,10 +26,9 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     exit 1
 fi
 
-# Execute renewal script inside container
-log_info "Executing renewal script in container '${CONTAINER_NAME}'"
+# Run renewal script inside container
 if docker exec "$CONTAINER_NAME" /haproxy/scripts/renew-certificates.sh; then
-    log_info "Certificate renewal completed successfully"
+    log_info "Certificate renewal completed"
     exit 0
 else
     log_error "Certificate renewal failed"

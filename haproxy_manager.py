@@ -682,15 +682,15 @@ def remove_domain():
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
 
-            # Get domain ID and check if it exists
-            cursor.execute('SELECT id FROM domains WHERE domain = ?', (domain,))
+            # Get domain ID and SSL status
+            cursor.execute('SELECT id, ssl_enabled, ssl_cert_path FROM domains WHERE domain = ?', (domain,))
             domain_result = cursor.fetchone()
 
             if not domain_result:
                 log_operation('remove_domain', False, f'Domain {domain} not found')
                 return jsonify({'status': 'error', 'message': 'Domain not found'}), 404
 
-            domain_id = domain_result[0]
+            domain_id, ssl_enabled, ssl_cert_path = domain_result
 
             # Get backend IDs associated with this domain
             cursor.execute('SELECT id FROM backends WHERE domain_id = ?', (domain_id,))
@@ -706,14 +706,27 @@ def remove_domain():
             # Delete domain
             cursor.execute('DELETE FROM domains WHERE id = ?', (domain_id,))
 
-            # Delete SSL certificate if it exists
-            cursor.execute('SELECT ssl_cert_path FROM domains WHERE id = ? AND ssl_enabled = 1', (domain_id,))
-            cert_result = cursor.fetchone()
-            if cert_result and cert_result[0]:
-                try:
-                    os.remove(cert_result[0])
-                except OSError:
-                    pass  # Ignore errors if file doesn't exist
+        # Delete SSL certificate from HAProxy certs directory
+        if ssl_enabled and ssl_cert_path:
+            try:
+                os.remove(ssl_cert_path)
+                logger.info(f"Removed HAProxy certificate file: {ssl_cert_path}")
+            except OSError as e:
+                logger.warning(f"Failed to remove certificate file {ssl_cert_path}: {e}")
+
+        # Remove certificate from certbot
+        if ssl_enabled:
+            try:
+                result = subprocess.run(
+                    ['certbot', 'delete', '--cert-name', domain, '--non-interactive'],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    logger.info(f"Removed Let's Encrypt certificate for {domain}")
+                else:
+                    logger.warning(f"Failed to remove Let's Encrypt certificate for {domain}: {result.stderr}")
+            except Exception as e:
+                logger.warning(f"Error removing Let's Encrypt certificate for {domain}: {e}")
 
         # Regenerate HAProxy config
         generate_config()
