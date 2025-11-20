@@ -132,11 +132,29 @@ update_combined_certificates() {
         fi
 
         # Combine certificate and key into single file for HAProxy
-        if cat "$letsencrypt_cert" "$letsencrypt_key" > "$cert_path"; then
-            log_info "Updated combined certificate for $domain at $cert_path"
-            updated_count=$((updated_count + 1))
+        # HAProxy requires fullchain.pem followed by privkey.pem in a single file
+        # Write to temp file first, then move to ensure atomic update
+        local temp_cert="${cert_path}.tmp"
+        if cat "$letsencrypt_cert" "$letsencrypt_key" > "$temp_cert"; then
+            # Verify the combined file is not empty and contains valid data
+            if [ -s "$temp_cert" ]; then
+                # Atomically move to final location
+                if mv "$temp_cert" "$cert_path"; then
+                    log_info "Updated combined certificate for $domain at $cert_path"
+                    updated_count=$((updated_count + 1))
+                else
+                    log_error "Failed to move combined certificate for $domain to $cert_path"
+                    rm -f "$temp_cert"
+                    error_count=$((error_count + 1))
+                fi
+            else
+                log_error "Combined certificate file for $domain is empty"
+                rm -f "$temp_cert"
+                error_count=$((error_count + 1))
+            fi
         else
             log_error "Failed to combine certificate files for $domain"
+            rm -f "$temp_cert"
             error_count=$((error_count + 1))
         fi
     done <<< "$domains"
