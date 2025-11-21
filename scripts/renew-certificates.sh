@@ -3,8 +3,6 @@
 # Certificate Renewal Script for HAProxy Manager
 # This script runs certbot renew and copies certificates to HAProxy format
 
-set -e
-
 # Configuration
 LOG_FILE="${LOG_FILE:-/var/log/haproxy-manager.log}"
 ERROR_LOG_FILE="${ERROR_LOG_FILE:-/var/log/haproxy-manager-errors.log}"
@@ -31,16 +29,11 @@ else
 fi
 
 # Copy all certificates to HAProxy format
-if [ ! -f "$DB_FILE" ]; then
-    log_error "Database file not found at $DB_FILE"
-    exit 1
-fi
-
 # Ensure SSL certs directory exists
 mkdir -p "$SSL_CERTS_DIR"
 
 # Get all SSL-enabled domains from database
-DOMAINS=$(sqlite3 "$DB_FILE" "SELECT domain FROM domains WHERE ssl_enabled = 1;" 2>/dev/null)
+DOMAINS=$(find /etc/letsencrypt/live/ -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
 
 if [ -z "$DOMAINS" ]; then
     log_info "No SSL-enabled domains found"
