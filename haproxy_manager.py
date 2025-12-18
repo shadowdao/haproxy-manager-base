@@ -282,15 +282,52 @@ def add_domain():
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
 
-            # Add domain
-            cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override))
-            domain_id = cursor.lastrowid
+            # Check if domain already exists
+            cursor.execute('SELECT id, ssl_enabled, ssl_cert_path FROM domains WHERE domain = ?', (domain,))
+            existing_domain = cursor.fetchone()
 
-            # Add backend
-            cursor.execute('INSERT INTO backends (name, domain_id) VALUES (?, ?)',
-                          (backend_name, domain_id))
-            backend_id = cursor.lastrowid
+            if existing_domain:
+                # Domain exists - update it while preserving SSL settings
+                domain_id = existing_domain[0]
+                ssl_enabled = existing_domain[1]
+                ssl_cert_path = existing_domain[2]
 
+                cursor.execute('''
+                    UPDATE domains
+                    SET template_override = ?
+                    WHERE id = ?
+                ''', (template_override, domain_id))
+
+                # Update backend or create if doesn't exist
+                cursor.execute('SELECT id FROM backends WHERE domain_id = ?', (domain_id,))
+                backend_result = cursor.fetchone()
+
+                if backend_result:
+                    backend_id = backend_result[0]
+                    # Update existing backend name
+                    cursor.execute('UPDATE backends SET name = ? WHERE id = ?', (backend_name, backend_id))
+                    # Remove old servers
+                    cursor.execute('DELETE FROM backend_servers WHERE backend_id = ?', (backend_id,))
+                else:
+                    # Create new backend
+                    cursor.execute('INSERT INTO backends (name, domain_id) VALUES (?, ?)',
+                                  (backend_name, domain_id))
+                    backend_id = cursor.lastrowid
+
+                logger.info(f"Updated existing domain {domain} (preserved SSL: enabled={ssl_enabled}, cert={ssl_cert_path})")
+            else:
+                # New domain - insert it
+                cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override))
+                domain_id = cursor.lastrowid
+
+                # Add backend
+                cursor.execute('INSERT INTO backends (name, domain_id) VALUES (?, ?)',
+                              (backend_name, domain_id))
+                backend_id = cursor.lastrowid
+
+                logger.info(f"Added new domain {domain}")
+
+            # Add/update backend servers
             for server in servers:
                 cursor.execute('''
                     INSERT INTO backend_servers
@@ -298,11 +335,12 @@ def add_domain():
                     VALUES (?, ?, ?, ?, ?)
                 ''', (backend_id, server['name'], server['address'],
                      server['port'], server.get('options')))
+
         # Close cursor and connection
         cursor.close()
         conn.close()
         generate_config()
-        log_operation('add_domain', True, f'Domain {domain} added successfully')
+        log_operation('add_domain', True, f'Domain {domain} configured successfully')
         return jsonify({'status': 'success', 'domain_id': domain_id})
     except Exception as e:
         log_operation('add_domain', False, str(e))
