@@ -12,10 +12,11 @@ backend {{ name }}-backend
     # Enable http-no-delay for immediate data transmission (good for SSE and general performance)
     option http-no-delay
 
-    # Extended timeouts to support SSE long-lived connections
+    # Extended timeouts to support SSE long-lived connections (up to 6 hours)
     # These values also work fine for normal HTTP requests
-    timeout server 1h
-    timeout http-keep-alive 1h
+    # Note: SSE sends keepalives every 1 second, so timeout only triggers if backend hangs
+    timeout server 6h
+    timeout http-keep-alive 6h
 
     # Ensure keep-alive connection for SSE requests
     http-response set-header Connection keep-alive if is_sse or is_sse_url
