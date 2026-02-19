@@ -7,7 +7,8 @@ backend {{ name }}-backend
     http-request add-header X-CLIENT-IP %[var(txn.real_ip)]
     http-request set-header X-Real-IP %[var(txn.real_ip)]
     http-request set-header X-Forwarded-For %[var(txn.real_ip)]
-    {% if ssl_enabled %}http-request set-header X-Forwarded-Proto https if { ssl_fc }{% endif %}
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    http-request set-header X-Forwarded-Proto http if !{ ssl_fc }
 
     {% for server in servers %}
     server {{ server.server_name }} {{ server.server_address }}:{{ server.server_port }} {{ server.server_options }}
@@ -31,7 +32,8 @@ backend {{ name }}-sse-backend
     http-request add-header X-CLIENT-IP %[var(txn.real_ip)]
     http-request set-header X-Real-IP %[var(txn.real_ip)]
     http-request set-header X-Forwarded-For %[var(txn.real_ip)]
-    {% if ssl_enabled %}http-request set-header X-Forwarded-Proto https if { ssl_fc }{% endif %}
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    http-request set-header X-Forwarded-Proto http if !{ ssl_fc }
 
     {% for server in servers %}
     server {{ server.server_name }} {{ server.server_address }}:{{ server.server_port }} {{ server.server_options }}

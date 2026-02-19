@@ -13,6 +13,9 @@ import json
 import ipaddress
 import shutil
 import tempfile
+import threading
+import time
+import re
 
 app = Flask(__name__)
 
@@ -118,6 +121,12 @@ def init_db():
                 blocked_by TEXT
             )
         ''')
+        # Migration: add is_wildcard column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE domains ADD COLUMN is_wildcard BOOLEAN DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         conn.commit()
 
 def validate_ip_address(ip_string):
@@ -273,6 +282,7 @@ def add_domain():
     template_override = data.get('template_override')
     backend_name = data.get('backend_name')
     servers = data.get('servers', [])
+    is_wildcard = data.get('is_wildcard', False)
 
     if not domain or not backend_name:
         log_operation('add_domain', False, 'Domain and backend_name are required')
@@ -294,9 +304,9 @@ def add_domain():
 
                 cursor.execute('''
                     UPDATE domains
-                    SET template_override = ?
+                    SET template_override = ?, is_wildcard = ?
                     WHERE id = ?
-                ''', (template_override, domain_id))
+                ''', (template_override, 1 if is_wildcard else 0, domain_id))
 
                 # Update backend or create if doesn't exist
                 cursor.execute('SELECT id FROM backends WHERE domain_id = ?', (domain_id,))
@@ -317,7 +327,8 @@ def add_domain():
                 logger.info(f"Updated existing domain {domain} (preserved SSL: enabled={ssl_enabled}, cert={ssl_cert_path})")
             else:
                 # New domain - insert it
-                cursor.execute('INSERT INTO domains (domain, template_override) VALUES (?, ?)', (domain, template_override))
+                cursor.execute('INSERT INTO domains (domain, template_override, is_wildcard) VALUES (?, ?, ?)',
+                              (domain, template_override, 1 if is_wildcard else 0))
                 domain_id = cursor.lastrowid
 
                 # Add backend
@@ -1114,6 +1125,167 @@ def clear_expired_blocks():
         log_operation('clear_expired_blocks', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@app.route('/api/ssl/dns-challenge/request', methods=['POST'])
+@require_api_key
+def dns_challenge_request():
+    """Start DNS-01 challenge for wildcard certificate"""
+    data = request.get_json()
+    domain = data.get('domain')
+
+    if not domain:
+        return jsonify({'success': False, 'error': 'Domain is required'}), 400
+
+    # Extract base domain (strip *. prefix if present)
+    base_domain = domain
+    if base_domain.startswith('*.'):
+        base_domain = base_domain[2:]
+
+    # Validate base_domain format
+    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$', base_domain):
+        return jsonify({'success': False, 'error': 'Invalid domain format'}), 400
+
+    # Clean up any previous challenge files
+    token_file = f'/tmp/dns-challenge-{base_domain}.token'
+    proceed_file = f'/tmp/dns-challenge-{base_domain}.proceed'
+    for f in [token_file, proceed_file]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    # Start certbot in background thread
+    def run_certbot():
+        try:
+            auth_hook = '/app/scripts/dns-challenge-auth-hook.sh'
+            cleanup_hook = '/app/scripts/dns-challenge-cleanup-hook.sh'
+            result = subprocess.run([
+                'certbot', 'certonly', '-n',
+                '--manual', '--preferred-challenges', 'dns-01',
+                '-d', f'*.{base_domain}',
+                '--manual-auth-hook', auth_hook,
+                '--manual-cleanup-hook', cleanup_hook
+            ], capture_output=True, text=True, timeout=600)
+            if result.returncode == 0:
+                logger.info(f"DNS-01 certbot completed successfully for *.{base_domain}")
+            else:
+                logger.error(f"DNS-01 certbot failed for *.{base_domain}: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            logger.error(f"DNS-01 certbot timed out for *.{base_domain}")
+        except Exception as e:
+            logger.error(f"DNS-01 certbot error for *.{base_domain}: {e}")
+
+    certbot_thread = threading.Thread(target=run_certbot, daemon=True)
+    certbot_thread.start()
+
+    # Poll for the auth hook to write the challenge token
+    max_wait = 30
+    poll_interval = 0.5
+    elapsed = 0
+    while elapsed < max_wait:
+        if os.path.exists(token_file):
+            try:
+                with open(token_file, 'r') as f:
+                    challenge_token = f.read().strip()
+                if challenge_token:
+                    log_operation('dns_challenge_request', True, f'Challenge token obtained for *.{base_domain}')
+                    return jsonify({
+                        'success': True,
+                        'data': {
+                            'challenge_token': challenge_token,
+                            'base_domain': base_domain
+                        }
+                    })
+            except Exception as e:
+                logger.warning(f"Error reading token file: {e}")
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    log_operation('dns_challenge_request', False, f'Timed out waiting for challenge token for *.{base_domain}')
+    return jsonify({'success': False, 'error': 'Timed out waiting for challenge token from certbot'}), 504
+
+@app.route('/api/ssl/dns-challenge/verify', methods=['POST'])
+@require_api_key
+def dns_challenge_verify():
+    """Signal certbot to proceed after DNS record is set, wait for cert"""
+    data = request.get_json()
+    domain = data.get('domain')
+
+    if not domain:
+        return jsonify({'success': False, 'error': 'Domain is required'}), 400
+
+    # Extract base domain (strip *. prefix if present)
+    base_domain = domain
+    if base_domain.startswith('*.'):
+        base_domain = base_domain[2:]
+
+    # Validate base_domain format
+    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$', base_domain):
+        return jsonify({'success': False, 'error': 'Invalid domain format'}), 400
+
+    # Create proceed signal file so the auth hook can continue
+    proceed_file = f'/tmp/dns-challenge-{base_domain}.proceed'
+    try:
+        with open(proceed_file, 'w') as f:
+            f.write('proceed')
+    except Exception as e:
+        log_operation('dns_challenge_verify', False, f'Failed to create proceed file: {e}')
+        return jsonify({'success': False, 'error': f'Failed to signal certbot: {e}'}), 500
+
+    # Wait for certbot to finish and produce the certificate
+    cert_path = f'/etc/letsencrypt/live/{base_domain}/fullchain.pem'
+    key_path = f'/etc/letsencrypt/live/{base_domain}/privkey.pem'
+    max_wait = 120
+    poll_interval = 1
+    elapsed = 0
+
+    while elapsed < max_wait:
+        if os.path.exists(cert_path) and os.path.exists(key_path):
+            # Check that files were recently modified (within last 5 minutes)
+            cert_mtime = os.path.getmtime(cert_path)
+            if (time.time() - cert_mtime) < 300:
+                break
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    if elapsed >= max_wait:
+        log_operation('dns_challenge_verify', False, f'Timed out waiting for certificate for *.{base_domain}')
+        return jsonify({'success': False, 'error': 'Timed out waiting for certificate from certbot'}), 504
+
+    # Combine fullchain + privkey into HAProxy cert
+    try:
+        os.makedirs(SSL_CERTS_DIR, exist_ok=True)
+        combined_path = f'{SSL_CERTS_DIR}/*.{base_domain}.pem'
+
+        with open(combined_path, 'w') as combined:
+            with open(cert_path, 'r') as cf:
+                combined.write(cf.read())
+            with open(key_path, 'r') as kf:
+                combined.write(kf.read())
+
+        # Update database
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            # Match wildcard domain entry (stored as *.domain.tld)
+            cursor.execute('''
+                UPDATE domains
+                SET ssl_enabled = 1, ssl_cert_path = ?
+                WHERE domain = ? OR domain = ?
+            ''', (combined_path, f'*.{base_domain}', base_domain))
+
+        # Regenerate config and reload HAProxy
+        generate_config()
+
+        log_operation('dns_challenge_verify', True, f'Wildcard certificate obtained for *.{base_domain}')
+        return jsonify({
+            'success': True,
+            'data': {
+                'domain': f'*.{base_domain}',
+                'cert_path': combined_path,
+                'message': 'Wildcard certificate obtained and HAProxy updated'
+            }
+        })
+    except Exception as e:
+        log_operation('dns_challenge_verify', False, str(e))
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 def generate_config():
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -1128,6 +1300,7 @@ def generate_config():
                 d.ssl_enabled,
                 d.ssl_cert_path,
                 d.template_override,
+                d.is_wildcard,
                 b.id as backend_id,
                 b.name as backend_name
             FROM domains d
@@ -1167,25 +1340,12 @@ def generate_config():
         default_rule = "    # Default backend for unmatched domains\n    default_backend default-backend\n"
         config_parts.append(default_rule)
         
-        # Add domain configurations
-        for domain in domains:
-            if not domain['backend_name']:
-                logger.warning(f"Skipping domain {domain['domain']} - no backend name")
-                continue
+        # Split domains into exact and wildcard for ACL ordering
+        exact_domains = [d for d in domains if not d.get('is_wildcard')]
+        wildcard_domains = [d for d in domains if d.get('is_wildcard')]
 
-            # Add domain ACL
-            try:
-                domain_acl = template_env.get_template('hap_subdomain_acl.tpl').render(
-                    domain=domain['domain'],
-                    name=domain['backend_name']
-                )
-                config_acls.append(domain_acl)
-                logger.info(f"Added ACL for domain: {domain['domain']}")
-            except Exception as e:
-                logger.error(f"Error generating domain ACL for {domain['domain']}: {e}")
-                continue
-
-            # Add backend configuration
+        # Helper to generate backend config for a domain
+        def generate_backend_for_domain(domain):
             try:
                 cursor.execute('''
                     SELECT * FROM backend_servers WHERE backend_id = ?
@@ -1194,7 +1354,7 @@ def generate_config():
 
                 if not servers:
                     logger.warning(f"No servers found for backend {domain['backend_name']}")
-                    continue
+                    return
 
                 if domain['template_override'] is not None:
                     logger.info(f"Template Override is set to: {domain['template_override']}")
@@ -1202,7 +1362,6 @@ def generate_config():
                     backend_block = template_env.get_template(template_file).render(
                         name=domain['backend_name'],
                         servers=servers
-
                     )
                 else:
                     backend_block = template_env.get_template('hap_backend.tpl').render(
@@ -1214,7 +1373,50 @@ def generate_config():
                 logger.info(f"Added backend block for: {domain['backend_name']}")
             except Exception as e:
                 logger.error(f"Error generating backend block for {domain['backend_name']}: {e}")
+
+        # First pass: exact domain ACLs (higher priority - evaluated first)
+        for domain in exact_domains:
+            if not domain['backend_name']:
+                logger.warning(f"Skipping domain {domain['domain']} - no backend name")
                 continue
+
+            try:
+                domain_acl = template_env.get_template('hap_subdomain_acl.tpl').render(
+                    domain=domain['domain'],
+                    name=domain['backend_name']
+                )
+                config_acls.append(domain_acl)
+                logger.info(f"Added ACL for domain: {domain['domain']}")
+            except Exception as e:
+                logger.error(f"Error generating domain ACL for {domain['domain']}: {e}")
+                continue
+
+            generate_backend_for_domain(domain)
+
+        # Second pass: wildcard domain ACLs (lower priority - evaluated after exact matches)
+        for domain in wildcard_domains:
+            if not domain['backend_name']:
+                logger.warning(f"Skipping wildcard domain {domain['domain']} - no backend name")
+                continue
+
+            try:
+                # Strip *. prefix to get base domain for hdr_end matching
+                base_domain = domain['domain']
+                if base_domain.startswith('*.'):
+                    base_domain = base_domain[2:]
+
+                domain_acl = template_env.get_template('hap_wildcard_acl.tpl').render(
+                    domain=domain['domain'],
+                    name=domain['backend_name'],
+                    base_domain=base_domain
+                )
+                config_acls.append(domain_acl)
+                logger.info(f"Added wildcard ACL for domain: {domain['domain']}")
+            except Exception as e:
+                logger.error(f"Error generating wildcard ACL for {domain['domain']}: {e}")
+                continue
+
+            generate_backend_for_domain(domain)
 
         # Add ACLS
         config_parts.append('\n' .join(config_acls))
