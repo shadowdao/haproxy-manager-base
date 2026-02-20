@@ -137,6 +137,25 @@ def validate_ip_address(ip_string):
     except ValueError:
         return False
 
+def find_certbot_live_dir(base_domain):
+    """Find the most recent certbot live directory for a domain.
+    Certbot creates -NNNN suffixed dirs for repeated requests."""
+    live_dir = '/etc/letsencrypt/live'
+    if not os.path.isdir(live_dir):
+        return None
+    candidates = []
+    for entry in os.listdir(live_dir):
+        if entry == base_domain or re.match(rf'^{re.escape(base_domain)}-\d{{4}}$', entry):
+            full_path = os.path.join(live_dir, entry)
+            fullchain = os.path.join(full_path, 'fullchain.pem')
+            if os.path.exists(fullchain):
+                candidates.append((full_path, os.path.getmtime(fullchain)))
+    if not candidates:
+        return None
+    # Return the most recently modified
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
+
 def certbot_register():
     """Register with Let's Encrypt using the certbot client and agree to the terms of service"""
     result = subprocess.run(['certbot', 'show_account'],  capture_output=True)
@@ -392,9 +411,15 @@ def request_ssl():
         ], capture_output=True, text=True)
 
         if result.returncode == 0:
-            # Combine cert files and copy to HAProxy certs directory
-            cert_path = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
-            key_path = f'/etc/letsencrypt/live/{domain}/privkey.pem'
+            # Find the certbot live directory (handles -NNNN suffixes)
+            live_dir = find_certbot_live_dir(domain)
+            if not live_dir:
+                error_msg = f'Certificate obtained but live directory not found for {domain}'
+                log_operation('request_ssl', False, error_msg)
+                return jsonify({'status': 'error', 'message': error_msg}), 500
+
+            cert_path = os.path.join(live_dir, 'fullchain.pem')
+            key_path = os.path.join(live_dir, 'privkey.pem')
             combined_path = f'{SSL_CERTS_DIR}/{domain}.pem'
 
             # Ensure SSL certs directory exists
@@ -451,13 +476,16 @@ def renew_certificates():
                     
                     for domain, cert_path in domains:
                         if cert_path and os.path.exists(cert_path):
-                            # Recreate combined certificate
-                            letsencrypt_cert = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
-                            letsencrypt_key = f'/etc/letsencrypt/live/{domain}/privkey.pem'
-                            
-                            if os.path.exists(letsencrypt_cert) and os.path.exists(letsencrypt_key):
-                                with open(cert_path, 'w') as combined:
-                                    subprocess.run(['cat', letsencrypt_cert, letsencrypt_key], stdout=combined)
+                            # For wildcard domains, strip *. prefix for directory lookup
+                            lookup_domain = domain[2:] if domain.startswith('*.') else domain
+                            live_dir = find_certbot_live_dir(lookup_domain)
+                            if live_dir:
+                                letsencrypt_cert = os.path.join(live_dir, 'fullchain.pem')
+                                letsencrypt_key = os.path.join(live_dir, 'privkey.pem')
+
+                                if os.path.exists(letsencrypt_cert) and os.path.exists(letsencrypt_key):
+                                    with open(cert_path, 'w') as combined:
+                                        subprocess.run(['cat', letsencrypt_cert, letsencrypt_key], stdout=combined)
                 
                 # Regenerate config and reload HAProxy
                 generate_config()
@@ -510,7 +538,11 @@ def download_certificate(domain):
 def download_private_key(domain):
     """Download the private key for a domain"""
     try:
-        key_path = f'/etc/letsencrypt/live/{domain}/privkey.pem'
+        lookup_domain = domain[2:] if domain.startswith('*.') else domain
+        live_dir = find_certbot_live_dir(lookup_domain)
+        if not live_dir:
+            return jsonify({'status': 'error', 'message': 'Private key not found for domain'}), 404
+        key_path = os.path.join(live_dir, 'privkey.pem')
         if not os.path.exists(key_path):
             return jsonify({'status': 'error', 'message': 'Private key not found for domain'}), 404
         
@@ -525,7 +557,11 @@ def download_private_key(domain):
 def download_cert_only(domain):
     """Download only the certificate (without private key) for a domain"""
     try:
-        cert_path = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
+        lookup_domain = domain[2:] if domain.startswith('*.') else domain
+        live_dir = find_certbot_live_dir(lookup_domain)
+        if not live_dir:
+            return jsonify({'status': 'error', 'message': 'Certificate not found for domain'}), 404
+        cert_path = os.path.join(live_dir, 'fullchain.pem')
         if not os.path.exists(cert_path):
             return jsonify({'status': 'error', 'message': 'Certificate not found for domain'}), 404
         
@@ -630,14 +666,25 @@ def request_certificates():
             result = subprocess.run(cmd, capture_output=True, text=True)
             
             if result.returncode == 0:
-                # Combine cert files and copy to HAProxy certs directory
-                cert_path = f'/etc/letsencrypt/live/{domain}/fullchain.pem'
-                key_path = f'/etc/letsencrypt/live/{domain}/privkey.pem'
+                # Find the certbot live directory (handles -NNNN suffixes)
+                live_dir = find_certbot_live_dir(domain)
+                if not live_dir:
+                    error_msg = f'Certificate obtained but live directory not found for {domain}'
+                    results.append({
+                        'domain': domain,
+                        'status': 'error',
+                        'message': error_msg
+                    })
+                    error_count += 1
+                    continue
+
+                cert_path = os.path.join(live_dir, 'fullchain.pem')
+                key_path = os.path.join(live_dir, 'privkey.pem')
                 combined_path = f'{SSL_CERTS_DIR}/{domain}.pem'
-                
+
                 # Ensure SSL certs directory exists
                 os.makedirs(SSL_CERTS_DIR, exist_ok=True)
-                
+
                 with open(combined_path, 'w') as combined:
                     subprocess.run(['cat', cert_path, key_path], stdout=combined)
                 
@@ -1232,29 +1279,34 @@ def dns_challenge_verify():
         return jsonify({'success': False, 'error': f'Failed to signal certbot: {e}'}), 500
 
     # Wait for certbot to finish and produce the certificate
-    cert_path = f'/etc/letsencrypt/live/{base_domain}/fullchain.pem'
-    key_path = f'/etc/letsencrypt/live/{base_domain}/privkey.pem'
     max_wait = 120
     poll_interval = 1
     elapsed = 0
+    live_dir = None
 
     while elapsed < max_wait:
-        if os.path.exists(cert_path) and os.path.exists(key_path):
-            # Check that files were recently modified (within last 5 minutes)
-            cert_mtime = os.path.getmtime(cert_path)
-            if (time.time() - cert_mtime) < 300:
-                break
+        live_dir = find_certbot_live_dir(base_domain)
+        if live_dir:
+            cert_path = os.path.join(live_dir, 'fullchain.pem')
+            key_path = os.path.join(live_dir, 'privkey.pem')
+            if os.path.exists(cert_path) and os.path.exists(key_path):
+                # Check that files were recently modified (within last 5 minutes)
+                cert_mtime = os.path.getmtime(cert_path)
+                if (time.time() - cert_mtime) < 300:
+                    break
         time.sleep(poll_interval)
         elapsed += poll_interval
 
-    if elapsed >= max_wait:
+    if elapsed >= max_wait or not live_dir:
         log_operation('dns_challenge_verify', False, f'Timed out waiting for certificate for *.{base_domain}')
         return jsonify({'success': False, 'error': 'Timed out waiting for certificate from certbot'}), 504
 
     # Combine fullchain + privkey into HAProxy cert
+    cert_path = os.path.join(live_dir, 'fullchain.pem')
+    key_path = os.path.join(live_dir, 'privkey.pem')
     try:
         os.makedirs(SSL_CERTS_DIR, exist_ok=True)
-        combined_path = f'{SSL_CERTS_DIR}/*.{base_domain}.pem'
+        combined_path = f'{SSL_CERTS_DIR}/_wildcard_.{base_domain}.pem'
 
         with open(combined_path, 'w') as combined:
             with open(cert_path, 'r') as cf:
