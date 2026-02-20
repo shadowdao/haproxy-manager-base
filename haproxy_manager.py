@@ -1154,8 +1154,9 @@ def dns_challenge_request():
     # Start certbot in background thread
     def run_certbot():
         try:
-            auth_hook = '/app/scripts/dns-challenge-auth-hook.sh'
-            cleanup_hook = '/app/scripts/dns-challenge-cleanup-hook.sh'
+            auth_hook = '/haproxy/scripts/dns-challenge-auth-hook.sh'
+            cleanup_hook = '/haproxy/scripts/dns-challenge-cleanup-hook.sh'
+            logger.info(f"Starting certbot DNS-01 for *.{base_domain} with auth_hook={auth_hook}")
             result = subprocess.run([
                 'certbot', 'certonly', '-n',
                 '--manual', '--preferred-challenges', 'dns-01',
@@ -1163,10 +1164,11 @@ def dns_challenge_request():
                 '--manual-auth-hook', auth_hook,
                 '--manual-cleanup-hook', cleanup_hook
             ], capture_output=True, text=True, timeout=600)
+            logger.info(f"DNS-01 certbot stdout for *.{base_domain}: {result.stdout}")
             if result.returncode == 0:
                 logger.info(f"DNS-01 certbot completed successfully for *.{base_domain}")
             else:
-                logger.error(f"DNS-01 certbot failed for *.{base_domain}: {result.stderr}")
+                logger.error(f"DNS-01 certbot failed for *.{base_domain} (rc={result.returncode}): {result.stderr}")
         except subprocess.TimeoutExpired:
             logger.error(f"DNS-01 certbot timed out for *.{base_domain}")
         except Exception as e:
