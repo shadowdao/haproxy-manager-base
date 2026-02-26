@@ -4,6 +4,9 @@ frontend web
     # crt can now be a path, so it will load all .pem files in the path
     bind 0.0.0.0:443 ssl crt {{ crt_path }} alpn h2,http/1.1
 
+    # Capture Host header so it appears in httplog output (in %hr field)
+    http-request capture req.hdr(Host) len 64
+
     # Detect real client IP from proxy headers if they exist
     # Priority: CF-Connecting-IP (Cloudflare) > X-Real-IP > X-Forwarded-For > src
     acl has_cf_connecting_ip req.hdr(CF-Connecting-IP) -m found
