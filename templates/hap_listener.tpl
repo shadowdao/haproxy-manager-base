@@ -30,20 +30,20 @@ frontend web
     acl is_whitelisted var(txn.real_ip),map_ip(/etc/haproxy/trusted_ips.map,0) -m int gt 0
 
     # --- Rate limit rules (applied in order, first match wins) ---
-    # Thresholds sized for real-world web traffic: a heavy page load can
-    # generate 30-50 requests and multiple rapid page navigations can burst
-    # well above 100 req/10s legitimately.
+    # Thresholds are generous to accommodate media-heavy sites where a
+    # single page can load 100+ images/assets. These only trigger on
+    # obvious automated abuse, not real users.
     #
-    # Hard block: >2000 req/10s per IP (200 req/s — only real floods)
-    http-request deny deny_status 429 if { sc_http_req_rate(0) gt 2000 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
-    # Tarpit: >1000 req/10s per IP (100 req/s — sustained aggressive scraping)
-    http-request tarpit deny_status 429 if { sc_http_req_rate(0) gt 1000 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
-    # Connection rate limit: >300 new connections per 10s per IP
-    http-request deny deny_status 429 if { sc_conn_rate(0) gt 300 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
-    # Concurrent connection limit: >200 simultaneous connections per IP
-    http-request deny deny_status 429 if { sc_conn_cur(0) gt 200 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
-    # High error rate: >50 errors in 30s (scanner/fuzzer behavior)
-    http-request tarpit deny_status 403 if { sc_http_err_rate(0) gt 50 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
+    # Hard block: >5000 req/10s per IP (500 req/s — sustained flood)
+    http-request deny deny_status 429 if { sc_http_req_rate(0) gt 5000 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
+    # Tarpit: >3000 req/10s per IP (300 req/s — aggressive bot/scraper)
+    http-request tarpit deny_status 429 if { sc_http_req_rate(0) gt 3000 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
+    # Connection rate limit: >500 new connections per 10s per IP
+    http-request deny deny_status 429 if { sc_conn_rate(0) gt 500 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
+    # Concurrent connection limit: >500 simultaneous connections per IP
+    http-request deny deny_status 429 if { sc_conn_cur(0) gt 500 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
+    # High error rate: >100 errors in 30s (scanner/fuzzer behavior)
+    http-request tarpit deny_status 403 if { sc_http_err_rate(0) gt 100 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
 
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
