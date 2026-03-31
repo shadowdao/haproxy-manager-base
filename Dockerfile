@@ -5,6 +5,8 @@ COPY ./templates /haproxy/templates
 COPY requirements.txt /haproxy/
 COPY haproxy_manager.py /haproxy/
 COPY scripts /haproxy/scripts
+COPY trusted_ips.list /etc/haproxy/trusted_ips.list
+COPY trusted_ips.map /etc/haproxy/trusted_ips.map
 RUN chmod +x /haproxy/scripts/*
 RUN pip install -r requirements.txt
 # Create log directories

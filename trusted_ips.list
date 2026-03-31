@@ -1,0 +1,4 @@
+# Trusted IPs - one per line, supports CIDR
+# These IPs bypass all rate limiting rules
+# Phone system
+127.0.0.1
