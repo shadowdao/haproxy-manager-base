@@ -1,4 +1,1 @@
-# Trusted IPs map - format: <ip_or_cidr> 1
-# Used for whitelisting IPs that arrive via proxy headers (real_ip)
-# Phone system
 127.0.0.1 1
