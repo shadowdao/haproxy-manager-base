@@ -27,6 +27,10 @@ global
     # SSL and Performance
     tune.ssl.default-dh-param 2048
 
+    # HTTP/2 protection against Rapid Reset (CVE-2023-44487) and stream abuse
+    tune.h2.fe.max-total-streams 2000
+    tune.h2.fe.glitches-threshold 50
+
     # Stats persistence for zero-downtime reloads
     stats-file /var/lib/haproxy/stats.dat
 #---------------------------------------------------------------------
@@ -42,12 +46,12 @@ defaults
     option forwardfor       #except 127.0.0.0/8
     option                  redispatch
     retries                 3
-    timeout http-request    300s
+    timeout http-request    30s
     timeout queue           2m
-    timeout connect         120s
-    timeout client          10m
+    timeout connect         10s
+    timeout client          5m
     timeout server          10m
-    timeout http-keep-alive 120s
+    timeout http-keep-alive 30s
     timeout check           10s
     timeout tarpit          10s  # Tarpit delay for low-level scanners (before silent-drop)
     maxconn                 3000

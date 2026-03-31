@@ -1,7 +1,8 @@
-# HAProxy 3.0.11 eliminates need for separate security tables
-# All threat intelligence is now consolidated in the main frontend table
-# using array-based GPC system with 15 threat indicators
-
-# Placeholder for future security extensions
-# The main table in hap_listener.tpl now provides comprehensive
-# multi-dimensional threat tracking with weighted scoring
+# HAProxy Stats & Monitoring
+frontend stats
+    bind 127.0.0.1:8404
+    stats enable
+    stats uri /stats
+    stats refresh 30s
+    stats show-legends
+    stats show-node

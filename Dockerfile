@@ -18,6 +18,6 @@ RUN mkdir -p /var/spool/cron/crontabs && \
     chown root:crontab /var/spool/cron/crontabs/root
 EXPOSE 80 443 8000
 # Add health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -sf --max-time 5 http://localhost:8000/health && curl -s --max-time 5 -o /dev/null http://localhost/ || exit 1
 CMD ["/haproxy/scripts/start-up.sh"]

@@ -19,6 +19,26 @@ frontend web
     http-request set-var(txn.real_ip) req.hdr(X-Forwarded-For) if !has_cf_connecting_ip !has_x_real_ip has_x_forwarded_for
     http-request set-var(txn.real_ip) src if !has_cf_connecting_ip !has_x_real_ip !has_x_forwarded_for
 
+    # --- Connection & rate tracking ---
+    stick-table type ip size 200k expire 10m store conn_cur,conn_rate(10s),http_req_rate(10s),http_err_rate(30s)
+    http-request track-sc0 var(txn.real_ip)
+
+    # Whitelist: let health checks and local traffic bypass rate limits
+    acl is_local src 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+    acl is_health_check path_beg /.well-known/acme-challenge
+
+    # --- Rate limit rules (applied in order, first match wins) ---
+    # Hard block: >500 req/10s per IP (sustained flood)
+    http-request deny deny_status 429 if { sc_http_req_rate(0) gt 500 } !is_local !is_health_check
+    # Tarpit: >200 req/10s per IP (aggressive scraping / light flood)
+    http-request tarpit deny_status 429 if { sc_http_req_rate(0) gt 200 } !is_local !is_health_check
+    # Connection rate limit: >60 new connections per 10s per IP
+    http-request deny deny_status 429 if { sc_conn_rate(0) gt 60 } !is_local !is_health_check
+    # Concurrent connection limit: >100 simultaneous connections per IP
+    http-request deny deny_status 429 if { sc_conn_cur(0) gt 100 } !is_local !is_health_check
+    # High error rate: >20 errors in 30s (scanner/fuzzer behavior)
+    http-request tarpit deny_status 403 if { sc_http_err_rate(0) gt 20 } !is_local !is_health_check
+
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
     # Runtime updates: echo "add map #0 IP_ADDRESS 1" | socat stdio /var/run/haproxy.sock
