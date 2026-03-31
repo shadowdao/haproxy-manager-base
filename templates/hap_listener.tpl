@@ -32,8 +32,8 @@ frontend web
     http-request deny deny_status 429 if { sc_http_req_rate(0) gt 500 } !is_local !is_health_check
     # Tarpit: >200 req/10s per IP (aggressive scraping / light flood)
     http-request tarpit deny_status 429 if { sc_http_req_rate(0) gt 200 } !is_local !is_health_check
-    # Connection rate limit: >60 new connections per 10s per IP
-    http-request deny deny_status 429 if { sc_conn_rate(0) gt 60 } !is_local !is_health_check
+    # Connection rate limit: >150 new connections per 10s per IP
+    http-request deny deny_status 429 if { sc_conn_rate(0) gt 150 } !is_local !is_health_check
     # Concurrent connection limit: >100 simultaneous connections per IP
     http-request deny deny_status 429 if { sc_conn_cur(0) gt 100 } !is_local !is_health_check
     # High error rate: >20 errors in 30s (scanner/fuzzer behavior)
