@@ -39,10 +39,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `backend_servers` - Individual servers within backend groups
 
 3. **Template System** - Jinja2 templates for HAProxy configuration generation:
-   - `hap_header.tpl` - Global HAProxy settings and defaults
+   - `hap_header.tpl` - Global HAProxy settings, defaults, and HTTP/2 tuning
    - `hap_backend.tpl` - Backend server definitions
-   - `hap_listener.tpl` - Frontend listener configurations
+   - `hap_listener.tpl` - Frontend listener configurations with rate limiting
    - `hap_letsencrypt.tpl` - SSL certificate configurations
+   - `hap_security_tables.tpl` - Stats frontend and security stick tables
    - Template override support for custom backend configurations
 
 4. **Certificate Management** - Automated SSL certificate handling:
@@ -73,10 +74,51 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Certificate private keys combined with certificates in HAProxy-compatible format
 - Default backend page for unmatched domains instead of exposing HAProxy errors
 
+### Rate Limiting & Connection Limits (hap_listener.tpl)
+
+- **Stick table**: `type ip size 200k expire 10m` tracking `conn_cur`, `conn_rate(10s)`, `http_req_rate(10s)`, `http_err_rate(30s)`
+- Tracks real client IP via `var(txn.real_ip)` to work correctly behind Cloudflare/proxies
+- **Rate limit thresholds**:
+  - Tarpit at 3000 req/10s (300 req/s)
+  - Hard block (deny) at 5000 req/10s (500 req/s)
+  - Connection rate limit: 500/10s
+  - Concurrent connection limit: 500
+  - Error rate limit: 100/30s
+- **Whitelist bypasses** (exempt from rate limits):
+  - `is_local` — RFC1918 private address ranges
+  - `is_trusted_ip` — source IPs listed in `trusted_ips.list`
+  - `is_whitelisted` — real IPs (from proxy headers) matched in `trusted_ips.map`
+
+### Trusted IP Whitelist Files
+
+- `trusted_ips.list` — Source IP whitelist for rate limit bypass (one CIDR/IP per line)
+- `trusted_ips.map` — Real IP whitelist for proxy-header matching (format: `<IP> 1`)
+- Both files are baked into the Docker image via `COPY` in the Dockerfile
+- Currently contains phone system IP `127.0.0.1`
+
+### Timeout Hardening (hap_header.tpl)
+
+- `timeout http-request`: 300s -> 30s (slowloris protection)
+- `timeout connect`: 120s -> 10s
+- `timeout client`: 10m -> 5m
+- `timeout http-keep-alive`: 120s -> 30s
+
+### HTTP/2 Protection (hap_header.tpl)
+
+- `tune.h2.fe.max-total-streams 2000` — limits total streams per HTTP/2 connection
+- `tune.h2.fe.glitches-threshold 50` — CVE-2023-44487 Rapid Reset protection
+
+### Stats Frontend (hap_security_tables.tpl)
+
+- HAProxy stats page bound to `127.0.0.1:8404` (localhost only, accessible inside container)
+- Template: `templates/hap_security_tables.tpl`
+
 ### Deployment Context
 
 - Designed to run as Docker container with persistent volumes for certificates and configurations
 - Exposes ports 80 (HTTP), 443 (HTTPS), and 8000 (management API/UI)
+- Stats page on port 8404 (localhost only inside container)
 - Management interface on port 8000 should be firewall-protected in production
+- Dockerfile HEALTHCHECK verifies both port 8000 (Flask API) and port 80 (HAProxy), with `start-period=60s` and `timeout=10s`
 - Supports deployment on servers with git directory at `/root/whp` and web file sync via rsync to `/docker/whp/web/`
 - HAProxy is version 3.0.11
