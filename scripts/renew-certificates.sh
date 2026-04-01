@@ -20,12 +20,21 @@ log_error() {
 
 log_info "Starting certificate renewal process"
 
-# Run certbot renewal
-if certbot renew --quiet --no-random-sleep-on-renew; then
-    log_info "Certbot renewal completed"
+# Run certbot renewal — don't exit on failure, some certs may have
+# renewed successfully even if others failed (e.g., domain no longer
+# pointed here). Continue to copy/combine whatever succeeded.
+CERTBOT_OUTPUT=$(certbot renew --no-random-sleep-on-renew 2>&1)
+CERTBOT_EXIT=$?
+
+if [ $CERTBOT_EXIT -eq 0 ]; then
+    log_info "Certbot renewal completed successfully"
 else
-    log_error "Certbot renewal failed with exit code $?"
-    exit 1
+    log_error "Certbot renewal had failures (exit code $CERTBOT_EXIT):"
+    # Log the specific failures
+    echo "$CERTBOT_OUTPUT" | grep -E "Failed to renew|failure" | while read -r line; do
+        log_error "  $line"
+    done
+    log_info "Continuing to process successfully renewed certificates..."
 fi
 
 # Copy all certificates to HAProxy format
