@@ -18,21 +18,6 @@ global
     log         127.0.0.1 local2
 
     chroot      /var/lib/haproxy
-
-# DNS resolver for Docker container name resolution
-# Re-resolves backend server addresses so container IP changes
-# (from restarts, recreations, scaling) are picked up automatically
-resolvers docker_dns
-    nameserver dns1 127.0.0.11:53
-    resolve_retries 3
-    timeout resolve 1s
-    timeout retry 1s
-    hold valid 10s
-    hold other 10s
-    hold refused 10s
-    hold nx 10s
-    hold timeout 10s
-    hold obsolete 10s
     pidfile     /var/run/haproxy.pid
     maxconn     4000
     user        haproxy
@@ -48,6 +33,24 @@ resolvers docker_dns
 
     # Stats persistence for zero-downtime reloads
     stats-file /var/lib/haproxy/stats.dat
+
+#---------------------------------------------------------------------
+# DNS resolver for Docker container name resolution
+# Re-resolves backend server addresses so container IP changes
+# (from restarts, recreations, scaling) are picked up automatically
+#---------------------------------------------------------------------
+resolvers docker_dns
+    nameserver dns1 127.0.0.11:53
+    resolve_retries 3
+    timeout resolve 1s
+    timeout retry 1s
+    hold valid 10s
+    hold other 10s
+    hold refused 10s
+    hold nx 10s
+    hold timeout 10s
+    hold obsolete 10s
+
 #---------------------------------------------------------------------
 # common defaults that all the 'listen' and 'backend' sections will
 # use if not designated in their block
