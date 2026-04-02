@@ -11,7 +11,7 @@ backend {{ name }}-backend
     http-request set-header X-Forwarded-Proto http if !{ ssl_fc }
 
     {% for server in servers %}
-    server {{ server.server_name }} {{ server.server_address }}:{{ server.server_port }} {{ server.server_options }}
+    server {{ server.server_name }} {{ server.server_address }}:{{ server.server_port }} {{ server.server_options }} resolvers docker_dns init-addr last,libc,none
     {% endfor %}
 
 # SSE-specific backend - optimized for Server-Sent Events long-lived connections
@@ -36,5 +36,5 @@ backend {{ name }}-sse-backend
     http-request set-header X-Forwarded-Proto http if !{ ssl_fc }
 
     {% for server in servers %}
-    server {{ server.server_name }} {{ server.server_address }}:{{ server.server_port }} {{ server.server_options }}
+    server {{ server.server_name }} {{ server.server_address }}:{{ server.server_port }} {{ server.server_options }} resolvers docker_dns init-addr last,libc,none
     {% endfor %}
