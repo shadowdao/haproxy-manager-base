@@ -455,6 +455,134 @@ def request_ssl():
         log_operation('request_ssl', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@app.route('/api/ssl/bundle', methods=['POST'])
+@require_api_key
+def request_ssl_bundle():
+    """Issue a single Let's Encrypt cert covering multiple SANs.
+
+    Used by WHP's per-site bundling: one ACME order, one combined .pem,
+    one DB row update per included name. Replaces N separate single-domain
+    /api/ssl calls when a site has multiple domains.
+
+    Body:
+      {"primary": "example.com", "sans": ["www.example.com", ...]}
+
+    The cert lineage uses --cert-name <primary>, so renewal under the same
+    name doesn't proliferate -0001/-0002 dirs (the issue we hit with the
+    legacy single-domain flow). The combined PEM is written to
+    /etc/haproxy/certs/<primary>.pem; HAProxy matches SNI against the cert's
+    SAN list, so this single file serves all included names.
+    """
+    data = request.get_json() or {}
+    primary = (data.get('primary') or '').strip()
+    sans = data.get('sans') or []
+
+    if not primary:
+        log_operation('request_ssl_bundle', False, 'primary not provided')
+        return jsonify({'status': 'error', 'message': '"primary" is required'}), 400
+
+    # Basic shape validation. certbot will hard-validate the rest.
+    domain_re = re.compile(
+        r'^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$',
+        re.IGNORECASE,
+    )
+    if not domain_re.match(primary):
+        return jsonify({'status': 'error', 'message': f'invalid primary: {primary!r}'}), 400
+
+    # Build the unique ordered name list — primary first, then de-duped SANs.
+    if not isinstance(sans, list):
+        return jsonify({'status': 'error', 'message': '"sans" must be a list'}), 400
+    cleaned_sans = []
+    for s in sans:
+        if not isinstance(s, str):
+            return jsonify({'status': 'error', 'message': f'invalid SAN entry: {s!r}'}), 400
+        s = s.strip()
+        if not s:
+            continue
+        if not domain_re.match(s):
+            return jsonify({'status': 'error', 'message': f'invalid SAN: {s!r}'}), 400
+        cleaned_sans.append(s)
+
+    seen = {primary}
+    names = [primary]
+    for s in cleaned_sans:
+        if s not in seen:
+            names.append(s)
+            seen.add(s)
+
+    # Let's Encrypt allows up to 100 names per cert.
+    if len(names) > 100:
+        return jsonify({
+            'status': 'error',
+            'message': f'Too many SANs ({len(names)}); Let\'s Encrypt limit is 100',
+        }), 400
+
+    cmd = [
+        'certbot', 'certonly', '-n', '--standalone',
+        '--preferred-challenges', 'http', '--http-01-port=8688',
+        '--cert-name', primary,
+    ]
+    for n in names:
+        cmd.extend(['-d', n])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            stderr_excerpt = (result.stderr or '').strip()[:800]
+            error_msg = f'Failed to obtain SSL bundle for {primary}: {stderr_excerpt}'
+            log_operation('request_ssl_bundle', False, error_msg)
+            return jsonify({
+                'status': 'error',
+                'message': error_msg,
+                'primary': primary,
+                'attempted_names': names,
+            }), 500
+
+        # Locate the lineage. With --cert-name primary, this should be a
+        # stable directory name (no -NNNN suffix on the first issuance).
+        live_dir = find_certbot_live_dir(primary)
+        if not live_dir:
+            error_msg = f'Bundle issued but live dir not found for {primary}'
+            log_operation('request_ssl_bundle', False, error_msg)
+            return jsonify({'status': 'error', 'message': error_msg}), 500
+
+        cert_path = os.path.join(live_dir, 'fullchain.pem')
+        key_path = os.path.join(live_dir, 'privkey.pem')
+        combined_path = f'{SSL_CERTS_DIR}/{primary}.pem'
+
+        os.makedirs(SSL_CERTS_DIR, exist_ok=True)
+        with open(combined_path, 'w') as combined:
+            subprocess.run(['cat', cert_path, key_path], stdout=combined)
+
+        # Mark every name in the bundle as ssl_enabled, all pointing at the
+        # same combined .pem. HAProxy serves one file for many SNI hostnames.
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            for n in names:
+                cursor.execute('''
+                    UPDATE domains
+                    SET ssl_enabled = 1, ssl_cert_path = ?
+                    WHERE domain = ?
+                ''', (combined_path, n))
+            conn.commit()
+            cursor.close()
+
+        generate_config()
+        log_operation(
+            'request_ssl_bundle', True,
+            f'SSL bundle issued for {primary} covering {len(names)} names'
+        )
+        return jsonify({
+            'status': 'success',
+            'primary': primary,
+            'names': names,
+            'cert_path': combined_path,
+            'message': f'Bundled certificate obtained for {len(names)} names',
+        })
+    except Exception as e:
+        log_operation('request_ssl_bundle', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 @app.route('/api/certificates/renew', methods=['POST'])
 @require_api_key
 def renew_certificates():
