@@ -455,6 +455,90 @@ def request_ssl():
         log_operation('request_ssl', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+def _cleanup_superseded_lineages(keep_path, keep_lineage, bundle_names):
+    """Remove cert files + certbot lineages that the just-issued bundle supersedes.
+
+    A `.pem` in /etc/haproxy/certs/ is "superseded" iff its certificate's CN
+    is one of the bundle's names AND the file isn't the bundle's own combined
+    file. We don't look at SANs of the OLD certs — being the CN is enough,
+    since that's what HAProxy SNI-matches against and what the file
+    convention names it after.
+
+    Also drops the corresponding certbot renewal config so `certbot renew`
+    stops trying to renew the dead lineage on its next 12h cron tick.
+
+    Returns a small summary dict for logging / API response.
+    """
+    summary = {'removed': [], 'errors': [], 'skipped': []}
+
+    if not os.path.isdir(SSL_CERTS_DIR):
+        return summary
+
+    keep_basename = os.path.basename(keep_path)
+
+    for fname in sorted(os.listdir(SSL_CERTS_DIR)):
+        if not fname.endswith('.pem'):
+            continue
+        if fname == keep_basename:
+            continue
+        fpath = os.path.join(SSL_CERTS_DIR, fname)
+        try:
+            cn_proc = subprocess.run(
+                ['openssl', 'x509', '-in', fpath, '-noout', '-subject', '-nameopt', 'multiline'],
+                capture_output=True, text=True
+            )
+            if cn_proc.returncode != 0:
+                summary['skipped'].append({'file': fname, 'reason': 'openssl read failed'})
+                continue
+            # `-nameopt multiline` lays out the subject one RDN per line; CN is
+            # the row matching `commonName`. Robust against unusual subject orderings.
+            cn = None
+            for line in cn_proc.stdout.splitlines():
+                line = line.strip()
+                if line.startswith('commonName'):
+                    # format: "commonName                = example.com"
+                    parts = line.split('=', 1)
+                    if len(parts) == 2:
+                        cn = parts[1].strip()
+                    break
+            if not cn:
+                summary['skipped'].append({'file': fname, 'reason': 'no CN found'})
+                continue
+        except Exception as e:
+            summary['skipped'].append({'file': fname, 'reason': f'inspect failed: {e}'})
+            continue
+
+        if cn not in bundle_names:
+            continue  # not superseded — different domain group
+
+        # This file's CN is now part of our new bundle — supersede it.
+        lineage_name = fname[:-len('.pem')]
+        if lineage_name == keep_lineage:
+            # Defensive: shouldn't happen because of keep_basename check, but
+            # don't accidentally drop the lineage we just wrote.
+            continue
+
+        try:
+            os.remove(fpath)
+            removed_entry = {'file': fname, 'cn': cn, 'lineage_deleted': False}
+            # Best-effort certbot lineage delete. Some files may not have a
+            # corresponding lineage (e.g. self-signed dev certs); ignore those.
+            try:
+                cb_proc = subprocess.run(
+                    ['certbot', 'delete', '--cert-name', lineage_name, '-n'],
+                    capture_output=True, text=True
+                )
+                removed_entry['lineage_deleted'] = (cb_proc.returncode == 0)
+                if cb_proc.returncode != 0:
+                    removed_entry['certbot_stderr'] = (cb_proc.stderr or '').strip()[:200]
+            except Exception as e:
+                removed_entry['certbot_error'] = str(e)
+            summary['removed'].append(removed_entry)
+        except Exception as e:
+            summary['errors'].append({'file': fname, 'error': str(e)})
+
+    return summary
+
 @app.route('/api/ssl/bundle', methods=['POST'])
 @require_api_key
 def request_ssl_bundle():
@@ -567,16 +651,32 @@ def request_ssl_bundle():
             conn.commit()
             cursor.close()
 
+        # Clean up superseded lineages. When the bundle covers names that were
+        # previously each in their own single-SAN -0001/-0002 lineage, those
+        # older .pem files coexist in /etc/haproxy/certs/ and get loaded by the
+        # `bind ... ssl crt /etc/haproxy/certs` directive. HAProxy then picks
+        # one of them by alphabetical/load order — frequently the older
+        # single-SAN file — and the new bundle has no effect on what's served.
+        # This block deletes those superseded files (and their certbot lineage)
+        # before the generate_config() reload so HAProxy picks up the bundle.
+        cleanup_summary = _cleanup_superseded_lineages(
+            keep_path=combined_path,
+            keep_lineage=primary,
+            bundle_names=set(names),
+        )
+
         generate_config()
         log_operation(
             'request_ssl_bundle', True,
-            f'SSL bundle issued for {primary} covering {len(names)} names'
+            f'SSL bundle issued for {primary} covering {len(names)} names; '
+            f'cleaned up {len(cleanup_summary["removed"])} superseded lineage(s)'
         )
         return jsonify({
             'status': 'success',
             'primary': primary,
             'names': names,
             'cert_path': combined_path,
+            'cleanup': cleanup_summary,
             'message': f'Bundled certificate obtained for {len(names)} names',
         })
     except Exception as e:
