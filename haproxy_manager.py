@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import re
+import fcntl
 
 app = Flask(__name__)
 
@@ -136,6 +137,69 @@ def validate_ip_address(ip_string):
         return True
     except ValueError:
         return False
+
+# Certbot uses fasteners (fcntl-based) to serialize concurrent invocations.
+# When a previous certbot run is SIGKILLed mid-execution (container restart,
+# OOM, manual kill), the kernel releases the fcntl lock automatically — but
+# the LOCK FILE on disk persists. Subsequent runs sometimes report
+# "Another instance of Certbot is already running" anyway, blocking SSL
+# issuance until someone manually clears the files.
+#
+# Our hung-process scenario (observed 2026-05-09 during the bundling rollout):
+# certbot from a previous attempt sat in defunct state holding the lock fd.
+# Once the process eventually exited, the locks were physically removable but
+# the symptoms persisted across multiple subsequent attempts.
+#
+# This helper probes each known lock path with fcntl.LOCK_NB. If we get the
+# lock, no real process holds it and the file is stale — we delete it. If we
+# DON'T get the lock, a real certbot is running and we leave it alone (so we
+# never accidentally trigger concurrent certbot runs).
+CERTBOT_LOCK_PATHS = (
+    '/etc/letsencrypt/.certbot.lock',
+    '/var/lib/letsencrypt/.certbot.lock',
+    '/var/log/letsencrypt/.certbot.lock',
+)
+
+def clear_stale_certbot_locks():
+    """Remove stale certbot lock files. Safe to call before any ACME run.
+    Returns {'cleared': [paths...], 'held': [paths...]} for logging.
+    """
+    cleared, held = [], []
+    for path in CERTBOT_LOCK_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            held.append(f'{path} (open: {e})')
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # A real process holds it; do not touch.
+            os.close(fd)
+            held.append(path)
+            continue
+        try:
+            # We hold the lock now. Release before unlinking so the lock
+            # state is clean if someone races us.
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.remove(path)
+            cleared.append(path)
+        except FileNotFoundError:
+            cleared.append(path)
+        except Exception as e:
+            held.append(f'{path} (unlink: {e})')
+    return {'cleared': cleared, 'held': held}
 
 def find_certbot_live_dir(base_domain):
     """Find the most recent certbot live directory for a domain.
@@ -403,6 +467,9 @@ def request_ssl():
         return jsonify({'status': 'error', 'message': 'Domain is required'}), 400
 
     try:
+        # Defensive: clear any stale lock left by a SIGKILLed prior run.
+        clear_stale_certbot_locks()
+
         # Request Let's Encrypt certificate
         result = subprocess.run([
             'certbot', 'certonly', '-n', '--standalone',
@@ -610,6 +677,9 @@ def request_ssl_bundle():
         cmd.extend(['-d', n])
 
     try:
+        # Defensive: clear any stale lock left by a SIGKILLed prior run.
+        clear_stale_certbot_locks()
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             stderr_excerpt = (result.stderr or '').strip()[:800]
@@ -688,6 +758,9 @@ def request_ssl_bundle():
 def renew_certificates():
     """Renew all certificates and reload HAProxy"""
     try:
+        # Defensive: clear any stale lock left by a SIGKILLed prior run.
+        clear_stale_certbot_locks()
+
         # Run certbot renew
         result = subprocess.run([
             'certbot', 'renew', '--quiet'
@@ -2006,6 +2079,14 @@ def start_haproxy():
 
 if __name__ == '__main__':
     init_db()
+    # Clear any stale certbot locks left from a previous container instance
+    # that didn't shut down cleanly. Safe — only removes locks that no live
+    # process holds (verified via fcntl probe).
+    _stale = clear_stale_certbot_locks()
+    if _stale['cleared']:
+        logger.info(f"Cleared stale certbot lock(s) at startup: {_stale['cleared']}")
+    if _stale['held']:
+        logger.warning(f"certbot lock(s) actively held at startup: {_stale['held']}")
     certbot_register()
     generate_self_signed_cert(SSL_CERTS_DIR)
     
