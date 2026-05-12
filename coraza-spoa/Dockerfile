@@ -11,10 +11,12 @@
 
 ARG CORAZA_SPOA_VERSION=v0.7.1
 
-# golang:1.25 from docker.io. Mirror to repo.anhonesthost.net if Cloudflare
-# reliability becomes a recurring concern (the 2026-05-12 incident drove
-# the same mirror for python:3.12-slim in the parent Dockerfile).
-FROM golang:1.25 AS build
+# golang:1.25 from the in-house mirror. The 2026-05-12 Cloudflare incident
+# took out docker.io blob pulls TWICE in one day (first for python:3.12-slim,
+# then for this image's golang:1.25), so both are mirrored at
+# repo.anhonesthost.net via the .gitea/workflows/mirror-base-image.yaml
+# weekly job.
+FROM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS build
 ARG CORAZA_SPOA_VERSION
 WORKDIR /src
 RUN apt-get update \
