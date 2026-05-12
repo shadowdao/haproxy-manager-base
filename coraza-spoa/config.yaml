@@ -1,0 +1,61 @@
+# Coraza-SPOA configuration for WHP haproxy-manager integration.
+#
+# One named application "haproxy" — the haproxy-manager spoe template
+# references this same name in its spoe-agent block, so the SPOA knows
+# which rules to apply when HAProxy dispatches a request.
+#
+# Mode: SecRuleEngine DetectionOnly globally; overrides.conf promotes
+# specific high-confidence rule ID ranges to enforcement individually.
+# This is the safest posture for v1 — every rule logs, but only the
+# unambiguous ones (scanner UAs, RCE, LFI, webshells, Log4Shell) block.
+
+bind: 0.0.0.0:9000
+
+# Process-level logging (separate from per-request audit logging below)
+log_level: info
+log_file: /dev/stdout
+log_format: json
+
+# Fallback when the request doesn't match a named application — we only
+# have one, so it's also the default.
+default_application: haproxy
+
+applications:
+  - name: haproxy
+    directives: |
+      # CRS-bundled defaults: recommended Coraza settings + CRS setup +
+      # the rule pack itself (~16 MB of rules embedded in the binary).
+      Include @coraza.conf-recommended
+      Include @crs-setup.conf.example
+      Include @owasp_crs/*.conf
+
+      # WHP-specific overrides — day-one enforce list, plus tuning for
+      # the customer mix (WordPress, WooCommerce, Divi). Read this file
+      # to see exactly what blocks vs what's detect-only.
+      Include /etc/coraza/overrides.conf
+
+      # Global mode: log all alerts, block only what overrides.conf
+      # explicitly promotes via ctl:ruleEngine=On.
+      SecRuleEngine DetectionOnly
+
+      # Audit log: JSON to a bind-mounted file so AI Monitor + log
+      # rotation can pick it up. RelevantOnly means we don't log every
+      # passing request, only ones that triggered at least one rule.
+      SecAuditEngine RelevantOnly
+      SecAuditLog /var/log/coraza/audit.log
+      SecAuditLogFormat JSON
+      SecAuditLogParts ABIJDEFHKZ
+
+    # HAProxy sends request-only events for v1. Response inspection adds
+    # latency on every page render with marginal additional protection
+    # for our customer mix; can be turned on later if we want it.
+    response_check: false
+
+    # Transactions cache for 60s. SPOE protocol is fire-and-forget per
+    # request, so this is just how long Coraza holds context for any
+    # multi-stage processing.
+    transaction_ttl_ms: 60000
+
+    log_level: info
+    log_file: /var/log/coraza/spoa.log
+    log_format: json

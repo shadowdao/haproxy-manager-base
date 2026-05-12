@@ -1,0 +1,44 @@
+name: Build and push coraza-spoa
+run-name: ${{ gitea.actor }} pushed a change to coraza-spoa/
+
+# Triggers only on changes to the coraza-spoa subdirectory or this workflow
+# file itself — keeps the main haproxy-manager-base build and the coraza-spoa
+# build independent. workflow_dispatch lets us trigger manually after bumping
+# the upstream coraza-spoa version pin.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'coraza-spoa/**'
+      - '.gitea/workflows/build-push-coraza.yaml'
+  workflow_dispatch:
+
+jobs:
+  Build-and-Push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+
+      - name: Login to Gitea
+        uses: docker/login-action@v3
+        with:
+          registry: repo.anhonesthost.net
+          username: ${{ secrets.CI_USER }}
+          password: ${{ secrets.CI_TOKEN }}
+
+      - name: Build Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./coraza-spoa
+          platforms: linux/amd64
+          push: true
+          tags: |
+            repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa:latest
