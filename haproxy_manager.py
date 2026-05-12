@@ -20,6 +20,44 @@ import fcntl
 
 app = Flask(__name__)
 
+# Default page server (port 8080) — served to HAProxy clients whose request hit
+# an unconfigured domain OR whose IP is blocked. Defined at module level so
+# gunicorn can import it from start-up.sh; previously this was created inside
+# the __main__ block, which prevented out-of-process WSGI servers from reaching
+# it. Routes accept ALL HTTP methods because HAProxy proxies the original
+# request verb unchanged — a POST to a blocked domain would otherwise 405,
+# which is just log noise.
+default_app = Flask('haproxy_default')
+default_app.template_folder = 'templates'
+
+_ANY_METHOD = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
+
+
+@default_app.route('/', methods=_ANY_METHOD)
+def default_page():
+    """Serve the default page for unmatched domains."""
+    return render_template(
+        'default_page.html',
+        page_title=os.environ.get('HAPROXY_DEFAULT_PAGE_TITLE', 'Site Not Configured'),
+        main_message=os.environ.get(
+            'HAPROXY_DEFAULT_MAIN_MESSAGE',
+            'This domain has not been configured yet. Please contact your '
+            'system administrator to set up this website.'
+        ),
+        secondary_message=os.environ.get(
+            'HAPROXY_DEFAULT_SECONDARY_MESSAGE',
+            'If you believe this is an error, please check the domain name '
+            'and try again.'
+        ),
+    )
+
+
+@default_app.route('/blocked-ip', methods=_ANY_METHOD)
+def blocked_ip_page():
+    """Serve the blocked IP page for blocked clients (HTTP 403)."""
+    return render_template('blocked_ip_page.html'), 403
+
+
 # Configuration
 DB_FILE = '/etc/haproxy/haproxy_config.db'
 TEMPLATE_DIR = Path('templates')
@@ -2077,7 +2115,13 @@ def start_haproxy():
             log_operation('start_haproxy', False, error_msg)
             logger.warning("Container will continue without HAProxy running")
 
-if __name__ == '__main__':
+def do_initial_setup():
+    """One-time container-startup setup: DB schema, certbot account, fresh
+    self-signed cert, config generation, and HAProxy launch. Idempotent;
+    safe to re-run, but in prod it should run exactly once per container
+    instance (via scripts/init.py before gunicorn workers spawn) so that
+    start_haproxy() doesn't race with itself across forks.
+    """
     init_db()
     # Clear any stale certbot locks left from a previous container instance
     # that didn't shut down cleanly. Safe — only removes locks that no live
@@ -2089,7 +2133,7 @@ if __name__ == '__main__':
         logger.warning(f"certbot lock(s) actively held at startup: {_stale['held']}")
     certbot_register()
     generate_self_signed_cert(SSL_CERTS_DIR)
-    
+
     # Always regenerate config before starting HAProxy to ensure compatibility
     try:
         generate_config()
@@ -2097,40 +2141,23 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Failed to generate initial configuration: {e}")
         # Continue anyway, HAProxy will fail to start but the service will be available
-    
+
     start_haproxy()
     certbot_register()
-    
-    # Run Flask app on port 8000 for API and port 8080 for default page
+
+
+if __name__ == '__main__':
+    # Direct-invocation path: `python haproxy_manager.py`. Used for local dev
+    # and as a fallback. In the container this runs only when scripts/start-up.sh
+    # is bypassed; production uses gunicorn after scripts/init.py.
+    do_initial_setup()
+
+    # Run both Flask apps on the werkzeug dev server. Acceptable for local
+    # development but NOT production — gunicorn is the prod server, invoked
+    # from scripts/start-up.sh.
     from threading import Thread
-    
-    def run_default_page_server():
-        """Run a separate Flask app on port 8080 for the default page"""
-        from flask import Flask, render_template
-        default_app = Flask(__name__)
-        default_app.template_folder = 'templates'
-        
-        @default_app.route('/')
-        def default_page():
-            """Serve the default page for unmatched domains"""
-            admin_email = os.environ.get('HAPROXY_ADMIN_EMAIL', 'admin@example.com')
-            
-            return render_template('default_page.html',
-                page_title=os.environ.get('HAPROXY_DEFAULT_PAGE_TITLE', 'Site Not Configured'),
-                main_message=os.environ.get('HAPROXY_DEFAULT_MAIN_MESSAGE', 'This domain has not been configured yet. Please contact your system administrator to set up this website.'),
-                secondary_message=os.environ.get('HAPROXY_DEFAULT_SECONDARY_MESSAGE', 'If you believe this is an error, please check the domain name and try again.')
-            )
-        
-        @default_app.route('/blocked-ip')
-        def blocked_ip_page():
-            """Serve the blocked IP page for blocked clients"""
-            return render_template('blocked_ip_page.html'), 403
-        
-        default_app.run(host='0.0.0.0', port=8080)
-    
-    # Start the default page server in a separate thread
-    default_server_thread = Thread(target=run_default_page_server, daemon=True)
-    default_server_thread.start()
-    
-    # Run the main API server
+    Thread(
+        target=lambda: default_app.run(host='0.0.0.0', port=8080),
+        daemon=True,
+    ).start()
     app.run(host='0.0.0.0', port=8000)

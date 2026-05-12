@@ -1,3 +1,7 @@
 Flask==2.3.3
 Jinja2==3.1.2
 psutil
+# Production WSGI server. Replaces Flask's built-in werkzeug dev server, which
+# is single-threaded and leaks workers over long uptimes (root cause of the
+# 2026-05 haproxy-manager "healthy but stalled" incidents).
+gunicorn==23.0.0
