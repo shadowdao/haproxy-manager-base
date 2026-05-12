@@ -1710,16 +1710,25 @@ def generate_config():
         
         config_parts = []
 
+        # Optional Coraza WAF integration. When HAPROXY_CORAZA_SPOE_BACKEND is
+        # set on the haproxy-manager container, we render an extra TCP backend
+        # pointing at a coraza-spoa sidecar AND inject a `filter spoe ...` line
+        # into the frontend via hap_listener.tpl. Unset (the default for
+        # standalone deployments, home networks, and any non-WHP use of this
+        # image) -> the generated haproxy.cfg is byte-identical to today's.
+        coraza_spoe_backend = os.environ.get('HAPROXY_CORAZA_SPOE_BACKEND')
+
         # Add Haproxy Default Headers
         default_headers = template_env.get_template('hap_header.tpl').render()
         config_parts.append(default_headers)
 
         # Update blocked IPs map file first
         update_blocked_ips_map()
-        
+
         # Add Listener Block
         listener_block = template_env.get_template('hap_listener.tpl').render(
-            crt_path = SSL_CERTS_DIR
+            crt_path = SSL_CERTS_DIR,
+            coraza_spoe_backend = coraza_spoe_backend,
         )
         config_parts.append(listener_block)
 
@@ -1839,6 +1848,25 @@ backend default-backend
             config_parts.append(fallback_backend)
         # Add Backends
         config_parts.append('\n' .join(config_backends) + '\n')
+
+        # Coraza WAF backend + SPOE engine config file (only when env var set).
+        # Writing /etc/haproxy/coraza-spoe.cfg here keeps it in sync with the
+        # filter line that hap_listener.tpl just rendered into the frontend.
+        if coraza_spoe_backend:
+            coraza_backend_block = template_env.get_template(
+                'hap_coraza_spoa_backend.tpl'
+            ).render(agent_target=coraza_spoe_backend)
+            config_parts.append(coraza_backend_block)
+
+            coraza_spoe_cfg = template_env.get_template(
+                'hap_coraza_spoe_engine.tpl'
+            ).render()
+            coraza_spoe_path = '/etc/haproxy/coraza-spoe.cfg'
+            with open(coraza_spoe_path, 'w') as f:
+                f.write(coraza_spoe_cfg)
+            logger.info(f"Coraza SPOE engine config written to {coraza_spoe_path} "
+                        f"(SPOA target: {coraza_spoe_backend})")
+
         # Write complete configuration to tmp
         temp_config_path = "/etc/haproxy/haproxy.cfg"
 

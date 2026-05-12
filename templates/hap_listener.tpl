@@ -53,3 +53,11 @@ frontend web
     acl is_blocked_ip var(txn.real_ip),map_ip(/etc/haproxy/blocked_ips.map,0) -m int gt 0
     http-request set-path /blocked-ip if is_blocked_ip
     use_backend default-backend if is_blocked_ip
+{% if coraza_spoe_backend %}
+    # Coraza WAF inspection via SPOE. Runs AFTER rate-limit and IP-block
+    # guards (no point asking the WAF about requests we're already dropping)
+    # and AFTER the real-client-IP resolution (so Coraza sees the right src).
+    # Fail-open: see `option set-on-error continue` in /etc/haproxy/coraza-spoe.cfg.
+    filter spoe engine coraza config /etc/haproxy/coraza-spoe.cfg
+    http-request send-spoe-group coraza coraza-check
+{% endif %}
