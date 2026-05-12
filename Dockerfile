@@ -1,4 +1,14 @@
-FROM python:3.12-slim
+# Base image mirrored into the in-house registry to remove docker.io
+# (Cloudflare R2) as a single point of failure for CI builds. The 2026-05-12
+# Cloudflare incident took down docker.io blob pulls and broke this image's CI.
+# Refresh procedure (run on a workstation that can reach docker.io, e.g.
+# monthly or when Python patches drop):
+#     docker pull docker.io/library/python:3.12-slim
+#     docker tag  docker.io/library/python:3.12-slim \
+#                 repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
+#     docker push repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
+# Future improvement: a scheduled Gitea Action that does the above automatically.
+FROM repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
 RUN apt update -y && apt dist-upgrade -y && apt install socat haproxy cron certbot curl jq net-tools -y && apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
 COPY ./templates /haproxy/templates
