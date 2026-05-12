@@ -1,0 +1,52 @@
+name: Mirror python:3.12-slim base image
+run-name: weekly base-image mirror
+# Pulls python:3.12-slim from docker.io and re-pushes it to the in-house
+# registry, so haproxy-manager-base's build (and any future image that
+# uses the same mirror) doesn't depend on docker.io's Cloudflare R2
+# blob storage being reachable. The 2026-05-12 Cloudflare incident
+# motivated this; manual refresh was the workaround at the time.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC — outside customer peak hours and well before
+    # the typical Tuesday/Thursday push cycles. workflow_dispatch lets us
+    # trigger manually from the Gitea UI when Python publishes patches.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  Mirror-Base:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to in-house registry
+        uses: docker/login-action@v3
+        with:
+          registry: repo.anhonesthost.net
+          username: ${{ secrets.CI_USER }}
+          password: ${{ secrets.CI_TOKEN }}
+
+      - name: Pull, retag, push
+        run: |
+          set -euo pipefail
+          SRC=docker.io/library/python:3.12-slim
+          DST=repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
+
+          echo "::group::Pulling ${SRC}"
+          docker pull "${SRC}"
+          echo "::endgroup::"
+
+          # Capture the upstream digest so the workflow log shows what we
+          # actually pushed. Helps diagnose "did the mirror really update"
+          # questions later.
+          SRC_DIGEST=$(docker image inspect "${SRC}" -f '{{index .RepoDigests 0}}')
+          echo "upstream digest: ${SRC_DIGEST}"
+
+          docker tag "${SRC}" "${DST}"
+
+          echo "::group::Pushing ${DST}"
+          docker push "${DST}"
+          echo "::endgroup::"
+
+          # Sanity: the in-house tag should now resolve to the same content.
+          DST_DIGEST=$(docker image inspect "${DST}" -f '{{index .RepoDigests 0}}')
+          echo "mirror digest:   ${DST_DIGEST}"
