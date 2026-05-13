@@ -58,7 +58,9 @@ frontend web
     # Coraza WAF inspection via SPOE. Runs AFTER rate-limit and IP-block
     # guards (no point asking the WAF about requests we're already dropping)
     # and AFTER the real-client-IP resolution (so Coraza sees the right src).
-    # Fail-open: see `option set-on-error continue` in /etc/haproxy/coraza-spoe.cfg.
+    # Fail-open: option set-on-error in coraza-spoe.cfg only SETS the error
+    # var; we deliberately don't have a `http-request deny if errored` rule,
+    # so SPOA outages let traffic through uninspected.
     filter spoe engine coraza config /etc/haproxy/coraza-spoe.cfg
-    http-request send-spoe-group coraza coraza-check
+    http-request send-spoe-group coraza coraza-req
 {%- endif %}
