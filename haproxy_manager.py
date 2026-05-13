@@ -1863,6 +1863,12 @@ backend default-backend
             coraza_spoe_cfg = template_env.get_template(
                 'hap_coraza_spoe_engine.tpl'
             ).render()
+            # HAProxy also rejects this file without a trailing LF
+            # ("Missing LF on last line"). Belt-and-suspenders — even if the
+            # template ends with a newline, Jinja2 can trim it depending on
+            # how the file was authored.
+            if not coraza_spoe_cfg.endswith('\n'):
+                coraza_spoe_cfg += '\n'
             coraza_spoe_path = '/etc/haproxy/coraza-spoe.cfg'
             with open(coraza_spoe_path, 'w') as f:
                 f.write(coraza_spoe_cfg)

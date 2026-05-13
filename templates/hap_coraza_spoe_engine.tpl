@@ -36,15 +36,7 @@ spoe-message coraza-check
     # `app=str(haproxy)` matches the application named "haproxy" in
     # coraza-spoa's config.yaml — that's how Coraza picks which ruleset
     # to apply.
-    args        app=str(haproxy) \
-                src-ip=src \
-                src-port=src_port \
-                dest-ip=dst \
-                dest-port=dst_port \
-                method=method \
-                path=path \
-                query=query \
-                version=req.ver \
-                headers=req.hdrs \
-                body=req.body
-    event       on-frontend-http-request
+    # NOTE: args must be on ONE line. HAProxy does not support backslash
+    # line continuations in spoe configs (verified the hard way 2026-05-12).
+    args app=str(haproxy) src-ip=src src-port=src_port dest-ip=dst dest-port=dst_port method=method path=path query=query version=req.ver headers=req.hdrs body=req.body
+    event on-frontend-http-request
