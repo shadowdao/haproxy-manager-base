@@ -1852,11 +1852,13 @@ backend default-backend
         # Coraza WAF backend + SPOE engine config file (only when env var set).
         # Writing /etc/haproxy/coraza-spoe.cfg here keeps it in sync with the
         # filter line that hap_listener.tpl just rendered into the frontend.
+        # Explicit trailing '\n' because this is now the LAST config_part —
+        # HAProxy fails parse with "Missing LF on last line" otherwise.
         if coraza_spoe_backend:
             coraza_backend_block = template_env.get_template(
                 'hap_coraza_spoa_backend.tpl'
             ).render(agent_target=coraza_spoe_backend)
-            config_parts.append(coraza_backend_block)
+            config_parts.append(coraza_backend_block + '\n')
 
             coraza_spoe_cfg = template_env.get_template(
                 'hap_coraza_spoe_engine.tpl'
