@@ -58,9 +58,23 @@ frontend web
     # Coraza WAF inspection via SPOE. Runs AFTER rate-limit and IP-block
     # guards (no point asking the WAF about requests we're already dropping)
     # and AFTER the real-client-IP resolution (so Coraza sees the right src).
-    # Fail-open: option set-on-error in coraza-spoe.cfg only SETS the error
-    # var; we deliberately don't have a `http-request deny if errored` rule,
-    # so SPOA outages let traffic through uninspected.
     filter spoe engine coraza config /etc/haproxy/coraza-spoe.cfg
     http-request send-spoe-group coraza coraza-req
+
+    # Enforce Coraza's verdict. The SPOA sets var(txn.coraza.action) to
+    # "deny" / "drop" / "redirect" when a rule with the corresponding
+    # disruptive action fires (depends on SecRuleEngine mode + per-rule
+    # ctl:ruleEngine overrides). Without these rules, Coraza would inspect
+    # but never block.
+    http-request deny deny_status 403 hdr waf-block "request"  if { var(txn.coraza.action) -m str deny }
+    http-response deny deny_status 403 hdr waf-block "response" if { var(txn.coraza.action) -m str deny }
+    http-request silent-drop if { var(txn.coraza.action) -m str drop }
+    http-response silent-drop if { var(txn.coraza.action) -m str drop }
+    http-request redirect code 302 location %[var(txn.coraza.data)] if { var(txn.coraza.action) -m str redirect }
+    http-response redirect code 302 location %[var(txn.coraza.data)] if { var(txn.coraza.action) -m str redirect }
+
+    # FAIL-OPEN on SPOA error. Upstream's example does the opposite — denies
+    # 500 if var(txn.coraza.error) is set — but for a hosting platform we'd
+    # rather lose WAF coverage briefly than 503 customer sites. The error
+    # variable still gets set, so monitoring can observe it.
 {%- endif %}

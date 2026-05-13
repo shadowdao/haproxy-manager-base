@@ -6,9 +6,11 @@
 # container's name + 9000 inside the shared docker network).
 backend coraza-spoa-backend
     mode tcp
+    # spop-check actually speaks the SPOE protocol against the agent —
+    # confirms the agent can negotiate a session, not just that the TCP
+    # port is open. Required to detect a half-broken SPOA that's listening
+    # but not actually processing.
+    option spop-check
     timeout connect 5s
     timeout server  30s
-    # Keep-alive connection to the SPOA — saves a TCP handshake on every
-    # request. SPOE protocol multiplexes multiple requests over one
-    # connection so this is normal.
-    server coraza-spoa {{ agent_target }} check inter 30s rise 2 fall 3
+    server coraza-spoa {{ agent_target }} check
