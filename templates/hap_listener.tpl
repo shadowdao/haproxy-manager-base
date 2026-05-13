@@ -56,15 +56,17 @@ frontend web
 {%- if suspension_enabled %}
 
     # Site suspension routing. Any Host header listed in
-    # /etc/haproxy/suspended_domains.list is routed to bk_suspended (a
-    # backend serving a static 503 "site unavailable" page). External
-    # tooling (e.g. WHP's site_disable.php) maintains the list file via
-    # `docker cp`. An empty list is safe — the ACL simply doesn't match.
-    # Sits after IP-blocking (so 429/403 still trigger first) and before
-    # any per-domain use_backend rules, so suspension takes precedence
-    # over normal site routing.
+    # /etc/haproxy/suspended_domains.list is rewritten to /suspended and
+    # routed through default-backend, which is the same Flask app that
+    # serves the default page and blocked-ip page (port 8080 inside this
+    # container). The `/suspended` route returns HTTP 503 with a static
+    # suspension page. External tooling (e.g. WHP's site_disable.php)
+    # maintains the list file via `docker cp`. An empty list is safe —
+    # the ACL simply doesn't match. Sits after IP-blocking so 429/403
+    # still trigger first.
     acl is_suspended_domain hdr(host),lower -f /etc/haproxy/suspended_domains.list
-    use_backend bk_suspended if is_suspended_domain
+    http-request set-path /suspended if is_suspended_domain
+    use_backend default-backend if is_suspended_domain
 {%- endif %}
 {%- if coraza_spoe_backend %}
 

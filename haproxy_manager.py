@@ -58,6 +58,14 @@ def blocked_ip_page():
     return render_template('blocked_ip_page.html'), 403
 
 
+@default_app.route('/suspended', methods=_ANY_METHOD)
+def suspended_page():
+    """Serve the suspended-site page (HTTP 503) for hosts listed in
+    /etc/haproxy/suspended_domains.list. Routed here via the frontend
+    path-rewrite ACL when HAPROXY_SUSPENSION_ENABLED=true."""
+    return render_template('suspended_page.html'), 503
+
+
 # Configuration
 DB_FILE = '/etc/haproxy/haproxy_config.db'
 TEMPLATE_DIR = Path('templates')
@@ -1718,14 +1726,18 @@ def generate_config():
         # image) -> the generated haproxy.cfg is byte-identical to today's.
         coraza_spoe_backend = os.environ.get('HAPROXY_CORAZA_SPOE_BACKEND')
 
-        # Optional site-suspension routing. When HAPROXY_SUSPENSION_BACKEND is
-        # set (e.g. "whp-suspended:80"), we render bk_suspended + a frontend
-        # ACL that routes hosts in /etc/haproxy/suspended_domains.list to it.
+        # Optional site-suspension routing. When HAPROXY_SUSPENSION_ENABLED is
+        # set (any truthy value), the frontend gets an ACL that rewrites the
+        # path to /suspended and routes through default-backend for any host
+        # listed in /etc/haproxy/suspended_domains.list. The /suspended Flask
+        # route in this same process returns HTTP 503 + a static page — no
+        # separate container needed (mirrors the existing /blocked-ip pattern).
         # Same opt-in shape as Coraza: unset -> config byte-identical to today.
-        # The list file is maintained by external tooling; we just ensure it
-        # exists (haproxy refuses to start with -f pointing at a missing file).
-        suspension_backend_target = os.environ.get('HAPROXY_SUSPENSION_BACKEND')
-        if suspension_backend_target:
+        # We just ensure the list file exists (haproxy refuses to start with
+        # `-f` pointing at a missing file).
+        suspension_raw = os.environ.get('HAPROXY_SUSPENSION_ENABLED', '').strip().lower()
+        suspension_enabled = suspension_raw in ('1', 'true', 'yes', 'on')
+        if suspension_enabled:
             suspended_list_path = '/etc/haproxy/suspended_domains.list'
             if not os.path.exists(suspended_list_path):
                 try:
@@ -1747,7 +1759,7 @@ def generate_config():
         listener_block = template_env.get_template('hap_listener.tpl').render(
             crt_path = SSL_CERTS_DIR,
             coraza_spoe_backend = coraza_spoe_backend,
-            suspension_enabled = bool(suspension_backend_target),
+            suspension_enabled = suspension_enabled,
         )
         config_parts.append(listener_block)
 
@@ -1867,14 +1879,6 @@ backend default-backend
             config_parts.append(fallback_backend)
         # Add Backends
         config_parts.append('\n' .join(config_backends) + '\n')
-
-        # Suspended-site backend (only when env var set). Inserted before the
-        # Coraza backend so config_parts ordering remains deterministic.
-        if suspension_backend_target:
-            suspended_backend_block = template_env.get_template(
-                'hap_suspended_backend.tpl'
-            ).render(target=suspension_backend_target)
-            config_parts.append(suspended_backend_block + '\n')
 
         # Coraza WAF backend + SPOE engine config file (only when env var set).
         # Writing /etc/haproxy/coraza-spoe.cfg here keeps it in sync with the
