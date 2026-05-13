@@ -1718,6 +1718,24 @@ def generate_config():
         # image) -> the generated haproxy.cfg is byte-identical to today's.
         coraza_spoe_backend = os.environ.get('HAPROXY_CORAZA_SPOE_BACKEND')
 
+        # Optional site-suspension routing. When HAPROXY_SUSPENSION_BACKEND is
+        # set (e.g. "whp-suspended:80"), we render bk_suspended + a frontend
+        # ACL that routes hosts in /etc/haproxy/suspended_domains.list to it.
+        # Same opt-in shape as Coraza: unset -> config byte-identical to today.
+        # The list file is maintained by external tooling; we just ensure it
+        # exists (haproxy refuses to start with -f pointing at a missing file).
+        suspension_backend_target = os.environ.get('HAPROXY_SUSPENSION_BACKEND')
+        if suspension_backend_target:
+            suspended_list_path = '/etc/haproxy/suspended_domains.list'
+            if not os.path.exists(suspended_list_path):
+                try:
+                    with open(suspended_list_path, 'w') as f:
+                        f.write('')
+                    os.chmod(suspended_list_path, 0o644)
+                    logger.info(f"Created empty {suspended_list_path}")
+                except Exception as e:
+                    logger.error(f"Failed to create {suspended_list_path}: {e}")
+
         # Add Haproxy Default Headers
         default_headers = template_env.get_template('hap_header.tpl').render()
         config_parts.append(default_headers)
@@ -1729,6 +1747,7 @@ def generate_config():
         listener_block = template_env.get_template('hap_listener.tpl').render(
             crt_path = SSL_CERTS_DIR,
             coraza_spoe_backend = coraza_spoe_backend,
+            suspension_enabled = bool(suspension_backend_target),
         )
         config_parts.append(listener_block)
 
@@ -1848,6 +1867,14 @@ backend default-backend
             config_parts.append(fallback_backend)
         # Add Backends
         config_parts.append('\n' .join(config_backends) + '\n')
+
+        # Suspended-site backend (only when env var set). Inserted before the
+        # Coraza backend so config_parts ordering remains deterministic.
+        if suspension_backend_target:
+            suspended_backend_block = template_env.get_template(
+                'hap_suspended_backend.tpl'
+            ).render(target=suspension_backend_target)
+            config_parts.append(suspended_backend_block + '\n')
 
         # Coraza WAF backend + SPOE engine config file (only when env var set).
         # Writing /etc/haproxy/coraza-spoe.cfg here keeps it in sync with the
