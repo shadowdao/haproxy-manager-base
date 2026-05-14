@@ -13,10 +13,14 @@ frontend web
     acl has_x_real_ip req.hdr(X-Real-IP) -m found
     acl has_x_forwarded_for req.hdr(X-Forwarded-For) -m found
 
-    # Set the real IP based on available headers
-    http-request set-var(txn.real_ip) req.hdr(CF-Connecting-IP) if has_cf_connecting_ip
-    http-request set-var(txn.real_ip) req.hdr(X-Real-IP) if !has_cf_connecting_ip has_x_real_ip
-    http-request set-var(txn.real_ip) req.hdr(X-Forwarded-For) if !has_cf_connecting_ip !has_x_real_ip has_x_forwarded_for
+    # Set the real IP based on available headers. Use hdr_ip (not hdr) so the
+    # variable is typed as IP — required by the Coraza SPOE arg `src-ip` which
+    # decodes binary IP bytes (passing a string IP panics the SPOA goroutine).
+    # `hdr_ip(X-Forwarded-For,1)` extracts the FIRST address from a possibly
+    # comma-separated chain (original client, not intermediate proxies).
+    http-request set-var(txn.real_ip) req.hdr_ip(CF-Connecting-IP) if has_cf_connecting_ip
+    http-request set-var(txn.real_ip) req.hdr_ip(X-Real-IP) if !has_cf_connecting_ip has_x_real_ip
+    http-request set-var(txn.real_ip) req.hdr_ip(X-Forwarded-For,1) if !has_cf_connecting_ip !has_x_real_ip has_x_forwarded_for
     http-request set-var(txn.real_ip) src if !has_cf_connecting_ip !has_x_real_ip !has_x_forwarded_for
 
     # --- Connection & rate tracking ---
