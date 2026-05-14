@@ -44,8 +44,14 @@ spoe-agent coraza
 # Arg order/names are mandatory: Coraza-SPOA parses positionally and renames
 # break the agent. `app=str(haproxy)` is the literal application name from
 # coraza-spoa's config.yaml `applications:` block.
+#
+# src-ip uses var(txn.real_ip) — HAProxy resolves the real client IP at the
+# top of the frontend (CF-Connecting-IP > X-Real-IP > X-Forwarded-For > src,
+# only honoring those headers from trusted proxies). Falls back to `src`
+# when no proxy headers are present. This is what shows up as `client_ip`
+# in /var/log/coraza/audit.log and the rule manager's view-matches panel.
 spoe-message coraza-req
-    args app=str(haproxy) src-ip=src src-port=src_port dst-ip=dst dst-port=dst_port method=method path=path query=query version=req.ver headers=req.hdrs body=req.body
+    args app=str(haproxy) src-ip=var(txn.real_ip) src-port=src_port dst-ip=dst dst-port=dst_port method=method path=path query=query version=req.ver headers=req.hdrs body=req.body
 
 # Group binding for send-spoe-group invocation in the frontend. One group,
 # one message; could add more in the future (e.g. coraza-res for response
