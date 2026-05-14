@@ -34,6 +34,9 @@ applications:
       # to see exactly what blocks vs what's detect-only.
       Include /etc/coraza/overrides.conf
 
+      # Runtime-managed overrides written by WHP UI. Empty by default.
+      Include /etc/coraza/local-overrides.conf
+
       # Global mode: log all alerts, block only what overrides.conf
       # explicitly promotes via ctl:ruleEngine=On.
       SecRuleEngine DetectionOnly

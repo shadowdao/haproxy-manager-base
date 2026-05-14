@@ -39,6 +39,8 @@ LABEL org.opencontainers.image.title="coraza-spoa-whp" \
 COPY --from=build /out/coraza-spoa /coraza-spoa
 COPY config.yaml /etc/coraza-spoa/config.yaml
 COPY overrides.conf /etc/coraza/overrides.conf
+COPY local-overrides.conf /etc/coraza/local-overrides.conf
+COPY host-exceptions/ /etc/coraza/host-exceptions/
 
 # Audit log directory — bind-mount /var/log/coraza:/var/log/coraza from host
 # so logs persist across container restarts and AI Monitor can tail them.
