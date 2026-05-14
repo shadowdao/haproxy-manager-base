@@ -27,6 +27,14 @@ applications:
       # the rule pack itself (~16 MB of rules embedded in the binary).
       Include @coraza.conf-recommended
       Include @crs-setup.conf.example
+
+      # Runtime-managed PRE-CRS exclusions written by WHP UI. Empty by default.
+      # Loaded BEFORE the CRS rules so per-host ctl:ruleRemoveById exemptions
+      # fire in phase:1 BEFORE the CRS rule they're trying to exempt would
+      # otherwise match. Server-wide overrides live in local-overrides.conf
+      # (loaded after CRS) instead.
+      Include /etc/coraza/pre-overrides.conf
+
       Include @owasp_crs/*.conf
 
       # WHP-specific overrides — day-one enforce list, plus tuning for
@@ -34,7 +42,7 @@ applications:
       # to see exactly what blocks vs what's detect-only.
       Include /etc/coraza/overrides.conf
 
-      # Runtime-managed overrides written by WHP UI. Empty by default.
+      # Runtime-managed POST-CRS overrides written by WHP UI. Empty by default.
       Include /etc/coraza/local-overrides.conf
 
       # Global mode: log all alerts, block only what overrides.conf

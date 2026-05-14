@@ -49,6 +49,7 @@ LABEL org.opencontainers.image.title="coraza-spoa-whp" \
 COPY --from=build /out/coraza-spoa /coraza-spoa
 COPY config.yaml /etc/coraza-spoa/config.yaml
 COPY overrides.conf /etc/coraza/overrides.conf
+COPY pre-overrides.conf /etc/coraza/pre-overrides.conf
 COPY local-overrides.conf /etc/coraza/local-overrides.conf
 COPY host-exceptions/ /etc/coraza/host-exceptions/
 COPY --from=catalog /out/rules-catalog.json /etc/coraza/rules-catalog.json
