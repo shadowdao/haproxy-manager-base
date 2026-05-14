@@ -1,6 +1,6 @@
 module catalog-extractor
 
-go 1.25
+go 1.23
 
 require github.com/corazawaf/coraza-coreruleset/v4 v4.25.0
 
