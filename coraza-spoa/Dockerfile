@@ -27,6 +27,16 @@ RUN git clone --depth 1 --branch "${CORAZA_SPOA_VERSION}" \
     && go mod download \
     && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/coraza-spoa .
 
+# Catalog extractor: walks the bundled CRS at build time and emits
+# rules-catalog.json so WHP's UI can render rule metadata without parsing
+# .conf files at runtime. Uses the SAME coraza-coreruleset version pin as
+# the coraza-spoa binary above (drift between the two would mislabel rules).
+FROM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS catalog
+WORKDIR /src
+COPY catalog-extractor/ .
+RUN go build -trimpath -o /out/catalog-extractor . \
+    && /out/catalog-extractor > /out/rules-catalog.json
+
 # Distroless runtime: no shell, no package manager, no /tmp by default —
 # smallest attack surface for an exposed service. Audit log directory is
 # bind-mounted; coraza-spoa writes to it via direct file I/O (no shell needed).
@@ -41,6 +51,7 @@ COPY config.yaml /etc/coraza-spoa/config.yaml
 COPY overrides.conf /etc/coraza/overrides.conf
 COPY local-overrides.conf /etc/coraza/local-overrides.conf
 COPY host-exceptions/ /etc/coraza/host-exceptions/
+COPY --from=catalog /out/rules-catalog.json /etc/coraza/rules-catalog.json
 
 # Audit log directory — bind-mount /var/log/coraza:/var/log/coraza from host
 # so logs persist across container restarts and AI Monitor can tail them.
