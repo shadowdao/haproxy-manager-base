@@ -85,8 +85,17 @@ frontend web
     # disruptive action fires (depends on SecRuleEngine mode + per-rule
     # ctl:ruleEngine overrides). Without these rules, Coraza would inspect
     # but never block.
-    http-request deny deny_status 403 hdr waf-block "request"  if { var(txn.coraza.action) -m str deny }
-    http-response deny deny_status 403 hdr waf-block "response" if { var(txn.coraza.action) -m str deny }
+    #
+    # On request-phase deny we return a rendered HTML page that surfaces the
+    # request reference (the unique-id) so a customer who's been blocked
+    # incorrectly can open a support ticket and quote it. lf-file expands
+    # log-format expressions inside the file at response time, so
+    # %[unique-id] / %[req.hdr(host)] / etc. get substituted live.
+    # Response-phase deny stays as a bare 403 — outbound blocks are rare in
+    # our config (Coraza response inspection is disabled by default) and
+    # an HTML body on a 403 generated mid-response could land mid-stream.
+    http-request return status 403 content-type "text/html; charset=utf-8" hdr waf-block "request" hdr x-request-reference "%[unique-id]" lf-file /haproxy/errors/403-waf.html if { var(txn.coraza.action) -m str deny }
+    http-response deny deny_status 403 hdr waf-block "response" hdr x-request-reference "%[unique-id]" if { var(txn.coraza.action) -m str deny }
     http-request silent-drop if { var(txn.coraza.action) -m str drop }
     http-response silent-drop if { var(txn.coraza.action) -m str drop }
     http-request redirect code 302 location %[var(txn.coraza.data)] if { var(txn.coraza.action) -m str redirect }

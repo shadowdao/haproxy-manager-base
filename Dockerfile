@@ -17,6 +17,11 @@ COPY haproxy_manager.py /haproxy/
 COPY scripts /haproxy/scripts
 COPY trusted_ips.list /etc/haproxy/trusted_ips.list
 COPY trusted_ips.map /etc/haproxy/trusted_ips.map
+# /etc/haproxy is a named volume in deployed containers, so baked-in files
+# under that path get shadowed by the volume on existing deployments.
+# Place errorfiles outside the volumed path; the HAProxy config references
+# them by absolute path.
+COPY errors /haproxy/errors
 RUN chmod +x /haproxy/scripts/*
 RUN pip install -r requirements.txt
 # Create log directories

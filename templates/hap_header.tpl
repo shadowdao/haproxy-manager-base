@@ -73,4 +73,15 @@ defaults
     timeout check           10s
     timeout tarpit          10s  # Tarpit delay for low-level scanners (before silent-drop)
     maxconn                 3000
+
+    # Per-request unique reference, used:
+    #   - in the log line (httplog includes %ID)
+    #   - echoed to clients in the X-Request-Reference response header on
+    #     WAF blocks so a customer can quote it when opening a support ticket
+    #   - embedded in /etc/haproxy/errors/403-waf.html so a blocked visitor
+    #     sees it on the rendered 403 page
+    # Support correlates ref → /var/log/haproxy.log line → timestamp+client+host
+    # → /var/log/coraza/audit.log entry → rule_id.
+    unique-id-format        %[uuid()]
+    unique-id-header        X-Request-Reference
     
