@@ -1,4 +1,12 @@
 <!DOCTYPE html>
+<!--
+  Served by HAProxy via `lf-file` on Coraza WAF deny.
+  IMPORTANT: HAProxy's lf-file expansion treats `%` as the start of a
+  log-format expression. Literal percent signs (CSS 100%, gradient stops,
+  url-encoded data, etc.) MUST be doubled as `%%` or HAProxy will silently
+  swallow them. Expressions like `%[unique-id]` / `%[req.hdr(host)]` stay
+  single-`%` — those are the substitutions we want.
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -7,11 +15,11 @@
 <title>Request blocked &middot; %[req.hdr(host)]</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; height: 100%; }
+  html, body { margin: 0; padding: 0; height: 100%%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     color: #1f2937;
-    background: linear-gradient(135deg, #f9fafb 0%, #eef2f7 100%);
+    background: linear-gradient(135deg, #f9fafb 0%%, #eef2f7 100%%);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -23,7 +31,7 @@
     border-radius: 12px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05), 0 12px 32px rgba(31,41,55,0.08);
     max-width: 560px;
-    width: 100%;
+    width: 100%%;
     padding: 36px 40px;
   }
   .badge {
