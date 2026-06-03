@@ -44,7 +44,8 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 LABEL org.opencontainers.image.title="coraza-spoa-whp" \
       org.opencontainers.image.description="Coraza WAF SPOA agent configured for WHP haproxy-manager integration" \
-      org.opencontainers.image.source="https://repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base"
+      org.opencontainers.image.source="https://github.com/shadowdao/haproxy-manager-base" \
+      org.opencontainers.image.licenses="MIT"
 
 COPY --from=build /out/coraza-spoa /coraza-spoa
 COPY config.yaml /etc/coraza-spoa/config.yaml

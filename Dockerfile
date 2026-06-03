@@ -9,6 +9,16 @@
 #     docker push repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
 # Future improvement: a scheduled Gitea Action that does the above automatically.
 FROM repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
+
+# image.source is what ghcr.io uses to link the package to a GitHub repo
+# sidebar; pointing at the public GitHub mirror enables that linking. The
+# canonical source-of-truth git remote is still Gitea, but Gitea's registry
+# doesn't consume this label, so there's no contention.
+LABEL org.opencontainers.image.title="haproxy-manager-base" \
+      org.opencontainers.image.description="HAProxy management API with Let's Encrypt automation, Coraza WAF integration, and template-driven config" \
+      org.opencontainers.image.source="https://github.com/shadowdao/haproxy-manager-base" \
+      org.opencontainers.image.licenses="MIT"
+
 RUN apt update -y && apt dist-upgrade -y && apt install socat haproxy cron certbot curl jq net-tools -y && apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
 COPY ./templates /haproxy/templates
