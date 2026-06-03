@@ -24,7 +24,18 @@ jobs:
           registry: repo.anhonesthost.net
           username: ${{ secrets.CI_USER }}
           password: ${{ secrets.CI_TOKEN }}
-      
+
+      # Second push target so the image is also available from GitHub Container
+      # Registry under the user's account. The PAT only needs write:packages
+      # (and read:packages if the package is private). Stored in Gitea as
+      # secrets.GHCR_TOKEN; username is the literal GitHub login.
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: shadowdao
+          password: ${{ secrets.GHCR_TOKEN }}
+
       - name: Build Image
         uses: docker/build-push-action@v6
         with:
@@ -32,3 +43,4 @@ jobs:
           push: true
           tags: |
             repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
+            ghcr.io/shadowdao/haproxy-manager-base:latest
