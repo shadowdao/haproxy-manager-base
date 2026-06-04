@@ -23,6 +23,32 @@ Do not skip the verify step. The container can come up "healthy" while still ser
 
 ---
 
+## Step 0a — Resolve the target host (never hardcoded)
+
+This skill deliberately does **not** bake in a server hostname — this repo is mirrored to a public remote, so a real FQDN in the skill would leak into commits. Instead, resolve the deploy target into a `DEPLOY_HOST` shell variable that every `ssh` command below uses.
+
+```bash
+HOST_FILE=".claude/skills/haproxy-manager-deploy/target-host.local"
+DEPLOY_HOST="$(cat "$HOST_FILE" 2>/dev/null)"
+```
+
+- **If `$DEPLOY_HOST` is non-empty**, use it — that's the user's saved target. The file is gitignored, so the real hostname never lands in a commit.
+- **If it's empty**, ask the user which server this deploy targets (e.g. production vs. staging) and what its hostname or SSH alias is. Then offer to save it so future deploys don't have to ask:
+
+  ```bash
+  echo 'the-host-they-gave.example' > "$HOST_FILE"   # gitignored — safe to store the real FQDN here
+  ```
+
+Confirm `$DEPLOY_HOST` is set before running any `ssh` step:
+
+```bash
+[ -n "$DEPLOY_HOST" ] || echo "DEPLOY_HOST not set — ask the user for the target server"
+```
+
+All commands below assume the variable is set in the same shell session (`ssh root@"$DEPLOY_HOST" ...`).
+
+---
+
 ## Step 0 — Confirm before pushing
 
 If the user just said "deploy" or "ship the haproxy fix", confirm what's actually changing: a template, the Python manager, the coraza-spoa subdir (separate image, separate workflow), or a static asset. Look at `git status` and `git diff` and read the diff back to the user if it's non-trivial.
@@ -72,7 +98,7 @@ Pushing immediately triggers the Gitea Actions build.
 The Go build inside coraza-spoa takes ~2-3 minutes; the haproxy-manager-base build is faster (~1-2 min). Don't bother polling the runs UI — just pull on the target server until the digest changes:
 
 ```bash
-ssh root@deploy-target.example 'until docker pull -q repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest 2>&1 | tail -1 | grep -qE "Image is up to date|Status: Downloaded"; do sleep 15; done'
+ssh root@"$DEPLOY_HOST" 'until docker pull -q repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest 2>&1 | tail -1 | grep -qE "Image is up to date|Status: Downloaded"; do sleep 15; done'
 ```
 
 `-q` suppresses the noisy layer progress so the grep can match cleanly. If you started this command before the CI build finished, it'll loop until the new image lands; once the digest matches, it exits.
@@ -80,7 +106,7 @@ ssh root@deploy-target.example 'until docker pull -q repo.anhonesthost.net/cloud
 To confirm you got the new image, check the image-creation time vs your push:
 
 ```bash
-ssh root@deploy-target.example 'docker images repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base --format "{{.CreatedSince}}"'
+ssh root@"$DEPLOY_HOST" 'docker images repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base --format "{{.CreatedSince}}"'
 ```
 
 It should say "X minutes ago" matching the build wait, not "yesterday".
@@ -93,10 +119,10 @@ The image is `gcr.io/distroless/static-debian12:nonroot`-based, no shell. To pee
 
 ```bash
 # haproxy-manager-base (has sh):
-ssh root@deploy-target.example 'docker run --rm --entrypoint sh repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest -c "ls /haproxy/errors/ && head -5 /haproxy/errors/403-waf.html"'
+ssh root@"$DEPLOY_HOST" 'docker run --rm --entrypoint sh repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest -c "ls /haproxy/errors/ && head -5 /haproxy/errors/403-waf.html"'
 
 # coraza-spoa (distroless, no sh) — use docker create + docker cp instead:
-ssh root@deploy-target.example 'docker create --name _peek repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa:latest && docker cp _peek:/etc/coraza/config.yaml - | tar xO; docker rm _peek'
+ssh root@"$DEPLOY_HOST" 'docker create --name _peek repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa:latest && docker cp _peek:/etc/coraza/config.yaml - | tar xO; docker rm _peek'
 ```
 
 This step exists because the CI build can succeed but ship the wrong file (wrong commit pulled, build cache issue, etc.). Catching it here is one step earlier than catching it from a customer report.
@@ -106,12 +132,12 @@ This step exists because the CI build can succeed but ship the wrong file (wrong
 ## Step 6 — Recreate the container
 
 ```bash
-ssh root@deploy-target.example '/root/whp/scripts/container-manager.sh recreate haproxy-manager'
+ssh root@"$DEPLOY_HOST" '/root/whp/scripts/container-manager.sh recreate haproxy-manager'
 ```
 
 For coraza-spoa changes:
 ```bash
-ssh root@deploy-target.example '/root/whp/scripts/container-manager.sh recreate coraza-spoa'
+ssh root@"$DEPLOY_HOST" '/root/whp/scripts/container-manager.sh recreate coraza-spoa'
 ```
 
 `container-manager.sh recreate` does: stop, remove, docker pull (idempotent if already pulled), start with the right flags from settings.json. **It reads `/docker/whp/settings.json` for things like `coraza_waf.mode`**, so if the user has toggled mode while you were building, the recreated container reflects the current setting — not whatever it was when you started.
@@ -123,7 +149,7 @@ ssh root@deploy-target.example '/root/whp/scripts/container-manager.sh recreate 
 For haproxy-manager:
 
 ```bash
-ssh root@deploy-target.example '
+ssh root@"$DEPLOY_HOST" '
 echo "=== container ==="
 docker ps --filter name=haproxy-manager --format "image: {{.Image}} status: {{.Status}}"
 echo "=== healthy ==="
@@ -154,17 +180,19 @@ If your change affects what a visitor sees (block pages, redirects, security res
 ```bash
 # Inject a temporary ACL that forces the WAF deny path on a custom header,
 # fire one request, observe the rendered response, then revert + reload.
-ssh root@deploy-target.example '
+ssh root@"$DEPLOY_HOST" '
 docker exec haproxy-manager cp /etc/haproxy/haproxy.cfg /tmp/cfg-bak
 docker exec haproxy-manager sh -c "sed -i \"/http-request send-spoe-group coraza coraza-req/a\\\\    http-request set-var(txn.coraza.action) str(deny) if { req.hdr(x-force-waf-block) -m str yes }\" /etc/haproxy/haproxy.cfg"
 docker exec haproxy-manager sh -c "echo reload | socat stdio /tmp/haproxy-cli" >/dev/null
 sleep 1
-curl -sSk -D - -H "x-force-waf-block: yes" -H "Host: example.com" "https://localhost/" | head -40
+curl -sSk -D - -H "x-force-waf-block: yes" -H "Host: <live-vhost>" "https://localhost/" | head -40
 # revert
 docker exec haproxy-manager cp /tmp/cfg-bak /etc/haproxy/haproxy.cfg
 docker exec haproxy-manager sh -c "echo reload | socat stdio /tmp/haproxy-cli" >/dev/null
 '
 ```
+
+**Pick a real `<live-vhost>`.** The `Host:` header must match a domain currently served by this haproxy-manager, or the request won't route to the WAF path. Don't hardcode a customer hostname in this skill — pull a live one at test time (any entry from the panel's domain list, or `docker exec haproxy-manager ls /etc/letsencrypt/live`) and substitute it.
 
 **The injection point matters.** Insert AFTER `http-request send-spoe-group coraza coraza-req`, because the SPOE call overwrites `txn.coraza.action` based on the real Coraza verdict — if you inject before it, your override is wiped.
 

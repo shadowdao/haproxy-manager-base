@@ -37,3 +37,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local-only deploy config (never commit real hostnames)
+.claude/skills/haproxy-manager-deploy/target-host.local
+*.local

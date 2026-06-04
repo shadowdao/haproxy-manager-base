@@ -1,1 +1,9 @@
+# Source-IP whitelist — exempt from HAProxy rate limits (one IP or CIDR per line).
+# Referenced by templates/hap_listener.tpl:
+#   acl is_trusted_ip src -f /etc/haproxy/trusted_ips.list
+#
+# Add trusted source IPs below. Do NOT commit real/personal IPs to this repo —
+# it is mirrored publicly. Keep real entries in an untracked local copy, or add
+# them directly on the server (the file lives in the /etc/haproxy named volume
+# and persists across container recreates).
 127.0.0.1

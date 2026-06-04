@@ -1,1 +1,9 @@
+# Real-IP whitelist for proxy-header matching — exempt from HAProxy rate limits.
+# Format: "<IP> 1" (one per line). Referenced by templates/hap_listener.tpl:
+#   acl is_whitelisted var(txn.real_ip),map_ip(/etc/haproxy/trusted_ips.map,0) -m int gt 0
+#
+# Add trusted real IPs below. Do NOT commit real/personal IPs to this repo —
+# it is mirrored publicly. Keep real entries in an untracked local copy, or add
+# them directly on the server (the file lives in the /etc/haproxy named volume
+# and persists across container recreates).
 127.0.0.1 1

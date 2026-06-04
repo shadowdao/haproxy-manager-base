@@ -32,7 +32,7 @@ docker run -d \
     --network client-net \
     --restart unless-stopped \
     -v /var/log/coraza:/var/log/coraza \
-    repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa:latest
+    your-registry.example.com/cloud-hosting-platform/coraza-spoa:latest
 ```
 
 Then on the `haproxy-manager` container, add the env var:

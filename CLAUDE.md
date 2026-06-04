@@ -94,7 +94,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `trusted_ips.list` — Source IP whitelist for rate limit bypass (one CIDR/IP per line)
 - `trusted_ips.map` — Real IP whitelist for proxy-header matching (format: `<IP> 1`)
 - Both files are baked into the Docker image via `COPY` in the Dockerfile
-- Currently contains phone system IP `127.0.0.1`
+- Ship as comment-only templates (no real IPs). Add trusted IPs locally and do **not** commit them — this repo is mirrored publicly. Entries persist in the `/etc/haproxy` named volume across recreates
 
 ### Timeout Hardening (hap_header.tpl)
 

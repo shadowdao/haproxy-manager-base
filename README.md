@@ -6,10 +6,10 @@ A Flask-based API service for managing HAProxy configurations with dynamic SSL c
 To run the container:
 ```bash
 # Without API key authentication (default)
-docker run -d -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy --name haproxy-manager repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
+docker run -d -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy --name haproxy-manager your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
 
 # With API key authentication (recommended for production)
-docker run -d -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy -e HAPROXY_API_KEY=your-secure-api-key-here --name haproxy-manager repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
+docker run -d -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy -e HAPROXY_API_KEY=your-secure-api-key-here --name haproxy-manager your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
 ```
 
 ## Features
@@ -402,7 +402,7 @@ docker run -d \
   -e HAPROXY_DEFAULT_MAIN_MESSAGE="This website is currently under construction and will be available soon." \
   -e HAPROXY_DEFAULT_SECONDARY_MESSAGE="Please check back later or contact us for more information." \
   --name haproxy-manager \
-  repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
+  your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
 ```
 
 ## Example Usage
@@ -416,7 +416,7 @@ docker run -d \
   -v haproxy:/etc/haproxy \
   -e HAPROXY_API_KEY=your-secure-api-key-here \
   --name haproxy-manager \
-  repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
+  your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
 
 # Add a domain
 curl -X POST http://localhost:8000/api/domain \
