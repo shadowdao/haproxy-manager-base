@@ -6,11 +6,25 @@
 SOCKET="/tmp/haproxy-cli"
 MAP_FILE="/etc/haproxy/blocked_ips.map"
 
+# HAProxy runs in master-worker mode here, and /tmp/haproxy-cli is the MASTER
+# socket. Data-plane commands (map/table manipulation) are NOT accepted on the
+# master socket — they must be routed to a worker with the "@<n>" prefix. "@1"
+# targets the current active worker. (A bare "add map ..." on the master socket
+# fails with "Unknown command: 'add'".)
+cli() { printf '@1 %s\n' "$*" | socat stdio "$SOCKET"; }
+
+# Map lookup in haproxy.cfg is `map_ip(...,0) -m int gt 0`, so each entry MUST be
+# "<ip_or_cidr> 1" — a bare IP yields an empty value (0) and is NOT blocked once
+# the map file is re-read on reload. The runtime map and the file must agree.
+MAP_VALUE=1
+
 # Ensure map file exists
 if [ ! -f "$MAP_FILE" ]; then
-    touch "$MAP_FILE"
-    echo "# Blocked IPs - Format: IP_ADDRESS" > "$MAP_FILE"
+    echo "# Blocked IPs - Format: <ip_or_cidr> 1 (one per line)" > "$MAP_FILE"
 fi
+
+# Escape regex metacharacters (notably dots) in an IP/CIDR for anchored matching.
+esc_re() { printf '%s' "$1" | sed 's/[.[\*^$/]/\\&/g'; }
 
 case "$1" in
     block)
@@ -18,10 +32,14 @@ case "$1" in
             echo "Usage: $0 block IP_ADDRESS"
             exit 1
         fi
-        # Add IP to map file
-        grep -q "^$2" "$MAP_FILE" || echo "$2" >> "$MAP_FILE"
-        # Add to runtime map
-        echo "add map /etc/haproxy/blocked_ips.map $2 1" | socat stdio "$SOCKET"
+        re="$(esc_re "$2")"
+        # Persist (idempotent, anchored so 1.2.3.4 doesn't match 1.2.3.45),
+        # always with the trailing value so the block survives a reload.
+        if ! grep -qE "^${re}([[:space:]]|$)" "$MAP_FILE"; then
+            echo "$2 $MAP_VALUE" >> "$MAP_FILE"
+        fi
+        # Apply at runtime immediately (no reload).
+        cli "add map $MAP_FILE $2 $MAP_VALUE"
         echo "Blocked IP: $2"
         ;;
 
@@ -30,31 +48,33 @@ case "$1" in
             echo "Usage: $0 unblock IP_ADDRESS"
             exit 1
         fi
-        # Remove from map file
-        sed -i "/^$2$/d" "$MAP_FILE"
-        # Remove from runtime map
-        echo "del map /etc/haproxy/blocked_ips.map $2" | socat stdio "$SOCKET"
+        re="$(esc_re "$2")"
+        # Remove from map file (match "<ip>" optionally followed by a value).
+        sed -i -E "/^${re}([[:space:]]|$)/d" "$MAP_FILE"
+        # Remove from runtime map.
+        cli "del map $MAP_FILE $2"
         echo "Unblocked IP: $2"
         ;;
 
     list)
         echo "Currently blocked IPs:"
-        echo "show map /etc/haproxy/blocked_ips.map" | socat stdio "$SOCKET" | awk '{print $1}'
+        # `show map` output is "<ptr> <key> <value>" — the IP is field 2.
+        cli "show map $MAP_FILE" | awk 'NF>=2 {print $2}'
         ;;
 
     clear)
         echo "Clearing all blocked IPs..."
-        echo "clear map /etc/haproxy/blocked_ips.map" | socat stdio "$SOCKET"
-        echo "# Blocked IPs - Format: IP_ADDRESS" > "$MAP_FILE"
+        cli "clear map $MAP_FILE"
+        echo "# Blocked IPs - Format: <ip_or_cidr> 1 (one per line)" > "$MAP_FILE"
         echo "All IPs unblocked"
         ;;
 
     stats)
         echo "=== HAProxy 3.0.11 Threat Intelligence Dashboard ==="
-        echo "show table web" | socat stdio "$SOCKET" | awk 'NR<=21'
+        cli "show table web" | awk 'NR<=21'
         echo ""
         echo "=== Top Threat Scores ==="
-        echo "show table web" | socat stdio "$SOCKET" | awk '
+        cli "show table web" | awk '
         NR>1 {
             ip = $1
             auth_fail = 0
@@ -84,7 +104,7 @@ case "$1" in
             exit 1
         fi
         # Add to manual blacklist using GPC(13)
-        echo "set table web key $2 data.gpc(13) 1" | socat stdio "$SOCKET"
+        cli "set table web key $2 data.gpc(13) 1"
         echo "Manually blacklisted IP: $2 (GPC(13) = 1)"
         ;;
 
@@ -94,7 +114,7 @@ case "$1" in
             exit 1
         fi
         # Clear manual blacklist flag
-        echo "set table web key $2 data.gpc(13) 0" | socat stdio "$SOCKET"
+        cli "set table web key $2 data.gpc(13) 0"
         echo "Removed manual blacklist for IP: $2"
         ;;
 
@@ -104,7 +124,7 @@ case "$1" in
             exit 1
         fi
         # Add to auto-blacklist using GPC(14)
-        echo "set table web key $2 data.gpc(14) 1" | socat stdio "$SOCKET"
+        cli "set table web key $2 data.gpc(14) 1"
         echo "Auto-blacklisted IP: $2 (GPC(14) = 1)"
         ;;
 
@@ -115,14 +135,14 @@ case "$1" in
         fi
         # Show detailed threat breakdown for specific IP
         echo "Threat analysis for $2:"
-        echo "show table web key $2" | socat stdio "$SOCKET"
+        cli "show table web key $2"
         ;;
 
     *)
         echo "Usage: $0 {block|unblock|list|clear|blacklist|unblacklist|auto-blacklist|threat-score|stats} [IP_ADDRESS]"
         echo ""
         echo "HAProxy 3.0.11 Enhanced Security Commands:"
-        echo "  block IP         - Block IP via map file (immediate)"
+        echo "  block IP         - Block IP via map file (immediate + persisted)"
         echo "  unblock IP       - Unblock IP from map file"
         echo "  blacklist IP     - Manual blacklist via GPC(13) array"
         echo "  unblacklist IP   - Remove manual blacklist flag"
