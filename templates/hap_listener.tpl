@@ -4,6 +4,21 @@ frontend web
     # crt can now be a path, so it will load all .pem files in the path
     bind 0.0.0.0:443 ssl crt {{ crt_path }} alpn h2,http/1.1
 
+    # HTTP/3 over QUIC (UDP/443). Same cert path as the TCP listener above.
+    # The Debian haproxy package is built +QUIC (QUIC_OPENSSL_COMPAT), so this
+    # is config-only — no source build. Requires UDP/443 published on the
+    # container (`-p 443:443/udp`) and open at the host firewall. `h3` is the
+    # only ALPN QUIC negotiates; h2/http1 stay on the TCP bind above. Sharing
+    # the frontend means all the real-IP, rate-limit, IP-block and Coraza
+    # rules below apply identically to H3 traffic.
+    bind quic4@0.0.0.0:443 ssl crt {{ crt_path }} alpn h3
+
+    # Advertise H3 so browsers upgrade their existing TCP (h2) connection to
+    # QUIC on the next request. `ma` is how long (seconds) the client may
+    # cache the advertisement. http-after-response applies it to every
+    # response, including haproxy-generated ones (blocks, default page).
+    http-after-response set-header alt-svc "h3=\":443\"; ma=86400"
+
     # Capture Host header so it appears in httplog output (in %hr field)
     http-request capture req.hdr(Host) len 64
 

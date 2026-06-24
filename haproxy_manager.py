@@ -75,6 +75,10 @@ BLOCKED_IPS_MAP_PATH = '/etc/haproxy/blocked_ips.map'
 BLOCKED_IPS_MAP_BACKUP_PATH = '/etc/haproxy/blocked_ips.map.backup'
 HAPROXY_SOCKET_PATH = '/var/run/haproxy.sock'
 SSL_CERTS_DIR = '/etc/haproxy/certs'
+# Stable per-host secret for QUIC Retry/address-validation tokens. Lives in the
+# /etc/haproxy named volume so it survives container recreates; self-healed on
+# first config render. See get_or_create_cluster_secret().
+CLUSTER_SECRET_PATH = '/etc/haproxy/cluster-secret'
 API_KEY = os.environ.get('HAPROXY_API_KEY')  # Optional API key for authentication
 
 # Setup logging
@@ -1687,6 +1691,45 @@ def dns_challenge_verify():
         log_operation('dns_challenge_verify', False, str(e))
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def get_or_create_cluster_secret():
+    """Return a stable secret for QUIC token derivation, generating it once.
+
+    HAProxy uses `cluster-secret` to key QUIC Retry/address-validation tokens.
+    Without a stable value it picks a random one each (re)start and logs a
+    notice; tokens then don't survive reloads. We persist one in the
+    /etc/haproxy named volume so it's stable across container recreates.
+    Exclusive-create avoids a race if two renders run concurrently. Failure to
+    read/write is non-fatal: we fall back to an empty string and the template
+    simply omits the directive (HAProxy reverts to its random-per-process
+    behaviour), so QUIC still works.
+    """
+    try:
+        if os.path.exists(CLUSTER_SECRET_PATH):
+            with open(CLUSTER_SECRET_PATH, 'r') as f:
+                secret = f.read().strip()
+                if secret:
+                    return secret
+        # Generate and persist exclusively (0600). hex => config-safe charset.
+        secret = os.urandom(32).hex()
+        fd = os.open(CLUSTER_SECRET_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, secret.encode())
+        finally:
+            os.close(fd)
+        logger.info("Generated new QUIC cluster-secret at %s", CLUSTER_SECRET_PATH)
+        return secret
+    except FileExistsError:
+        # Lost the create race — another render just wrote it; read it back.
+        try:
+            with open(CLUSTER_SECRET_PATH, 'r') as f:
+                return f.read().strip()
+        except Exception as e:
+            logger.error("Failed to read cluster-secret after race: %s", e)
+            return ''
+    except Exception as e:
+        logger.error("Failed to get/create cluster-secret: %s", e)
+        return ''
+
 def generate_config():
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -1749,7 +1792,9 @@ def generate_config():
                     logger.error(f"Failed to create {suspended_list_path}: {e}")
 
         # Add Haproxy Default Headers
-        default_headers = template_env.get_template('hap_header.tpl').render()
+        default_headers = template_env.get_template('hap_header.tpl').render(
+            cluster_secret = get_or_create_cluster_secret(),
+        )
         config_parts.append(default_headers)
 
         # Update blocked IPs map file first

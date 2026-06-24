@@ -6,10 +6,10 @@ A Flask-based API service for managing HAProxy configurations with dynamic SSL c
 To run the container:
 ```bash
 # Without API key authentication (default)
-docker run -d -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy --name haproxy-manager your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
+docker run -d -p 80:80 -p 443:443 -p 443:443/udp -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy --name haproxy-manager your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
 
 # With API key authentication (recommended for production)
-docker run -d -p 80:80 -p 443:443 -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy -e HAPROXY_API_KEY=your-secure-api-key-here --name haproxy-manager your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
+docker run -d -p 80:80 -p 443:443 -p 443:443/udp -p 8000:8000 -v lets-encrypt:/etc/letsencrypt -v haproxy:/etc/haproxy -e HAPROXY_API_KEY=your-secure-api-key-here --name haproxy-manager your-registry.example.com/cloud-hosting-platform/haproxy-manager-base:latest
 ```
 
 ## Features
@@ -394,7 +394,7 @@ You can customize the default page by setting environment variables:
 
 ```bash
 docker run -d \
-  -p 80:80 -p 443:443 -p 8000:8000 \
+  -p 80:80 -p 443:443 -p 443:443/udp -p 8000:8000 \
   -v lets-encrypt:/etc/letsencrypt \
   -v haproxy:/etc/haproxy \
   -e HAPROXY_API_KEY=your-secure-api-key-here \
@@ -411,7 +411,7 @@ docker run -d \
 ```bash
 # Start container with API key
 docker run -d \
-  -p 80:80 -p 443:443 -p 8000:8000 \
+  -p 80:80 -p 443:443 -p 443:443/udp -p 8000:8000 \
   -v lets-encrypt:/etc/letsencrypt \
   -v haproxy:/etc/haproxy \
   -e HAPROXY_API_KEY=your-secure-api-key-here \

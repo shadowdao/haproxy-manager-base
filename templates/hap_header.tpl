@@ -27,6 +27,23 @@ global
     # SSL and Performance
     tune.ssl.default-dh-param 2048
 
+    # HTTP/3 over QUIC. The Debian haproxy package is built against system
+    # OpenSSL via the compatibility shim (USE_QUIC_OPENSSL_COMPAT), which is
+    # not a native QUIC TLS stack. HAProxy therefore rejects `quic*@` binds
+    # unless this opt-in is set. `limited-quic` enables QUIC through the compat
+    # layer (no 0-RTT — that needs quictls/aws-lc or native OpenSSL 3.5 QUIC).
+    # Without this, the quic bind in the frontend fails to start: "this SSL
+    # library does not support the QUIC protocol".
+    limited-quic
+{%- if cluster_secret %}
+
+    # Stable secret keying QUIC Retry/address-validation tokens. Self-healed
+    # to /etc/haproxy/cluster-secret (named volume) by the manager so it
+    # survives recreates; without it haproxy picks a random one per process
+    # and tokens don't survive reloads (benign, just a startup notice).
+    cluster-secret "{{ cluster_secret }}"
+{%- endif %}
+
     # HTTP/2 protection against Rapid Reset (CVE-2023-44487) and stream abuse
     tune.h2.fe.max-total-streams 2000
     tune.h2.fe.glitches-threshold 50

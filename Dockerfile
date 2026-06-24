@@ -14,9 +14,13 @@ FROM repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
 # sidebar; pointing at the public GitHub mirror enables that linking. The
 # canonical source-of-truth git remote is still Gitea, but Gitea's registry
 # doesn't consume this label, so there's no contention.
+# Stamped from the VERSION file by CI (build-arg) so `docker inspect` reports
+# what's running on any host. Defaults to "dev" for local/manual builds.
+ARG VERSION=dev
 LABEL org.opencontainers.image.title="haproxy-manager-base" \
       org.opencontainers.image.description="HAProxy management API with Let's Encrypt automation, Coraza WAF integration, and template-driven config" \
       org.opencontainers.image.source="https://github.com/shadowdao/haproxy-manager-base" \
+      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
 RUN apt update -y && apt dist-upgrade -y && apt install socat haproxy cron certbot curl jq net-tools -y && apt clean && rm -rf /var/lib/apt/lists/*
@@ -43,7 +47,9 @@ RUN mkdir -p /var/spool/cron/crontabs && \
     echo '0 */12 * * * /haproxy/scripts/renew-certificates.sh >> /var/log/haproxy-manager.log 2>&1' >> /var/spool/cron/crontabs/root && \
     chmod 600 /var/spool/cron/crontabs/root && \
     chown root:crontab /var/spool/cron/crontabs/root
-EXPOSE 80 443 8000
+# 443/udp carries HTTP/3 (QUIC). EXPOSE is documentation only — the container
+# must still be run with `-p 443:443/udp` for the UDP listener to be reachable.
+EXPOSE 80 443 443/udp 8000
 # Add health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -sf --max-time 5 http://localhost:8000/health && curl -s --max-time 5 -o /dev/null http://localhost/ || exit 1

@@ -36,11 +36,26 @@ jobs:
           username: shadowdao
           password: ${{ secrets.GHCR_TOKEN }}
 
+      # Read the human-readable release version from the VERSION file so every
+      # build is pinnable for rollback (alongside the immutable git SHA). Bump
+      # VERSION (YYYY.MM.N) in the same commit as a release-worthy change.
+      - name: Read version
+        id: ver
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Build Image
         uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64
           push: true
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          # Three tags per registry: :latest (moving), :<version> (human-readable
+          # release), :<sha> (immutable, guaranteed-unique rollback target).
           tags: |
             repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
+            repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:${{ steps.ver.outputs.version }}
+            repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:${{ gitea.sha }}
             ghcr.io/shadowdao/haproxy-manager-base:latest
+            ghcr.io/shadowdao/haproxy-manager-base:${{ steps.ver.outputs.version }}
+            ghcr.io/shadowdao/haproxy-manager-base:${{ gitea.sha }}
