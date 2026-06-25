@@ -78,6 +78,24 @@ frontend web
     http-request track-sc1 var(txn.real_ip) table wp_bruteforce if METH_POST wp_login_path
     http-request tarpit deny_status 429 if METH_POST wp_login_path { sc_http_req_rate(1) gt 30 } !is_local !is_trusted_ip !is_whitelisted
 
+    # --- WordPress wp-login.php "must-load-the-form-first" cookie challenge ---
+    # Defeats DISTRIBUTED credential-stuffing (hundreds of thousands of unique
+    # IPs, each low-and-slow, so the per-IP rule above can't see them). Such
+    # bots POST straight to /wp-login.php without ever GETting the form — on
+    # these sites the login POST:GET ratio is ~15:1. We hand out a cookie when
+    # the form is actually fetched (GET) and require it on POST; direct-POST
+    # bots lack it and are denied AT THE EDGE before reaching PHP. Real logins
+    # are unaffected — WordPress login already requires loading the page and
+    # accepting cookies. Immediate deny (NOT tarpit) — under a 300k-POST flood,
+    # holding tarpit connections would exhaust HAProxy. Honors the whitelist.
+    # Mark login-form GETs at REQUEST time (method/path are reliably evaluable
+    # here; in the response phase they are not) so the cookie is emitted on the
+    # form's own response.
+    http-request set-var(txn.wp_login_form) int(1) if METH_GET wp_login_path
+    http-after-response add-header set-cookie "whplc=1; Path=/; Max-Age=1800; HttpOnly; Secure; SameSite=Lax" if { var(txn.wp_login_form) -m found }
+    acl has_login_cookie req.cook(whplc) -m found
+    http-request deny deny_status 403 if METH_POST wp_login_path !has_login_cookie !is_local !is_trusted_ip !is_whitelisted
+
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
     # Runtime updates: echo "add map #0 IP_ADDRESS 1" | socat stdio /var/run/haproxy.sock
