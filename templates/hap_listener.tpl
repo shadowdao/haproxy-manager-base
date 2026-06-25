@@ -64,6 +64,20 @@ frontend web
     # High error rate: >100 errors in 30s (scanner/fuzzer behavior)
     http-request tarpit deny_status 403 if { sc_http_err_rate(0) gt 100 } !is_local !is_trusted_ip !is_whitelisted !is_health_check
 
+    # --- WordPress wp-login.php brute-force protection ---
+    # The generic limits above are deliberately high (media-heavy sites), so a
+    # slow credential-stuffing run (dozens of login POSTs/min) slips under them.
+    # Track POSTs to wp-login.php per real client IP in a DEDICATED 60s table
+    # (sc1 / backend wp_bruteforce, defined in hap_security_tables.tpl) and
+    # tarpit once an IP exceeds 30/min. Only login POSTs are counted — GETs of
+    # the login form, normal browsing, and the handful of POSTs a legit user
+    # makes are unaffected; an offending IP can still browse, just not keep
+    # hammering login. path_end also covers subdirectory WP installs. Honors the
+    # same whitelist (RFC1918 / trusted_ips.list / trusted_ips.map).
+    acl wp_login_path path_end /wp-login.php
+    http-request track-sc1 var(txn.real_ip) table wp_bruteforce if METH_POST wp_login_path
+    http-request tarpit deny_status 429 if METH_POST wp_login_path { sc_http_req_rate(1) gt 30 } !is_local !is_trusted_ip !is_whitelisted
+
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
     # Runtime updates: echo "add map #0 IP_ADDRESS 1" | socat stdio /var/run/haproxy.sock
