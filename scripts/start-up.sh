@@ -27,6 +27,22 @@ cron &
 # Phase 1: container init
 python /haproxy/scripts/init.py
 
+# Phase 1.5: in-container haproxy supervisor.
+# haproxy runs as a background child of PID 1 (gunicorn) with NOTHING watching
+# it after init. If the haproxy master dies mid-life (e.g. SIGABRT -> exit 134,
+# segfault), the container stays "up" (gunicorn is PID 1), Docker's --restart
+# policy never fires, and haproxy is down until the external host watchdog
+# full-restarts the whole container minutes later (dropping every connection).
+# This loop revives haproxy in place within one interval. ensure_haproxy.py is
+# idempotent — a cheap no-op whenever haproxy is already running.
+HAPROXY_SUPERVISOR_INTERVAL="${HAPROXY_SUPERVISOR_INTERVAL:-15}"
+(
+    while true; do
+        sleep "${HAPROXY_SUPERVISOR_INTERVAL}"
+        python /haproxy/scripts/ensure_haproxy.py 2>&1 || true
+    done
+) &
+
 # Phase 2: WSGI servers
 # Tunable via env: HAPROXY_MGR_API_WORKERS (default 1), HAPROXY_MGR_API_TIMEOUT
 # (default 120 — API can do slow ACME calls), HAPROXY_MGR_MAX_REQUESTS (default
