@@ -1855,7 +1855,11 @@ def generate_config():
         # First pass: exact domain ACLs (higher priority - evaluated first)
         for domain in exact_domains:
             if not domain['backend_name']:
-                logger.warning(f"Skipping domain {domain['domain']} - no backend name")
+                # Expected for domains registered without a proxy backend (e.g. the
+                # panel's own hostname, present only for certificate management).
+                # Log at INFO — not WARNING — so it doesn't trip log monitors as an
+                # error; it recurs on every generate_config by design.
+                logger.info(f"Skipping domain {domain['domain']} - no proxy backend (cert/management-only)")
                 continue
 
             try:
@@ -1874,7 +1878,8 @@ def generate_config():
         # Second pass: wildcard domain ACLs (lower priority - evaluated after exact matches)
         for domain in wildcard_domains:
             if not domain['backend_name']:
-                logger.warning(f"Skipping wildcard domain {domain['domain']} - no backend name")
+                # See note above — INFO, not WARNING; expected for cert/management-only domains.
+                logger.info(f"Skipping wildcard domain {domain['domain']} - no proxy backend (cert/management-only)")
                 continue
 
             try:
