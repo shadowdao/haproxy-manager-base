@@ -18,6 +18,38 @@ import time
 import re
 import fcntl
 
+# ---------------------------------------------------------------------------
+# Bounded subprocess execution (incident 2026-07-07)
+# ---------------------------------------------------------------------------
+# Every external command this manager runs — certbot ACME issuance/renewal,
+# `socat` reloads over the haproxy admin socket, `haproxy -c` validation — is a
+# potential hang. The management API runs under gunicorn gthread workers, and a
+# subprocess.run() with NO timeout blocks its worker thread forever if the
+# command stalls (e.g. an ACME/upstream that stops responding mid-read).
+# gunicorn's --timeout does not rescue this: for gthread it only kills a worker
+# whose *main* thread stops heart-beating, but the main thread keeps polling
+# while pool threads are wedged. Enough stalled calls exhaust the 4-thread pool
+# and the whole API stops responding — "healthy" health-check, every request
+# 30s-timeouts — which is exactly what stalled WHP site updates on 2026-07-07.
+#
+# Fix: give EVERY subprocess.run() a default timeout unless the caller passes
+# one explicitly. On expiry Python kills the child and raises
+# subprocess.TimeoutExpired (a subclass of Exception); the existing per-endpoint
+# try/except turns that into a clean error AND releases the worker thread.
+# Bounding by default (instead of editing ~30 call sites) means no site can be
+# missed and any future call is protected automatically.
+DEFAULT_SUBPROCESS_TIMEOUT = int(os.environ.get('HAPROXY_MGR_SUBPROCESS_TIMEOUT', '180'))
+_unbounded_subprocess_run = subprocess.run
+
+
+def _bounded_subprocess_run(*args, **kwargs):
+    if kwargs.get('timeout') is None:
+        kwargs['timeout'] = DEFAULT_SUBPROCESS_TIMEOUT
+    return _unbounded_subprocess_run(*args, **kwargs)
+
+
+subprocess.run = _bounded_subprocess_run
+
 app = Flask(__name__)
 
 # Default page server (port 8080) — served to HAProxy clients whose request hit
@@ -811,10 +843,12 @@ def renew_certificates():
         # Defensive: clear any stale lock left by a SIGKILLed prior run.
         clear_stale_certbot_locks()
 
-        # Run certbot renew
+        # Run certbot renew. Explicit long timeout (overrides the module
+        # default): `renew` walks every lineage and can legitimately make many
+        # ACME round-trips when several certs are actually due.
         result = subprocess.run([
             'certbot', 'renew', '--quiet'
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, timeout=900)
         
         if result.returncode == 0:
             # Check if any certificates were renewed

@@ -47,7 +47,13 @@ HAPROXY_SUPERVISOR_INTERVAL="${HAPROXY_SUPERVISOR_INTERVAL:-15}"
 # Tunable via env: HAPROXY_MGR_API_WORKERS (default 1), HAPROXY_MGR_API_TIMEOUT
 # (default 120 — API can do slow ACME calls), HAPROXY_MGR_MAX_REQUESTS (default
 # 1000 — worker recycle frequency).
-API_WORKERS="${HAPROXY_MGR_API_WORKERS:-1}"
+#
+# API_WORKERS default is 2 (was 1). A single worker is a single point of
+# failure: if its gthread pool ever wedges (see the 2026-07-07 subprocess-hang
+# incident — now bounded by DEFAULT_SUBPROCESS_TIMEOUT in haproxy_manager.py),
+# the entire management API goes dark. A second worker keeps the API answering
+# (config regenerate, health, SSL) while the other recycles via --max-requests.
+API_WORKERS="${HAPROXY_MGR_API_WORKERS:-2}"
 API_TIMEOUT="${HAPROXY_MGR_API_TIMEOUT:-120}"
 MAX_REQ="${HAPROXY_MGR_MAX_REQUESTS:-1000}"
 MAX_REQ_JITTER="${HAPROXY_MGR_MAX_REQUESTS_JITTER:-100}"
