@@ -96,6 +96,35 @@ frontend web
     acl has_login_cookie req.cook(whplc) -m found
     http-request deny deny_status 403 if METH_POST wp_login_path !has_login_cookie !is_local !is_trusted_ip !is_whitelisted
 
+    # WordPress REST batch endpoint lockdown ("wp2shell": CVE-2026-63030 +
+    # CVE-2026-60137). Chaining a core SQL injection with REST batch-route
+    # confusion gives unauthenticated RCE on WP 6.9.0-6.9.4 and 7.0.0-7.0.1
+    # (fixed in 6.9.5 / 7.0.2). Exploits are public and were used against this
+    # fleet on 2026-07-19/20; one site was compromised via this path before
+    # patching. This is a virtual patch: it does not repair the vulnerable
+    # application logic, it only removes reachability, so it stays until every
+    # site is confirmed on a fixed release.
+    #
+    # Both routing forms must be covered -- a rule matching only the pretty
+    # permalink path leaves the ?rest_route= fallback wide open, and urlp()
+    # does not URL-decode, hence the third ACL for the %2F spelling.
+    #
+    # Anonymous-only. batch/v1 is used legitimately by the block editor for
+    # multi-entity saves, so a blanket deny would break wp-admin for real
+    # users; requiring a wordpress_logged_in_* cookie costs them nothing.
+    # req.cook() needs an exact name and WordPress suffixes a per-site hash,
+    # so this substring-matches the raw Cookie header instead.
+    #
+    # Immediate deny, not tarpit -- holding connections open helps an attacker
+    # who is already scripting this. Honors the same whitelist as above.
+    acl wp_batch_path path_beg /wp-json/batch/v1
+    acl wp_batch_route urlp(rest_route) -i -m beg /batch/v1
+    acl wp_batch_route_enc query -i -m sub rest_route=%2Fbatch%2Fv1
+    acl has_wp_logged_in req.hdr(Cookie) -i -m sub wordpress_logged_in_
+    http-request deny deny_status 403 if wp_batch_path !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
+    http-request deny deny_status 403 if wp_batch_route !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
+    http-request deny deny_status 403 if wp_batch_route_enc !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
+
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
     # Runtime updates: echo "add map #0 IP_ADDRESS 1" | socat stdio /var/run/haproxy.sock
