@@ -113,6 +113,12 @@ BLOCKED_IPS_MAP_BACKUP_PATH = '/etc/haproxy/blocked_ips.map.backup'
 CORAZA_SPOE_CONFIG_PATH = '/etc/haproxy/coraza-spoe.cfg'
 CORAZA_SPOE_BACKUP_PATH = '/etc/haproxy/coraza-spoe.cfg.backup'
 HAPROXY_SOCKET_PATH = '/var/run/haproxy.sock'
+# HAProxy loads this path as a DIRECTORY (`bind ... ssl crt /etc/haproxy/certs`),
+# which means it tries to load EVERY file it finds in here. Nothing but final,
+# validated `<name>.pem` bundles may ever exist in this directory - no temp
+# files, no `.backup` copies. Staging and backups live in the sibling
+# directories below, on the same filesystem so os.replace() stays atomic.
+# See publish_pem_bundle().
 SSL_CERTS_DIR = '/etc/haproxy/certs'
 # Stable per-host secret for QUIC Retry/address-validation tokens. Lives in the
 # /etc/haproxy named volume so it survives container recreates; self-healed on
@@ -309,6 +315,298 @@ def find_certbot_live_dir(base_domain):
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[0][0]
 
+# ---------------------------------------------------------------------------
+# Certificate publishing
+# ---------------------------------------------------------------------------
+# Until 2026-08 every code path that refreshed a combined PEM did this:
+#
+#     with open(combined_path, 'w') as combined:            # TRUNCATES the file
+#         subprocess.run(['cat', cert, key], stdout=combined)   # rc ignored
+#
+# `combined_path` is the live bundle HAProxy is serving. open(...,'w') empties
+# it BEFORE a single byte of source material has been read, and the `cat` exit
+# status was never checked. Any failure in between - source unreadable, disk
+# full, container killed, certbot lineage half-written - left a truncated or
+# key-less PEM in place. HAProxy loads /etc/haproxy/certs as a directory, so one
+# unusable file there fails the whole `bind ... ssl crt` and takes down HTTPS
+# for every site on the host. Unlike a bad haproxy.cfg this is NOT recoverable
+# by config rollback, and re-issuing hits Let's Encrypt rate limits.
+#
+# Everything below exists to make publishing a bundle all-or-nothing:
+#   assemble in a staging dir -> validate -> back up the old one -> os.replace()
+# The live file is only ever swapped for a complete, validated replacement.
+
+
+class CertificatePublishError(Exception):
+    """A certificate bundle could not be published. The live PEM is untouched."""
+
+
+def _cert_sibling_dir(name):
+    """A directory next to SSL_CERTS_DIR (NOT inside it).
+
+    HAProxy loads SSL_CERTS_DIR as a crt directory and tries to load every file
+    in it, so staging and backup copies must live outside. Siblings share the
+    /etc/haproxy filesystem, which is what keeps os.replace() atomic.
+
+    Derived at call time so tests that repoint SSL_CERTS_DIR get matching
+    staging/backup dirs, the same pattern as _config_backup_pairs().
+    """
+    parent = os.path.dirname(SSL_CERTS_DIR.rstrip('/')) or '/'
+    return os.path.join(parent, name)
+
+
+def cert_staging_dir():
+    """Directory where bundles are assembled and validated before publishing."""
+    return _cert_sibling_dir('cert-staging')
+
+
+def cert_backup_dir():
+    """Directory holding the previous copy of each published bundle.
+
+    Mirrors the config backup on the parent branch (one `.backup` alongside
+    haproxy.cfg): one copy per cert, overwritten on each successful publish, so
+    an operator always has a manual path back to the bundle that was being
+    served before the last change.
+    """
+    return _cert_sibling_dir('cert-backups')
+
+
+# ENCRYPTED PRIVATE KEY is deliberately absent: HAProxy cannot use a
+# passphrase-protected key from a crt file, so a bundle containing one is not
+# publishable. Accepting it here would let one through on a host without the
+# openssl CLI, where the pairing check (which would also reject it) is skipped.
+_PEM_KEY_LABELS = ('PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY')
+
+
+def _pem_labels(text):
+    """Labels of well-formed PEM blocks in text, in order.
+
+    A block counts only if its BEGIN line is followed by the matching END line,
+    so a bundle truncated in the middle of a block yields no label for it -
+    which is exactly the corruption we are guarding against.
+    """
+    labels = []
+    open_label = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('-----BEGIN ') and line.endswith('-----'):
+            open_label = line[len('-----BEGIN '):-len('-----')].strip()
+        elif line.startswith('-----END ') and line.endswith('-----'):
+            end_label = line[len('-----END '):-len('-----')].strip()
+            if open_label is not None and end_label == open_label:
+                labels.append(end_label)
+            open_label = None
+    return labels
+
+
+def validate_pem_structure(text):
+    """Structural check on an assembled bundle. Returns (ok, message).
+
+    Pure Python and therefore ALWAYS available - it can never be skipped for
+    lack of a tool. It catches every failure mode the truncation bug produced:
+    empty file, certificate without a key, key without a certificate, and a
+    block cut off mid-write.
+    """
+    if not text.strip():
+        return False, 'bundle is empty'
+    labels = _pem_labels(text)
+    if not labels:
+        return False, 'bundle contains no complete PEM block (truncated?)'
+    if 'CERTIFICATE' not in labels:
+        return False, 'bundle contains no complete CERTIFICATE block'
+    if not any(label in _PEM_KEY_LABELS for label in labels):
+        return False, 'bundle contains no complete private key block'
+    return True, None
+
+
+def _openssl_pairing_status(path):
+    """Does the private key in `path` match the leaf certificate in `path`?
+
+    Returns (status, message) with status 'valid' | 'invalid' | 'unavailable'.
+
+    `openssl x509` reads the FIRST certificate in the file (our bundles are
+    fullchain-then-key, so that is the leaf) and `openssl pkey` scans past the
+    certificate blocks to the first private key, so both run against the
+    assembled bundle directly. Comparing the two public keys proves the pair.
+
+    'unavailable' means the openssl BINARY is absent - a verdict about our
+    tooling, not about the bundle. The Dockerfile installs haproxy, certbot,
+    socat and curl but not the openssl CLI, so this is a real possibility.
+    Callers treat it as a loud warning rather than a failure: the failure modes
+    this whole module exists to prevent (truncation, missing key, partial
+    write) are fully covered by validate_pem_structure(), whereas refusing to
+    publish whenever the checker is missing would stall renewals fleet-wide and
+    let certificates expire - a guaranteed outage traded for a hypothetical
+    one. A mismatch, when we CAN check, is always fatal.
+    """
+    try:
+        cert_pub = subprocess.run(
+            ['openssl', 'x509', '-in', path, '-noout', '-pubkey'],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return 'unavailable', 'openssl binary not found'
+    except Exception as e:
+        return 'unavailable', f'could not run openssl: {e}'
+    if cert_pub.returncode != 0:
+        return 'invalid', ('leaf certificate is unreadable: '
+                           f'{(cert_pub.stderr or "").strip()[:200]}')
+    try:
+        # -passin pass: plus a closed stdin so an (unexpected) encrypted key
+        # fails fast instead of blocking on a passphrase prompt.
+        key_pub = subprocess.run(
+            ['openssl', 'pkey', '-in', path, '-pubout', '-passin', 'pass:'],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return 'unavailable', 'openssl binary not found'
+    except Exception as e:
+        return 'unavailable', f'could not run openssl: {e}'
+    if key_pub.returncode != 0:
+        return 'invalid', ('private key is unreadable: '
+                           f'{(key_pub.stderr or "").strip()[:200]}')
+    if cert_pub.stdout.strip() != key_pub.stdout.strip():
+        return 'invalid', 'private key does not match the leaf certificate'
+    return 'valid', None
+
+
+def validate_pem_bundle(path):
+    """Validate a bundle file on disk. Returns (ok, message).
+
+    Mandatory structural validation plus a best-effort cryptographic pairing
+    check - see _openssl_pairing_status() for what happens when openssl is
+    missing (loud warning, structural verdict stands).
+    """
+    try:
+        with open(path, 'r') as fh:
+            text = fh.read()
+    except OSError as e:
+        return False, f'cannot read assembled bundle: {e}'
+
+    ok, msg = validate_pem_structure(text)
+    if not ok:
+        return False, msg
+
+    status, pair_msg = _openssl_pairing_status(path)
+    if status == 'invalid':
+        return False, pair_msg
+    if status == 'unavailable':
+        logger.warning(
+            "Certificate key/leaf pairing check SKIPPED for %s (%s). The "
+            "bundle passed structural validation only.", path, pair_msg)
+    return True, None
+
+
+def backup_existing_pem(dest_path):
+    """Copy the currently published bundle aside before it is replaced.
+
+    Only a bundle that still validates is promoted to backup: overwriting a
+    good backup with an already-corrupt live file would turn "restore the
+    backup" into "restore different garbage". Same require_valid reasoning as
+    create_backup() for haproxy.cfg.
+
+    Never fatal - failing to take a backup must not stop us replacing a cert
+    with a validated one - but always logged.
+    """
+    if not os.path.exists(dest_path):
+        return None
+    try:
+        with open(dest_path, 'r') as fh:
+            ok, msg = validate_pem_structure(fh.read())
+    except OSError as e:
+        ok, msg = False, str(e)
+    backup_path = os.path.join(cert_backup_dir(), os.path.basename(dest_path))
+    if not ok:
+        logger.warning(
+            "Not backing up %s before replacing it: the file on disk is not a "
+            "valid bundle (%s). Keeping any previous backup at %s.",
+            dest_path, msg, backup_path)
+        return None
+    try:
+        os.makedirs(cert_backup_dir(), exist_ok=True)
+        shutil.copy2(dest_path, backup_path)
+        return backup_path
+    except Exception as e:
+        logger.error("Failed to back up %s to %s: %s",
+                     dest_path, backup_path, e)
+        return None
+
+
+def publish_pem_bundle(dest_path, source_paths):
+    """Publish cert+key as a combined PEM at dest_path, atomically.
+
+    source_paths are concatenated in order (fullchain first, then privkey) into
+    a staging file OUTSIDE the crt directory, validated there, and only then
+    moved into place with os.replace(). If anything fails, the exception is
+    raised and dest_path still holds the previous, working bundle - the live
+    PEM is never opened for writing at any point.
+
+    Returns the path of the backup taken (or None). Raises
+    CertificatePublishError on any failure.
+    """
+    for src in source_paths:
+        if not os.path.exists(src):
+            raise CertificatePublishError(
+                f'source certificate material missing: {src}')
+
+    parts = []
+    for src in source_paths:
+        try:
+            with open(src, 'r') as fh:
+                data = fh.read()
+        except OSError as e:
+            raise CertificatePublishError(f'cannot read {src}: {e}')
+        if not data.strip():
+            raise CertificatePublishError(f'source file is empty: {src}')
+        if not data.endswith('\n'):
+            # Guard against a cert whose last line runs into the key's BEGIN
+            # line; certbot always ends with a newline, but a hand-placed file
+            # might not.
+            data += '\n'
+        parts.append(data)
+    content = ''.join(parts)
+
+    ok, msg = validate_pem_structure(content)
+    if not ok:
+        raise CertificatePublishError(
+            f'assembled bundle for {dest_path} is not usable: {msg}')
+
+    dest_dir = os.path.dirname(dest_path) or '.'
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        os.makedirs(cert_staging_dir(), exist_ok=True)
+    except OSError as e:
+        raise CertificatePublishError(f'cannot prepare directories: {e}')
+
+    # os.replace() is only atomic within one filesystem. Checking up front
+    # turns an EXDEV rename failure into an operator-readable message; the
+    # outcome is the same either way (nothing published, live PEM untouched)
+    # because staging inside the crt directory is not an acceptable fallback.
+    try:
+        if os.stat(cert_staging_dir()).st_dev != os.stat(dest_dir).st_dev:
+            raise CertificatePublishError(
+                f'{cert_staging_dir()} and {dest_dir} are on different '
+                'filesystems, so a certificate cannot be swapped in atomically')
+    except OSError as e:
+        raise CertificatePublishError(f'cannot stat certificate dirs: {e}')
+
+    backup_path = backup_existing_pem(dest_path)
+
+    def _validate_staged(staged_path):
+        return validate_pem_bundle(staged_path)
+
+    try:
+        write_config_atomically(dest_path, content,
+                                staging_dir=cert_staging_dir(),
+                                validate=_validate_staged)
+    except Exception as e:
+        raise CertificatePublishError(
+            f'refused to publish {dest_path}: {e}. The previously served '
+            'certificate is still in place.')
+    logger.info("Published validated certificate bundle to %s%s", dest_path,
+                f' (previous copy backed up to {backup_path})'
+                if backup_path else '')
+    return backup_path
+
+
 def certbot_register():
     """Register with Let's Encrypt using the certbot client and agree to the terms of service"""
     result = subprocess.run(['certbot', 'show_account'],  capture_output=True)
@@ -337,12 +635,26 @@ def generate_self_signed_cert(ssl_certs_dir):
         '-subj', f'/CN={DOMAIN}'
     ], check=True)
 
-    # Combine cert and key for HAProxy
-    with open(self_sign_cert, 'wb') as combined:
+    # Combine cert and key for HAProxy. Same publisher as every other bundle:
+    # this file lands in the crt directory, so a half-written one would break
+    # the TLS bind for every site on the host, and because the function
+    # short-circuits on "file exists" a corrupt one would never be regenerated.
+    try:
+        publish_pem_bundle(self_sign_cert, ['/tmp/cert.pem', '/tmp/key.pem'])
+    except CertificatePublishError as e:
+        # do_initial_setup() calls this unguarded, so raising here would abort
+        # container startup before HAProxy is ever launched. Refusing to write
+        # an unusable default cert is right; taking the whole container down
+        # over it is not - start_haproxy() already degrades gracefully.
+        logger.critical("Could not publish the default self-signed certificate "
+                        "to %s: %s", self_sign_cert, e)
+        return False
+    finally:
         for file in ['/tmp/cert.pem', '/tmp/key.pem']:
-            with open(file, 'rb') as f:
-                combined.write(f.read())
-            os.remove(file)  # Clean up temporary files
+            try:
+                os.remove(file)  # Clean up temporary files
+            except OSError:
+                pass
     generate_config()
     return True
 
@@ -581,8 +893,15 @@ def request_ssl():
             # Ensure SSL certs directory exists
             os.makedirs(SSL_CERTS_DIR, exist_ok=True)
 
-            with open(combined_path, 'w') as combined:
-                subprocess.run(['cat', cert_path, key_path], stdout=combined)
+            try:
+                publish_pem_bundle(combined_path, [cert_path, key_path])
+            except CertificatePublishError as e:
+                # Nothing was written: any previously served bundle for this
+                # name is untouched and HAProxy is not reloaded.
+                error_msg = f'Certificate issued but not published: {e}'
+                logger.critical(error_msg)
+                log_operation('request_ssl', False, error_msg)
+                return jsonify({'status': 'error', 'message': error_msg}), 500
 
             # Update database
             with sqlite3.connect(DB_FILE) as conn:
@@ -611,8 +930,8 @@ def request_ssl():
         log_operation('request_ssl', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def _cleanup_superseded_lineages(keep_path, keep_lineage, bundle_names):
-    """Remove cert files + certbot lineages that the just-issued bundle supersedes.
+def _quarantine_superseded_certs(keep_path, keep_lineage, bundle_names):
+    """Move aside cert files that the just-issued bundle supersedes.
 
     A `.pem` in /etc/haproxy/certs/ is "superseded" iff its certificate's CN
     is one of the bundle's names AND the file isn't the bundle's own combined
@@ -620,10 +939,24 @@ def _cleanup_superseded_lineages(keep_path, keep_lineage, bundle_names):
     since that's what HAProxy SNI-matches against and what the file
     convention names it after.
 
-    Also drops the corresponding certbot renewal config so `certbot renew`
-    stops trying to renew the dead lineage on its next 12h cron tick.
+    This used to os.remove() the file and immediately `certbot delete` the
+    lineage, both BEFORE anything had checked that the replacement bundle was
+    usable — destroying the only two copies of a working certificate on the
+    strength of a `cat` whose exit status nobody read. Now:
 
-    Returns a small summary dict for logging / API response.
+      * the superseded file is MOVED to the cert backup directory instead of
+        unlinked, so an operator can put it back by hand;
+      * the certbot lineage is left alone here. Deleting it is irreversible
+        (archive, live and renewal config all go) and recovering means fresh,
+        rate-limited ACME orders, so it happens only in
+        _delete_superseded_lineages(), after HAProxy has actually loaded the
+        replacement.
+
+    Moving still solves the problem the removal existed for: the old file no
+    longer sits in the crt directory shadowing the new bundle's SNI match.
+
+    Returns a summary dict for logging / API response. Entries in 'removed'
+    carry the lineage name for the deletion phase.
     """
     summary = {'removed': [], 'errors': [], 'skipped': []}
 
@@ -675,24 +1008,52 @@ def _cleanup_superseded_lineages(keep_path, keep_lineage, bundle_names):
             continue
 
         try:
-            os.remove(fpath)
-            removed_entry = {'file': fname, 'cn': cn, 'lineage_deleted': False}
-            # Best-effort certbot lineage delete. Some files may not have a
-            # corresponding lineage (e.g. self-signed dev certs); ignore those.
-            try:
-                cb_proc = subprocess.run(
-                    ['certbot', 'delete', '--cert-name', lineage_name, '-n'],
-                    capture_output=True, text=True
-                )
-                removed_entry['lineage_deleted'] = (cb_proc.returncode == 0)
-                if cb_proc.returncode != 0:
-                    removed_entry['certbot_stderr'] = (cb_proc.stderr or '').strip()[:200]
-            except Exception as e:
-                removed_entry['certbot_error'] = str(e)
-            summary['removed'].append(removed_entry)
+            os.makedirs(cert_backup_dir(), exist_ok=True)
+            quarantine_path = os.path.join(cert_backup_dir(), fname)
+            # Move, not unlink: out of the crt directory (so it stops shadowing
+            # the new bundle) but still on disk for manual recovery.
+            shutil.move(fpath, quarantine_path)
+            summary['removed'].append({
+                'file': fname,
+                'cn': cn,
+                'lineage': lineage_name,
+                'moved_to': quarantine_path,
+                'lineage_deleted': False,
+            })
         except Exception as e:
             summary['errors'].append({'file': fname, 'error': str(e)})
 
+    return summary
+
+
+def _delete_superseded_lineages(summary):
+    """`certbot delete` the lineages quarantined by _quarantine_superseded_certs().
+
+    IRREVERSIBLE: certbot removes the lineage's archive, live symlinks and
+    renewal config. If it turns out we needed that certificate, the only way
+    back is a fresh ACME order, which Let's Encrypt rate-limits — an outage
+    measured in hours. So this is gated hardest of anything in this module: it
+    runs only after the replacement bundle has been assembled, validated,
+    published, AND loaded by a HAProxy that reloaded successfully.
+
+    Mutates `summary` in place. Best-effort: some files have no corresponding
+    lineage (e.g. self-signed dev certs) and a failure here is harmless — a
+    dead lineage merely wastes a renewal attempt on the next 12h cron tick.
+    """
+    for entry in summary.get('removed', []):
+        lineage_name = entry.get('lineage')
+        if not lineage_name:
+            continue
+        try:
+            cb_proc = subprocess.run(
+                ['certbot', 'delete', '--cert-name', lineage_name, '-n'],
+                capture_output=True, text=True
+            )
+            entry['lineage_deleted'] = (cb_proc.returncode == 0)
+            if cb_proc.returncode != 0:
+                entry['certbot_stderr'] = (cb_proc.stderr or '').strip()[:200]
+        except Exception as e:
+            entry['certbot_error'] = str(e)
     return summary
 
 @app.route('/api/ssl/bundle', methods=['POST'])
@@ -794,8 +1155,17 @@ def request_ssl_bundle():
         combined_path = f'{SSL_CERTS_DIR}/{primary}.pem'
 
         os.makedirs(SSL_CERTS_DIR, exist_ok=True)
-        with open(combined_path, 'w') as combined:
-            subprocess.run(['cat', cert_path, key_path], stdout=combined)
+        try:
+            publish_pem_bundle(combined_path, [cert_path, key_path])
+        except CertificatePublishError as e:
+            # Publishing is all-or-nothing, so at this point nothing has been
+            # written, no old certificate has been touched and no lineage has
+            # been deleted. Stop before any of that becomes untrue.
+            error_msg = f'Bundle issued but not published for {primary}: {e}'
+            logger.critical(error_msg)
+            log_operation('request_ssl_bundle', False, error_msg)
+            return jsonify({'status': 'error', 'message': error_msg,
+                            'primary': primary, 'names': names}), 500
 
         # Mark every name in the bundle as ssl_enabled, all pointing at the
         # same combined .pem. HAProxy serves one file for many SNI hostnames.
@@ -816,15 +1186,35 @@ def request_ssl_bundle():
         # `bind ... ssl crt /etc/haproxy/certs` directive. HAProxy then picks
         # one of them by alphabetical/load order — frequently the older
         # single-SAN file — and the new bundle has no effect on what's served.
-        # This block deletes those superseded files (and their certbot lineage)
+        # This block moves those superseded files out of the crt directory
         # before the generate_config() reload so HAProxy picks up the bundle.
-        cleanup_summary = _cleanup_superseded_lineages(
+        # It only runs once publish_pem_bundle() above has validated the
+        # replacement and put it in place, so the old certificate is never the
+        # only copy we have.
+        cleanup_summary = _quarantine_superseded_certs(
             keep_path=combined_path,
             keep_lineage=primary,
             bundle_names=set(names),
         )
 
-        generate_config()
+        # Raises if the config does not validate or HAProxy does not reload;
+        # the certbot lineages below are therefore only deleted once the new
+        # bundle is genuinely being served.
+        try:
+            generate_config()
+        except Exception:
+            if cleanup_summary['removed']:
+                logger.critical(
+                    "HAProxy did not reload after publishing the bundle for "
+                    "%s. The superseded certificate files were moved to %s and "
+                    "their certbot lineages were NOT deleted, so they can be "
+                    "restored by hand: %s",
+                    primary, cert_backup_dir(),
+                    [e['file'] for e in cleanup_summary['removed']])
+            raise
+
+        _delete_superseded_lineages(cleanup_summary)
+
         log_operation(
             'request_ssl_bundle', True,
             f'SSL bundle issued for {primary} covering {len(names)} names; '
@@ -861,11 +1251,12 @@ def renew_certificates():
             # Check if any certificates were renewed
             if 'Congratulations' in result.stdout or 'renewed' in result.stdout:
                 # Update combined certificates for HAProxy
+                publish_failures = []
                 with sqlite3.connect(DB_FILE) as conn:
                     cursor = conn.cursor()
                     cursor.execute('SELECT domain, ssl_cert_path FROM domains WHERE ssl_enabled = 1')
                     domains = cursor.fetchall()
-                    
+
                     for domain, cert_path in domains:
                         if cert_path and os.path.exists(cert_path):
                             # For wildcard domains, strip *. prefix for directory lookup
@@ -876,15 +1267,40 @@ def renew_certificates():
                                 letsencrypt_key = os.path.join(live_dir, 'privkey.pem')
 
                                 if os.path.exists(letsencrypt_cert) and os.path.exists(letsencrypt_key):
-                                    with open(cert_path, 'w') as combined:
-                                        subprocess.run(['cat', letsencrypt_cert, letsencrypt_key], stdout=combined)
-                
-                # Regenerate config and reload HAProxy
+                                    # A failure here leaves the currently
+                                    # served bundle in place. That certificate
+                                    # is still valid (renewal runs ~30 days
+                                    # before expiry and retries every 12h), so
+                                    # keeping it is strictly better than
+                                    # replacing it with something unverified.
+                                    try:
+                                        publish_pem_bundle(
+                                            cert_path,
+                                            [letsencrypt_cert, letsencrypt_key])
+                                    except CertificatePublishError as e:
+                                        logger.critical(
+                                            "Renewed certificate for %s was NOT "
+                                            "published: %s", domain, e)
+                                        publish_failures.append(
+                                            {'domain': domain, 'error': str(e)})
+
+                # Regenerate config and reload HAProxy. Safe to do with
+                # publish failures present: those certificates were left
+                # untouched, so nothing unvalidated is being loaded.
                 generate_config()
                 reload_result = subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli',
                                              capture_output=True, text=True, shell=True)
                 
                 if reload_result.returncode == 0:
+                    if publish_failures:
+                        error_msg = (
+                            f'{len(publish_failures)} renewed certificate(s) could '
+                            'not be published and are still being served from '
+                            'their previous bundle')
+                        log_operation('renew_certificates', False, error_msg)
+                        return jsonify({'status': 'partial_success',
+                                        'message': error_msg,
+                                        'failures': publish_failures}), 500
                     log_operation('renew_certificates', True, 'Certificates renewed and HAProxy reloaded')
                     return jsonify({'status': 'success', 'message': 'Certificates renewed and HAProxy reloaded'})
                 else:
@@ -1077,9 +1493,19 @@ def request_certificates():
                 # Ensure SSL certs directory exists
                 os.makedirs(SSL_CERTS_DIR, exist_ok=True)
 
-                with open(combined_path, 'w') as combined:
-                    subprocess.run(['cat', cert_path, key_path], stdout=combined)
-                
+                try:
+                    publish_pem_bundle(combined_path, [cert_path, key_path])
+                except CertificatePublishError as e:
+                    error_msg = f'Certificate issued but not published: {e}'
+                    logger.critical('%s (%s)', error_msg, domain)
+                    results.append({
+                        'domain': domain,
+                        'status': 'error',
+                        'message': error_msg,
+                    })
+                    error_count += 1
+                    continue
+
                 # Update database (add domain if it doesn't exist)
                 with sqlite3.connect(DB_FILE) as conn:
                     cursor = conn.cursor()
@@ -1700,11 +2126,13 @@ def dns_challenge_verify():
         os.makedirs(SSL_CERTS_DIR, exist_ok=True)
         combined_path = f'{SSL_CERTS_DIR}/_wildcard_.{base_domain}.pem'
 
-        with open(combined_path, 'w') as combined:
-            with open(cert_path, 'r') as cf:
-                combined.write(cf.read())
-            with open(key_path, 'r') as kf:
-                combined.write(kf.read())
+        try:
+            publish_pem_bundle(combined_path, [cert_path, key_path])
+        except CertificatePublishError as e:
+            error_msg = f'Wildcard certificate obtained but not published: {e}'
+            logger.critical(error_msg)
+            log_operation('dns_challenge_verify', False, error_msg)
+            return jsonify({'success': False, 'error': error_msg}), 500
 
         # Update database
         with sqlite3.connect(DB_FILE) as conn:
@@ -1750,6 +2178,40 @@ def get_or_create_cluster_secret():
                 secret = f.read().strip()
                 if secret:
                     return secret
+            # File exists but is blank — e.g. a create that died between
+            # open() and write(), or a volume restored empty. Without healing
+            # it here we fall through to the O_EXCL create below, which fails
+            # with FileExistsError, and the handler re-reads the same blank
+            # file: this function would return '' forever and the host would
+            # never get the stable secret its docstring promises.
+            #
+            # Rewrite in place under an exclusive lock rather than unlinking
+            # and recreating: the file is never momentarily absent, and two
+            # workers healing at once serialise instead of racing to install
+            # two different secrets.
+            try:
+                fd = os.open(CLUSTER_SECRET_PATH, os.O_RDWR)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    # Re-read under the lock: another worker may have healed it
+                    # while we were waiting.
+                    existing = os.read(fd, 4096).decode(errors='replace').strip()
+                    if existing:
+                        return existing
+                    secret = os.urandom(32).hex()
+                    os.ftruncate(fd, 0)
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.write(fd, secret.encode())
+                    os.fchmod(fd, 0o600)
+                    logger.warning(
+                        "Healed empty QUIC cluster-secret at %s",
+                        CLUSTER_SECRET_PATH)
+                    return secret
+                finally:
+                    os.close(fd)
+            except Exception as e:
+                logger.error("Failed to heal empty cluster-secret: %s", e)
+                return ''
         # Generate and persist exclusively (0600). hex => config-safe charset.
         secret = os.urandom(32).hex()
         fd = os.open(CLUSTER_SECRET_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -2111,7 +2573,7 @@ def _config_backup_pairs():
     )
 
 
-def write_config_atomically(path, content):
+def write_config_atomically(path, content, staging_dir=None, validate=None):
     """Write content to path via temp file + rename.
 
     A half-written haproxy.cfg (disk full, container killed mid-write) is just
@@ -2119,8 +2581,26 @@ def write_config_atomically(path, content):
     atomic within a filesystem, so the file on disk is always either the whole
     old config or the whole new one — never a truncated hybrid. This also keeps
     the "existing config is already broken" case from being self-inflicted.
+
+    The same guarantee is what certificate bundles need, so this is the single
+    atomic publisher for both (see publish_pem_bundle()); the two extra
+    arguments exist for that caller:
+
+    staging_dir: where the temp file is created. Defaults to the destination's
+        own directory, which is right for /etc/haproxy but WRONG for
+        /etc/haproxy/certs — HAProxy loads that path as a crt directory and
+        tries to load every file in it, so a `.tmp` there (or one leaked by a
+        crash) can break the whole TLS bind. Must be on the same filesystem as
+        `path` or os.replace() cannot be atomic; if it is not, the rename fails
+        loudly and the destination is left untouched, which is the safe outcome.
+
+    validate: optional callable(temp_path) -> (ok, message), run on the staged
+        file BEFORE it is moved into place. Returning False aborts the publish
+        with the temp file removed and `path` still holding its previous
+        contents. This is the only ordering that lets us validate the
+        replacement without having destroyed the original first.
     """
-    directory = os.path.dirname(path) or '.'
+    directory = staging_dir or os.path.dirname(path) or '.'
     # Preserve the mode of the file we are replacing; mkstemp defaults to 0600
     # and HAProxy config files are conventionally 0644.
     try:
@@ -2136,6 +2616,10 @@ def write_config_atomically(path, content):
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp_path, mode)
+        if validate is not None:
+            ok, message = validate(tmp_path)
+            if not ok:
+                raise ValueError(f'staged file failed validation: {message}')
         os.replace(tmp_path, path)
     except Exception:
         try:
