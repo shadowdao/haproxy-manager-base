@@ -90,5 +90,12 @@ if [ $UPDATED -gt 0 ]; then
     fi
 fi
 
+# See the matching block in renew-certificates.sh: a run in which every domain
+# failed to publish must not look like a clean run to its caller.
+if [ "$FAILED" -gt 0 ]; then
+    log_error "Certificate sync process completed with failures: $UPDATED updated, $FAILED failed"
+    exit 1
+fi
+
 log_info "Certificate sync process completed"
 exit 0

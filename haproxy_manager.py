@@ -373,8 +373,9 @@ def cert_backup_dir():
 
 # ENCRYPTED PRIVATE KEY is deliberately absent: HAProxy cannot use a
 # passphrase-protected key from a crt file, so a bundle containing one is not
-# publishable. Accepting it here would let one through on a host without the
-# openssl CLI, where the pairing check (which would also reject it) is skipped.
+# publishable, and the structural layer is the only layer that names the
+# problem ("no complete private key block") rather than reporting it as an
+# unreadable key.
 _PEM_KEY_LABELS = ('PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY')
 
 
@@ -406,6 +407,11 @@ def validate_pem_structure(text):
     lack of a tool. It catches every failure mode the truncation bug produced:
     empty file, certificate without a key, key without a certificate, and a
     block cut off mid-write.
+
+    It is NOT sufficient on its own, which is why _openssl_pairing_status() is
+    mandatory rather than best-effort: a bundle of EMPTY pem blocks (a BEGIN
+    line immediately followed by its END line, no base64 between them) passes
+    every check here and is rejected only by openssl.
     """
     if not text.strip():
         return False, 'bundle is empty'
@@ -430,14 +436,34 @@ def _openssl_pairing_status(path):
     assembled bundle directly. Comparing the two public keys proves the pair.
 
     'unavailable' means the openssl BINARY is absent - a verdict about our
-    tooling, not about the bundle. The Dockerfile installs haproxy, certbot,
-    socat and curl but not the openssl CLI, so this is a real possibility.
-    Callers treat it as a loud warning rather than a failure: the failure modes
-    this whole module exists to prevent (truncation, missing key, partial
-    write) are fully covered by validate_pem_structure(), whereas refusing to
-    publish whenever the checker is missing would stall renewals fleet-wide and
-    let certificates expire - a guaranteed outage traded for a hypothetical
-    one. A mismatch, when we CAN check, is always fatal.
+    tooling, not about the bundle. validate_pem_bundle() treats it as a HARD
+    FAILURE.
+
+    That is a deliberate reversal. This docstring used to say "the Dockerfile
+    installs haproxy, certbot, socat and curl but not the openssl CLI, so this
+    is a real possibility", and callers accepted the bundle on the structural
+    checks alone. The premise is false: openssl 3.x IS in the image, as a
+    dependency of ca-certificates (which certbot requires), and
+    generate_self_signed_cert() below already runs `openssl req` with
+    check=True during first-run setup - so no container has ever reached a
+    publish without it. The 'unavailable' branch never fired, which means the
+    pairing check has in fact always run, and THAT is what made the fail-open
+    harmless - not the stated reasoning. Structural validation on its own is
+    weak: a bundle of empty pem blocks passes validate_pem_structure() and is
+    caught only here.
+
+    So an absent openssl now means the image is broken, and we say so and stop
+    instead of quietly downgrading to the weaker check. The cost is that a
+    hypothetical openssl-less image stops publishing renewals - but it does so
+    immediately and loudly, in the monitored error log, at the first renewal,
+    rather than 90 days later; and publishing an unverified bundle can take the
+    whole :443 bind, i.e. every site on the host, down at the next reload.
+
+    There is no python `cryptography` fallback on purpose: this process runs on
+    /usr/local/bin/python3 (the base image's 3.12), where cryptography is not
+    importable. It is installed for Debian's /usr/bin/python3 as a certbot
+    dependency, and reaching for that interpreter would be a second unverified
+    premise of exactly the kind this comment is correcting.
     """
     try:
         cert_pub = subprocess.run(
@@ -471,14 +497,17 @@ def _openssl_pairing_status(path):
 def validate_pem_bundle(path):
     """Validate a bundle file on disk. Returns (ok, message).
 
-    Mandatory structural validation plus a best-effort cryptographic pairing
-    check - see _openssl_pairing_status() for what happens when openssl is
-    missing (loud warning, structural verdict stands).
+    Structural validation AND the cryptographic pairing check, both mandatory -
+    see _openssl_pairing_status() for why a missing openssl is a failure rather
+    than a downgrade to structure-only.
     """
     try:
         with open(path, 'r') as fh:
             text = fh.read()
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError, not just OSError: a bundle corrupted into binary
+        # is unreadable as text but reads perfectly well as bytes, so `except
+        # OSError` let the decode error escape as an unhandled traceback.
         return False, f'cannot read assembled bundle: {e}'
 
     ok, msg = validate_pem_structure(text)
@@ -489,9 +518,13 @@ def validate_pem_bundle(path):
     if status == 'invalid':
         return False, pair_msg
     if status == 'unavailable':
-        logger.warning(
-            "Certificate key/leaf pairing check SKIPPED for %s (%s). The "
-            "bundle passed structural validation only.", path, pair_msg)
+        logger.error(
+            "Certificate key/leaf pairing check could not run for %s (%s) - "
+            "REFUSING to publish. openssl is required; structural validation "
+            "alone cannot tell a real bundle from empty pem blocks.",
+            path, pair_msg)
+        return False, (f'cert/key pairing check unavailable ({pair_msg}); '
+                       'refusing to publish on structural checks alone')
     return True, None
 
 
@@ -511,7 +544,14 @@ def backup_existing_pem(dest_path):
     try:
         with open(dest_path, 'r') as fh:
             ok, msg = validate_pem_structure(fh.read())
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError, not just OSError. A live pem corrupted into
+        # BINARY (the exact state a republish is meant to heal) raises
+        # UnicodeDecodeError here, and with only OSError caught it escaped all
+        # the way out of publish_pem_bundle() - so the one operation that would
+        # have put a working certificate back blew up on the way to taking a
+        # backup of the broken one. The shell half recovers from this fine;
+        # this is the only reason the Python half did not.
         ok, msg = False, str(e)
     backup_path = os.path.join(cert_backup_dir(), os.path.basename(dest_path))
     if not ok:
@@ -552,7 +592,9 @@ def publish_pem_bundle(dest_path, source_paths):
         try:
             with open(src, 'r') as fh:
                 data = fh.read()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
+            # Binary-corrupt source material must be a clean, reported refusal,
+            # not an unhandled UnicodeDecodeError out of the request handler.
             raise CertificatePublishError(f'cannot read {src}: {e}')
         if not data.strip():
             raise CertificatePublishError(f'source file is empty: {src}')

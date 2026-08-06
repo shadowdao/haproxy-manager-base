@@ -108,5 +108,18 @@ if [ $UPDATED -gt 0 ]; then
     fi
 fi
 
+# A per-domain publication failure is a real failure and must be reported as
+# one. This script used to `exit 0` no matter how many domains failed, so
+# "0 updated, 12 failed" - a host that has completely stopped publishing
+# renewals - looked identical to a clean run to cron, to
+# host-renew-certificates.sh (which branches on this exit code) and to any
+# external monitoring. The first visible symptom would have been certificates
+# expiring. The loop above deliberately continues past a failed domain so the
+# others still get published; the status is reported here instead.
+if [ "$FAILED" -gt 0 ]; then
+    log_error "Certificate renewal process completed with failures: $UPDATED updated, $FAILED failed"
+    exit 1
+fi
+
 log_info "Certificate renewal process completed"
 exit 0

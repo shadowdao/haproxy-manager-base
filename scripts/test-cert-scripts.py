@@ -41,16 +41,26 @@ binaries on PATH.
 
 The certificate material below is a real self-signed test certificate with its
 matching key (plus a second, unrelated key for the mismatch case), embedded as
-constants so the tests need no openssl to *create* material. The one test that
-needs openssl to *verify* pairing skips itself if the binary is absent.
+constants so the tests need no openssl to *create* material. openssl IS needed
+to run them: the library's cert/key pairing check is mandatory (it is the only
+layer that can reject a bundle of empty pem blocks), so without the binary
+every publish is refused by design. The image ships openssl 3.x.
+
+The acceptance bar for this file is a green run INSIDE the built image, as
+root, which is where these scripts actually execute - not on a workstation.
+Several failure modes are invisible outside the container (root ignores the
+directory permissions one test used to rely on) and one was actively
+destructive there; see _cleanup_tmp().
 """
 
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 MODULE_DIR = os.path.abspath(
@@ -152,11 +162,72 @@ FV0RvuQPDYkqsx8ibqpSv7c=
 -----END PRIVATE KEY-----
 """
 
+# A SECOND, unrelated but internally consistent pair. Needed by the
+# concurrency test: two bundles that are each perfectly valid but whose keys
+# differ, so a validator that reads the certificate from one and the key from
+# the other reports a mismatch. Two bundles sharing key material - which is
+# what PREVIOUS_BUNDLE and NEW_BUNDLE are - cannot detect that at all.
+# openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+#         -subj /CN=second.example.com
+TEST_CERT_2 = """\
+-----BEGIN CERTIFICATE-----
+MIIDGzCCAgOgAwIBAgIUKQAAvrVkden7gIg2zYMLb6dO1c8wDQYJKoZIhvcNAQEL
+BQAwHTEbMBkGA1UEAwwSc2Vjb25kLmV4YW1wbGUuY29tMB4XDTI2MDgwNjE2NTcz
+NVoXDTM2MDgwMzE2NTczNVowHTEbMBkGA1UEAwwSc2Vjb25kLmV4YW1wbGUuY29t
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv2pfTOvN2zrZJ6d+biiD
+VOczMqanuHPBCy2CnTBif+7VWf8AaywRzQ3ShfhmalVRNEFMn0MSO+GocmH71Ve1
+nl89oGiJPmvX1lpncbgM692ddhP9ez4xUeNj+QAWp9VBZhInNuM4Pawv5BPngtpj
+2MGXf3ZlBSli8Ng7jBo1fTMT3bh8GcE1rIPRvmUuQwFIt2eGnLR8jQd+xGelhAjG
+nnXtlc+ebo4r2OjljNgvtdUknBZdpiZXmjdFzyClYTeMuEen2uwMpJNc0wLbRjcU
+khVF3nw4jUnkOhWH3JYGAoWslJyEqZSANwt/eOHwXgyVuxg31bCl297iskW0IRZL
+wQIDAQABo1MwUTAdBgNVHQ4EFgQU7HH8GacJzc2j9s2UJCPwykgrIckwHwYDVR0j
+BBgwFoAU7HH8GacJzc2j9s2UJCPwykgrIckwDwYDVR0TAQH/BAUwAwEB/zANBgkq
+hkiG9w0BAQsFAAOCAQEAYE5jHX1dK091jVsFSZDdiw9AU5rrk8XpF1yuPmDisRnE
+dJ4QQq3dzWXRnp0bzZnq7fdfiEz1m39zVixov7WFp24QhenD2n5K7/wew7RpXTnA
+pAGBEdsGvBJ+3MgkRYklXCM9f9f4z21xXRNZ+BwBcM25D+gR4b+PRMQR6BhZx5R+
+y2jQsoM68cFjRApFWgmji4pBjg/eOaZMBCfVTjP+npVyqG7UtV5EyYXwPgPa/rm2
+FoP+eftzP6dszBEonkIVyyvkdscI4Wkr8hw3S0R/TP8l9lTnvN1HC3o7Es5VY53R
+swNAXWBlgm0N7A96ISLtQjgvOfeMRTCSjxW9pm0wJA==
+-----END CERTIFICATE-----
+"""
+
+TEST_KEY_2 = """\
+-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC/al9M683bOtkn
+p35uKINU5zMypqe4c8ELLYKdMGJ/7tVZ/wBrLBHNDdKF+GZqVVE0QUyfQxI74ahy
+YfvVV7WeXz2gaIk+a9fWWmdxuAzr3Z12E/17PjFR42P5ABan1UFmEic24zg9rC/k
+E+eC2mPYwZd/dmUFKWLw2DuMGjV9MxPduHwZwTWsg9G+ZS5DAUi3Z4actHyNB37E
+Z6WECMaede2Vz55ujivY6OWM2C+11SScFl2mJleaN0XPIKVhN4y4R6fa7Aykk1zT
+AttGNxSSFUXefDiNSeQ6FYfclgYChayUnISplIA3C3944fBeDJW7GDfVsKXb3uKy
+RbQhFkvBAgMBAAECggEABQLqy6eedRPt31sLOMFEDkzbZdFHOMpZeuqThsNmjo7z
+t9diokgeD4ZQXimbEQqsZYDAtmFGdiEp86I9JQBk/4TUiqFhHrOADBe1jQAptjfs
+iyIb51gIPnjZ1RBA5Al8zohy28T9h1+Z7+/OeCvcgLyVAixf/U9pU8D1El9cu9zv
+4q4WJPB5Tgkq+YwcmeuT8LzsKoSDmPQjFVY9v+gz6hoVUVyP6gswnlFnKjNcmfZU
+0CKP90sCAc5mKZv7RyGG920LDU4u2ggnQoK05GhXK8R3amJmoAF3i+xGeTRvNEKe
+wDC7NinTG2WDVo6y/FCvFKs0+qqlKww1u39fq166rQKBgQDtjPjvkDkSYFcWFznn
+sfsxN5R1cLpxdutLZhfvtpHIj5NkQbmOk0r3LbDAwU+UNVQ6F8jWQVHUsni9jAY6
+3RNRF4ZabC51aqg/Ssj7d5mE4kj7y6Ch/nnSXIogRxLG4bWo2rtG1M2Dt3Ef08R4
+6gjcp9ZmELyVx7H4yXFJGIaDdQKBgQDOSCHFK/ggZzzy4iC7DOq1lrbR+jyk95rh
+F5EGzyAkgJ4uYc9TCPkUDxXjWL17r61/obfbW4znaV9fHEKpz3R54osDXln3oLea
+BBWkJI3ANe8iNrGDE4FN9to4DdUMFsWX/WEiRyBPIqDy9DTyadblMLTNZjNPuLmg
+ZJOB3tRZnQKBgQCjeglya9Eq2Uv1MuSxk2VnmHU9YOed4BXLHKZKXFz1JgFr1GNL
+QAguFK536FDIkO62z9lxwR/8fRnkb7F13uBFRSg7oAlU2qKQc/nePI9UyJkrVxXj
+hYn2f6K61c6ROZFXc7e/5gDMrXhXS9gA0iZpG8PLF6eAeB39NTwV7p/bZQKBgQCV
+v5eEY58FJu0ABVhtcbsRiA+/70EHIRi2Pz1xC/vxg81RLoArb2AiR7FEEa+8kpQJ
+C4VFIPjxJXWuvf1G+Os9cFAqadw1/95JWJ29QywEVSL8W2gSF57O0l0oRCJdXEql
+Q7O4BppV2HWu6clmEZ+HUgxu77pgLWHUJi9PIExXoQKBgEq6rYBXmsSQermnPTOn
+YFx7c2ns97hsjYIbs497+gPW4/xQWwsN76t60SWqjXV4DHJCpi5Tnjo2fk5/OzK+
+HfshC9CKFDk8T0KGQWwaPwqP/OYbqOA88IlJ7xbPdSuJkjefHCtVVEtao6+HNgzm
+lniLtDMpU0MLPgB98ClQ4HDA
+-----END PRIVATE KEY-----
+"""
+
 # The bundle already on disk when a run starts. Same key material, plus a
 # trailing marker so "the live file was replaced" and "the old file was
 # archived" can be told apart byte-for-byte.
 PREVIOUS_BUNDLE = TEST_CERT + TEST_KEY + '# previous bundle\n'
 NEW_BUNDLE = TEST_CERT + TEST_KEY
+OTHER_BUNDLE = TEST_CERT_2 + TEST_KEY_2
 
 # --- stub binaries -----------------------------------------------------------
 STUB_CERTBOT = """\
@@ -216,6 +287,12 @@ class CertScriptFixture(unittest.TestCase):
     """An isolated fake /etc/haproxy + /etc/letsencrypt plus stub binaries."""
 
     def setUp(self):
+        # Without the library every "the library rejects X" assertion in this
+        # file can be satisfied by bash exiting 127, so make its absence a
+        # failure of every test rather than a silent pass of several.
+        self.assertTrue(os.path.isfile(LIB),
+                        f'{LIB} is missing - nothing below tests anything')
+
         self.tmp = tempfile.mkdtemp(prefix='haproxy-cert-test-')
         self.addCleanup(self._cleanup_tmp)
 
@@ -246,11 +323,28 @@ class CertScriptFixture(unittest.TestCase):
         self.error_log = os.path.join(self.tmp, 'haproxy-manager-errors.log')
 
     def _cleanup_tmp(self):
-        # A test may have chmod 000'd a fixture file.
+        # A test may have chmod 000'd a fixture file, which would stop rmtree.
+        #
+        # SYMLINKS ARE SKIPPED, and that is not a nicety. os.chmod() FOLLOWS
+        # symlinks, and the openssl-availability tests below build a stripped
+        # PATH directory out of symlinks to real system binaries (/usr/bin/cat,
+        # /usr/bin/chmod, ...). Walking those with chmod 0600 as root - which is
+        # how this container runs - stripped the exec bit from a dozen core
+        # binaries of the machine running the tests, chmod itself included, so
+        # it could not even be undone from inside the container: every later
+        # test failed with "/usr/bin/grep: Permission denied" and certificate
+        # publishing stayed dead until the container was recreated. It never
+        # showed up on a workstation because an unprivileged chmod of a
+        # root-owned file fails EPERM and was swallowed by `except OSError`.
+        # This file ships in the image (COPY scripts /haproxy/scripts), so
+        # running it in place is a thing an operator will do.
         for root, dirs, files in os.walk(self.tmp):
             for name in files:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    continue
                 try:
-                    os.chmod(os.path.join(root, name), 0o600)
+                    os.chmod(path, 0o600)
                 except OSError:
                     pass
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -309,6 +403,27 @@ class CertScriptFixture(unittest.TestCase):
         if os.path.isdir(self.staging_dir):
             self.assertEqual(sorted(os.listdir(self.staging_dir)), [],
                              'staging file was not cleaned up')
+
+    def assert_rejected(self, result, because):
+        """The library refused, FOR THE STATED REASON.
+
+        `assertNotEqual(rc, 0)` on its own proves nothing about this library.
+        Delete cert-publish-lib.sh and `. "$1"` fails, cert_bundle_valid is
+        never defined, bash exits 127 - and a bare rc!=0 assertion passes. Four
+        tests in TestCertPublishLibrary were doing exactly that; they were
+        pinning "some bash pipeline failed", not "the bundle was rejected".
+        """
+        output = result.stdout + result.stderr
+        self.assertNotIn('command not found', output,
+                         'the shell could not find the function under test - '
+                         'this asserts nothing about the library')
+        self.assertNotEqual(127, result.returncode,
+                            f'exit 127 means "no such command", not "rejected": {output}')
+        self.assertNotEqual(0, result.returncode,
+                            f'expected a rejection, got success: {output}')
+        self.assertIn(because, output,
+                      f'rejected, but not for the expected reason '
+                      f'({because!r} not in output): {output}')
 
 
 class CertScriptBehaviour:
@@ -378,8 +493,17 @@ class CertScriptBehaviour:
                          'HAProxy was reloaded even though nothing was updated')
         self.assert_certs_dir_is_clean()
         self.assert_no_staging_leftovers()
-        self.assertEqual(result.returncode, 0,
-                         'a per-domain failure should not change the exit code')
+        # This used to assert returncode == 0 with the comment "a per-domain
+        # failure should not change the exit code", codifying the script's
+        # `exit 0`. That is wrong and it is the dangerous kind of wrong: a host
+        # where EVERY domain fails to publish looked, to cron and to
+        # host-renew-certificates.sh (which branches on this exit code),
+        # exactly like a clean run. Nothing would notice until the certificates
+        # expired. Continuing past a failed domain so the others still get
+        # published is right; reporting success afterwards is not.
+        self.assertNotEqual(result.returncode, 0,
+                            'a domain that failed to publish must be reported '
+                            'in the exit code, not just in the log')
 
     def break_source_key(self):
         """Make reading the source key fail, however this environment allows.
@@ -424,8 +548,9 @@ class CertScriptBehaviour:
 
     def test_mismatched_key_is_rejected(self):
         if shutil.which('openssl') is None:
-            self.skipTest('openssl CLI not available: the cert/key pairing '
-                          'check is best-effort and is skipped by design')
+            self.skipTest('openssl CLI not available: without it every publish '
+                          'is refused, so this test could not tell a pairing '
+                          'rejection from a missing-checker rejection')
         self.seed_previous_bundle()
         before = read(self.live_pem)
         write(self.src_key, UNRELATED_KEY)
@@ -504,10 +629,10 @@ class TestSyncCertificates(CertScriptBehaviour, CertScriptFixture):
 class TestCertPublishLibrary(CertScriptFixture):
     """Unit-level checks on cert-publish-lib.sh itself."""
 
-    def call(self, snippet, *args):
+    def call(self, snippet, *args, **env_overrides):
         return subprocess.run(
             ['bash', '-c', '. "$1"; shift; ' + snippet, '_', LIB, *args],
-            env=self.env(), capture_output=True, text=True)
+            env=self.env(**env_overrides), capture_output=True, text=True)
 
     def test_valid_bundle_accepted(self):
         path = write(os.path.join(self.tmp, 'ok.pem'), NEW_BUNDLE)
@@ -515,14 +640,32 @@ class TestCertPublishLibrary(CertScriptFixture):
 
     def test_empty_and_missing_bundles_rejected(self):
         empty = write(os.path.join(self.tmp, 'empty.pem'), '')
-        self.assertNotEqual(self.call('cert_bundle_valid "$1"', empty).returncode, 0)
+        self.assert_rejected(self.call('cert_bundle_valid "$1"', empty),
+                             'is empty')
         missing = os.path.join(self.tmp, 'nope.pem')
-        self.assertNotEqual(self.call('cert_bundle_valid "$1"', missing).returncode, 0)
+        self.assert_rejected(self.call('cert_bundle_valid "$1"', missing),
+                             'does not exist')
 
     def test_key_without_end_marker_rejected(self):
         truncated = write(os.path.join(self.tmp, 'cut.pem'),
                           TEST_CERT + '-----BEGIN PRIVATE KEY-----\nMIIEvAIB\n')
-        self.assertNotEqual(self.call('cert_bundle_valid "$1"', truncated).returncode, 0)
+        self.assert_rejected(self.call('cert_bundle_valid "$1"', truncated),
+                             'unterminated private key block')
+
+    def test_empty_pem_blocks_are_rejected(self):
+        """Why the pairing check is mandatory rather than best-effort.
+
+        Every structural check in the library passes on this file: a complete
+        CERTIFICATE block and a complete PRIVATE KEY block, both with nothing
+        between BEGIN and END. Only openssl can tell it is not a certificate.
+        """
+        hollow = write(os.path.join(self.tmp, 'hollow.pem'),
+                       '-----BEGIN CERTIFICATE-----\n'
+                       '-----END CERTIFICATE-----\n'
+                       '-----BEGIN PRIVATE KEY-----\n'
+                       '-----END PRIVATE KEY-----\n')
+        self.assert_rejected(self.call('cert_bundle_valid "$1"', hollow),
+                             'openssl could not read the certificate')
 
     def test_a_broken_live_pem_does_not_overwrite_a_good_backup(self):
         """Mirrors create_backup(require_valid=True) in haproxy_manager.py.
@@ -544,37 +687,218 @@ class TestCertPublishLibrary(CertScriptFixture):
                          'a good backup was overwritten with an unusable pem')
 
     def test_publish_fails_loudly_when_the_rename_cannot_happen(self):
-        """No silent fallback to writing straight into the certs dir."""
+        """No silent fallback to writing straight into the certs dir.
+
+        The failure is injected with a stub `mv` that refuses, rather than by
+        chmod 0500 on the certs dir: the container these scripts run in is
+        root, root ignores directory permissions, so the chmod version skipped
+        itself exactly where it matters and only ever ran on a workstation.
+        """
         self.seed_previous_bundle()
         before = read(self.live_pem)
-        os.chmod(self.certs_dir, 0o500)          # no writes: mv will fail
-        self.addCleanup(os.chmod, self.certs_dir, 0o755)
-        if os.geteuid() == 0:
-            self.skipTest('root ignores directory permissions')
+        write(os.path.join(self.bindir, 'mv'),
+              "#!/bin/sh\n"
+              "echo \"mv: cannot move '$2': Permission denied\" >&2\n"
+              "exit 1\n", 0o755)
+        self.addCleanup(os.unlink, os.path.join(self.bindir, 'mv'))
 
         result = self.call('cert_publish "$1" "$2" "$3"',
                            self.src_cert, self.src_key, self.live_pem)
 
-        self.assertNotEqual(result.returncode, 0,
-                            'a failed rename was reported as success')
+        self.assert_rejected(result, 'NOT falling back to a direct write')
         self.assertEqual(read(self.live_pem), before,
                          'the live pem was damaged by a failed rename')
         self.assert_no_staging_leftovers()
+
+    def test_published_pem_keeps_the_mode_of_the_file_it_replaces(self):
+        """A write-safety fix must not silently re-permission private keys.
+
+        Both directions matter: mktemp stages at 0600, so without the explicit
+        chmod every publish would tighten a 0644 bundle; and the mode must not
+        be copied from a symlink (see the next test).
+        """
+        for mode in (0o644, 0o640, 0o600):
+            with self.subTest(oct(mode)):
+                write(self.live_pem, PREVIOUS_BUNDLE, mode)
+                result = self.call('cert_publish "$1" "$2" "$3"',
+                                   self.src_cert, self.src_key, self.live_pem)
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+                self.assertEqual(read(self.live_pem), NEW_BUNDLE)
+                self.assertEqual(
+                    stat.S_IMODE(os.stat(self.live_pem).st_mode), mode,
+                    'publishing changed who can read the private key')
+
+    def test_symlinked_live_pem_does_not_become_world_writable(self):
+        """`stat -c %a` on a symlink reports 0777 - the LINK's mode, not a
+        permission. Copying that onto the staged bundle put a world-writable
+        private key in the directory HAProxy serves from. -L is what makes the
+        preserved mode the mode of the file an operator actually chose.
+        """
+        target = write(os.path.join(self.tmp, 'real-bundle.pem'),
+                       PREVIOUS_BUNDLE, 0o640)
+        os.symlink(target, self.live_pem)
+
+        result = self.call('cert_publish "$1" "$2" "$3"',
+                           self.src_cert, self.src_key, self.live_pem)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        mode = stat.S_IMODE(os.stat(self.live_pem).st_mode)
+        self.assertEqual(
+            0, mode & 0o022,
+            f'published bundle is group/world writable ({oct(mode)}) - the '
+            f'symlink mode was copied onto a real private key')
+        self.assertEqual(0o640, mode)
+
+    def test_publish_refuses_when_staging_is_on_another_filesystem(self):
+        """The header used to claim a cross-device mv "fails loudly and leaves
+        the live pem alone". GNU mv does no such thing: across filesystems it
+        copies, so it truncates and writes the DESTINATION first and only then
+        discovers it cannot finish (ENOSPC being the realistic case) - the very
+        truncation this library exists to prevent. Both directories are
+        env-overridable, so the device numbers have to be checked up front.
+        """
+        staging = os.path.join(self.a_dir_on_another_filesystem(),
+                               'cert-staging')
+        self.seed_previous_bundle()
+        before = read(self.live_pem)
+
+        result = self.call('cert_publish "$1" "$2" "$3"',
+                           self.src_cert, self.src_key, self.live_pem,
+                           CERT_STAGING_DIR=staging)
+
+        self.assert_rejected(result, 'different filesystems')
+        self.assertEqual(read(self.live_pem), before,
+                         'the live pem was disturbed by a refused publish')
+        self.assert_certs_dir_is_clean()
+
+    def test_stale_python_side_staging_temps_are_reaped(self):
+        """The staging dir has two writers.
+
+        write_config_atomically() on the Python side stages as
+        `<name>.<random>.tmp` (tempfile.mkstemp(prefix=name + '.',
+        suffix='.tmp')). The reaper matched only mktemp's `*.??????` shape, so
+        every temp leaked by a SIGKILL on the Python side stayed there forever.
+        """
+        os.makedirs(self.staging_dir, exist_ok=True)
+        stale_py = write(os.path.join(self.staging_dir,
+                                      DOMAIN + '.pem.ab12cd34.tmp'), 'stale\n')
+        stale_sh = write(os.path.join(self.staging_dir,
+                                      DOMAIN + '.pem.AbCdEf'), 'stale\n')
+        fresh = write(os.path.join(self.staging_dir,
+                                   'recent.pem.zz99yy.tmp'), 'fresh\n')
+        old = time.time() - 3 * 24 * 3600
+        for path in (stale_py, stale_sh):
+            os.utime(path, (old, old))
+
+        result = self.call('cert_publish "$1" "$2" "$3"',
+                           self.src_cert, self.src_key, self.live_pem)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        self.assertFalse(os.path.exists(stale_py),
+                         'a stale Python-side staging temp was never reaped')
+        self.assertFalse(os.path.exists(stale_sh),
+                         'a stale shell-side staging temp was never reaped')
+        self.assertTrue(os.path.exists(fresh),
+                        'the reaper deleted a temp a concurrent publisher may '
+                        'still be writing')
+
+    def test_validation_of_a_live_pem_being_republished_is_not_spurious(self):
+        """cert_bundle_valid must judge ONE snapshot of the file.
+
+        cert_publish() calls cert_bundle_valid() on the LIVE pem (step (e), to
+        decide whether it is worth backing up) while another publisher may be
+        renaming a new bundle over it. The function used to open the file six
+        times, so `openssl x509` could read the outgoing bundle and `openssl
+        pkey` the incoming one - and report "private key does not match the
+        certificate" about two files that were each perfectly fine. That ERROR
+        goes into the log monitor-errors.sh watches, which makes it a page.
+
+        The two bundles alternated below are each internally valid but carry
+        DIFFERENT key material. That matters: NEW_BUNDLE and PREVIOUS_BUNDLE
+        share a cert and a key, so alternating those two could never produce a
+        mismatch no matter how badly the reads were interleaved - the test
+        would model a world in which the bug cannot happen and pass forever.
+        """
+        write(self.live_pem, NEW_BUNDLE)
+        a = write(os.path.join(self.tmp, 'churn-a.pem'), NEW_BUNDLE)
+        b = write(os.path.join(self.tmp, 'churn-b.pem'), OTHER_BUNDLE)
+
+        # A publisher renaming over the live pem as fast as it can. Staged
+        # outside the certs dir, then renamed, exactly like cert_publish().
+        churn = subprocess.Popen(
+            ['bash', '-c',
+             'end=$((SECONDS+8)); s="$4"; while [ $SECONDS -lt $end ]; do '
+             '  cp "$1" "$s"; mv -f "$s" "$2"; '
+             '  cp "$3" "$s"; mv -f "$s" "$2"; '
+             'done', '_', a, self.live_pem, b,
+             os.path.join(self.tmp, 'churn-staged.pem')],
+            env=self.env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def _stop():
+            churn.kill()
+            churn.wait()
+        self.addCleanup(_stop)
+
+        result = subprocess.run(
+            ['bash', '-c',
+             '. "$1"; for i in $(seq 1 200); do cert_bundle_valid "$2" || exit 1; done',
+             '_', LIB, self.live_pem],
+            env=self.env(), capture_output=True, text=True, timeout=120)
+        _stop()
+
+        output = result.stdout + result.stderr
+        self.assertNotIn('does not match the certificate', output,
+                         'two valid bundles were reported as a mismatched pair '
+                         'because the checks read different files')
+        self.assertEqual(0, result.returncode,
+                         f'a concurrent republish made validation fail: {output}')
+
+    def a_dir_on_another_filesystem(self):
+        certs_dev = os.stat(self.certs_dir).st_dev
+        for candidate in ('/dev/shm', '/run', '/var/tmp', '/tmp', '/'):
+            try:
+                if (os.path.isdir(candidate)
+                        and os.access(candidate, os.W_OK)
+                        and os.stat(candidate).st_dev != certs_dev):
+                    path = tempfile.mkdtemp(prefix='cert-xdev-', dir=candidate)
+                    self.addCleanup(shutil.rmtree, path, True)
+                    return path
+            except OSError:
+                continue
+        self.skipTest('no writable directory on a second filesystem available')
 
     def test_haproxy_config_ok_follows_the_validator(self):
         self.assertEqual(self.call('haproxy_config_ok').returncode, 0)
         write(self.haproxy_cfg, GOOD_HAPROXY_CFG + BROKEN_TOKEN + '\n')
         self.assertNotEqual(self.call('haproxy_config_ok').returncode, 0)
 
-    def test_missing_openssl_warns_but_does_not_block(self):
-        """Best-effort layer: a missing checker must not stall renewals."""
-        fake_path = os.path.join(self.tmp, 'no-openssl-bin')
+    def _openssl_free_path(self, name):
+        """A PATH directory with the library's tools but no openssl.
+
+        Symlinks, so this directory must never be walked with a chmod that
+        follows them - see _cleanup_tmp().
+        """
+        fake_path = os.path.join(self.tmp, name)
         os.makedirs(fake_path)
         for tool in ('cat', 'grep', 'mktemp', 'mv', 'cp', 'rm', 'mkdir',
-                     'basename', 'dirname', 'find', 'date', 'chmod'):
+                     'basename', 'dirname', 'find', 'date', 'chmod', 'stat'):
             real = shutil.which(tool)
             if real:
                 os.symlink(real, os.path.join(fake_path, tool))
+        return fake_path
+
+    def test_missing_openssl_is_a_hard_failure(self):
+        """The pairing check is MANDATORY: no openssl, no publication.
+
+        This used to assert the opposite - that a missing openssl warns and
+        publishes anyway - justified by "the image does not necessarily install
+        the openssl CLI". The image does: openssl 3.x arrives with
+        ca-certificates, which certbot needs, and generate_self_signed_cert()
+        already runs `openssl req` with check=True at first-run setup. So the
+        fail-open never actually fired, and structural checks alone accept a
+        bundle of empty pem blocks (see test_empty_pem_blocks_are_rejected).
+        """
+        fake_path = self._openssl_free_path('no-openssl-bin')
         path = write(os.path.join(self.tmp, 'ok.pem'), NEW_BUNDLE)
 
         # bash by absolute path: the stripped PATH cannot resolve it.
@@ -583,29 +907,27 @@ class TestCertPublishLibrary(CertScriptFixture):
              '_', LIB, path],
             env=self.env(PATH=fake_path), capture_output=True, text=True)
 
-        self.assertEqual(result.returncode, 0,
-                         'a missing openssl blocked publication')
-        self.assertRegex(result.stdout + result.stderr,
-                         r'(?i)warning.*openssl',
-                         'the skipped pairing check was not announced loudly')
+        self.assert_rejected(result, 'openssl binary not found')
+        self.assertIn('REFUSING', result.stdout + result.stderr,
+                      'a broken image must be reported as a broken image')
 
-    def test_missing_openssl_still_rejects_a_structurally_broken_bundle(self):
-        fake_path = os.path.join(self.tmp, 'no-openssl-bin2')
-        os.makedirs(fake_path)
-        for tool in ('cat', 'grep', 'date'):
-            real = shutil.which(tool)
-            if real:
-                os.symlink(real, os.path.join(fake_path, tool))
-        path = write(os.path.join(self.tmp, 'nokey.pem'), TEST_CERT)
+    def test_missing_openssl_stops_a_publish_rather_than_weakening_it(self):
+        """cert_publish must inherit the refusal, and not touch the live pem."""
+        fake_path = self._openssl_free_path('no-openssl-bin2')
+        self.seed_previous_bundle()
+        before = read(self.live_pem)
 
-        # bash by absolute path: the stripped PATH cannot resolve it.
         result = subprocess.run(
-            [shutil.which('bash'), '-c', '. "$1"; cert_bundle_valid "$2"',
-             '_', LIB, path],
+            [shutil.which('bash'), '-c',
+             '. "$1"; cert_publish "$2" "$3" "$4"',
+             '_', LIB, self.src_cert, self.src_key, self.live_pem],
             env=self.env(PATH=fake_path), capture_output=True, text=True)
 
-        self.assertNotEqual(result.returncode, 0,
-                            'structural checks stopped being mandatory')
+        self.assert_rejected(result, 'openssl binary not found')
+        self.assertEqual(read(self.live_pem), before,
+                         'the live pem was disturbed by a refused publish')
+        self.assert_certs_dir_is_clean()
+        self.assert_no_staging_leftovers()
 
 
 class TestScriptsAreSane(unittest.TestCase):

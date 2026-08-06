@@ -50,6 +50,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -90,8 +91,25 @@ finally:
 logging.getLogger('haproxy_manager').setLevel(logging.CRITICAL)
 
 HAS_PUBLISHER = hasattr(hm, 'publish_pem_bundle')
-FIX_ONLY = unittest.skipUnless(
-    HAS_PUBLISHER, 'requires the certificate publishing fix (publish_pem_bundle)')
+
+# FIX_ONLY marks tests that can only run against a tree that HAS the fix, so
+# that pointing HAPROXY_MANAGER_DIR at a pre-fix checkout (how the bugs were
+# reproduced) skips them instead of erroring.
+#
+# It used to be `skipUnless(HAS_PUBLISHER, ...)` unconditionally, which is
+# tautological when testing THIS tree: rename or delete publish_pem_bundle and
+# 10 of the 17 tests silently skip themselves while the run still reports OK.
+# A guard that disappears when the thing it guards disappears is not a guard.
+# So the escape hatch is now tied to the thing it exists for - testing a
+# FOREIGN tree - and a missing publisher in the repo checkout is a hard
+# failure (see TestPublisherApiIsPresent).
+_REPO_ROOT = os.path.realpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+TESTING_FOREIGN_TREE = os.path.realpath(MODULE_DIR) != _REPO_ROOT
+FIX_ONLY = unittest.skipIf(
+    TESTING_FOREIGN_TREE and not HAS_PUBLISHER,
+    'HAPROXY_MANAGER_DIR points at a tree without the certificate publishing '
+    'fix (publish_pem_bundle)')
 NEEDS_OPENSSL = unittest.skipUnless(
     shutil.which('openssl'), 'needs the openssl CLI')
 
@@ -185,6 +203,14 @@ k49ABlblWHBsoUF63ka1PBrMgA==
 """
 
 GOOD_BUNDLE = LEAF_CERT + LEAF_KEY
+
+# What a bundle already on disk looks like when a test starts: the same, valid
+# material plus a trailing marker. Without it the "previous" and "new" bundles
+# are byte-identical, and a test that meant to prove a publish HAPPENED cannot
+# tell that from a publish that did nothing at all. Trailing text after the key
+# is ignored by both HAProxy and openssl, so the file stays genuinely usable.
+PREVIOUS_MARKER = '# previous bundle\n'
+PREVIOUS_BUNDLE = GOOD_BUNDLE + PREVIOUS_MARKER
 
 # Stub haproxy. Beyond the config check the parent suite's stub does, this one
 # also walks the crt directory the way HAProxy does when a `bind ... ssl crt
@@ -375,9 +401,9 @@ class CertPublishTestCase(unittest.TestCase):
             self.write(os.path.join(live, 'privkey.pem'), key)
         return live
 
-    def publish_live_bundle(self, domain):
+    def publish_live_bundle(self, domain, content=PREVIOUS_BUNDLE):
         """A good bundle already being served for `domain`."""
-        return self.write(os.path.join(self.certs, f'{domain}.pem'), GOOD_BUNDLE)
+        return self.write(os.path.join(self.certs, f'{domain}.pem'), content)
 
     def add_domain(self, domain, backend_name, ssl_cert_path=None):
         with sqlite3.connect(hm.DB_FILE) as conn:
@@ -478,19 +504,38 @@ class TestLivePemIsNeverTruncated(CertPublishTestCase):
         self.assertEqual('error', resp.get_json()['status'])
 
     def test_successful_renewal_still_publishes(self):
-        """The guard must not block the normal path."""
+        """The guard must not block the normal path.
+
+        The old version built its "renewed" certificate with a no-op
+        `.replace('\\n-----END CERTIFICATE-----', '\\n-----END CERTIFICATE-----')`,
+        so the renewed lineage was byte-identical to what was already being
+        served. Every assertion still passed if the renewal published nothing
+        at all - which is the failure this test is supposed to catch. The live
+        bundle now carries a marker the renewed material does not, so "the file
+        on disk changed" is an actual assertion.
+        """
         cert_path = self.publish_live_bundle('ok.example.com')
+        self.assertIn(PREVIOUS_MARKER, self.read(cert_path),
+                      'fixture precondition: the live bundle is distinguishable')
         self.add_domain('ok.example.com', 'ok_backend', ssl_cert_path=cert_path)
-        renewed = LEAF_CERT.replace('\n-----END CERTIFICATE-----',
-                                    '\n-----END CERTIFICATE-----')
-        self.make_lineage('ok.example.com', cert=renewed)
+        self.make_lineage('ok.example.com')
 
         resp = self.client.post('/api/certificates/renew')
 
         self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
-        self.assertTrue(structurally_valid(self.read(cert_path)))
+        published = self.read(cert_path)
+        self.assertEqual(GOOD_BUNDLE, published,
+                         'the renewed cert+key was not written to the live pem')
+        self.assertNotIn(PREVIOUS_MARKER, published,
+                         'the previous bundle is still on disk: the renewal '
+                         'published nothing')
+        self.assertTrue(structurally_valid(published))
         self.assertTrue(self.edge_would_start())
         self.assert_only_final_pems_in_certs_dir()
+        backup = os.path.join(hm.cert_backup_dir(), 'ok.example.com.pem')
+        self.assertTrue(os.path.exists(backup))
+        self.assertEqual(PREVIOUS_BUNDLE, self.read(backup),
+                         'the archived copy is not the bundle that was replaced')
 
 
 class TestOldCertificateIsNotDestroyedFirst(CertPublishTestCase):
@@ -658,11 +703,25 @@ class TestBundleValidation(CertPublishTestCase):
 
     @FIX_ONLY
     def test_staging_and_backups_live_outside_the_crt_directory(self):
-        """A temp or backup file inside the crt dir would be loaded by HAProxy."""
-        for path in (hm.cert_staging_dir(), hm.cert_backup_dir()):
+        """A temp or backup file inside the crt dir would be loaded by HAProxy.
+
+        `startswith(certs + os.sep)` alone let the worst case through: if
+        cert_staging_dir() returned the crt directory ITSELF - staging straight
+        into the directory HAProxy scans, the exact hazard this design exists
+        to prevent - the assertion passed, because the certs dir is not a
+        strict subpath of itself.
+        """
+        certs = os.path.realpath(self.certs)
+        for name, path in (('staging', hm.cert_staging_dir()),
+                           ('backup', hm.cert_backup_dir())):
+            real = os.path.realpath(path)
+            self.assertNotEqual(
+                certs, real,
+                f'the {name} directory IS the crt directory - HAProxy would '
+                f'load every temp/backup file in it')
             self.assertFalse(
-                os.path.abspath(path).startswith(os.path.abspath(self.certs) + os.sep),
-                f'{path} must not be inside {self.certs}')
+                real.startswith(certs + os.sep),
+                f'the {name} directory {path} must not be inside {self.certs}')
 
     @FIX_ONLY
     def test_previous_bundle_is_backed_up_on_publish(self):
@@ -700,18 +759,160 @@ class TestBundleValidation(CertPublishTestCase):
                          'file')
 
     @FIX_ONLY
+    @NEEDS_OPENSSL
     def test_no_temp_file_survives_a_failed_publish(self):
+        """The failure must happen AFTER something has been staged.
+
+        This used to feed publish_pem_bundle() an empty privkey, which is
+        rejected while reading the sources - before the staging directory is
+        even created. The test then asserted `[] == []` and proved nothing
+        about temp-file cleanup. A structurally perfect bundle whose key
+        belongs to a different certificate is rejected by the pairing check,
+        which runs on the fully staged file, so the temp definitely exists at
+        the moment the publish fails.
+        """
         dest = os.path.join(self.certs, 'leak.example.com.pem')
         cert = self.write(os.path.join(self.tmp, 'src4', 'fullchain.pem'),
                           LEAF_CERT)
-        empty = self.write(os.path.join(self.tmp, 'src4', 'privkey.pem'), '')
+        wrong = self.write(os.path.join(self.tmp, 'src4', 'privkey.pem'),
+                           UNRELATED_KEY)
         with self.assertRaises(hm.CertificatePublishError):
-            hm.publish_pem_bundle(dest, [cert, empty])
+            hm.publish_pem_bundle(dest, [cert, wrong])
+
+        staging = hm.cert_staging_dir()
+        self.assertTrue(os.path.isdir(staging),
+                        'the publish never got as far as staging, so this '
+                        'asserts nothing about cleanup')
+        self.assertEqual([], os.listdir(staging),
+                         'staged files must be cleaned up when a publish fails')
+        self.assertFalse(os.path.exists(dest),
+                         'a rejected bundle was published anyway')
         self.assert_only_final_pems_in_certs_dir()
-        self.assertEqual(
-            [], os.listdir(hm.cert_staging_dir()) if
-            os.path.isdir(hm.cert_staging_dir()) else [],
-            'staged files must be cleaned up when a publish fails')
+
+
+    @FIX_ONLY
+    @NEEDS_OPENSSL
+    def test_empty_pem_blocks_are_rejected(self):
+        """Why the pairing check may not be best-effort.
+
+        Structural validation is weak on its own: BEGIN/END pairs with nothing
+        between them satisfy every rule in validate_pem_structure(). Only
+        openssl can say this is not a certificate.
+        """
+        hollow = ('-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n'
+                  '-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n')
+        ok, _ = hm.validate_pem_structure(hollow)
+        self.assertTrue(ok, 'precondition: structure alone accepts this file')
+
+        path = self.write(os.path.join(self.tmp, 'hollow.pem'), hollow)
+        ok, msg = hm.validate_pem_bundle(path)
+        self.assertFalse(ok, 'a bundle of empty pem blocks was accepted')
+
+    @FIX_ONLY
+    def test_publish_refuses_when_the_pairing_check_cannot_run(self):
+        """No fail-open. 'unavailable' means the image is broken, not the cert.
+
+        The previous behaviour logged a warning and published on structural
+        checks alone, justified by "the Dockerfile does not install the openssl
+        CLI". It does - openssl 3.x comes in with ca-certificates, and
+        generate_self_signed_cert() shells out to `openssl req` with
+        check=True during setup - so this branch never fired and the fail-open
+        was safe only by accident.
+        """
+        real = hm._openssl_pairing_status
+        hm._openssl_pairing_status = lambda path: ('unavailable',
+                                                   'openssl binary not found')
+        self.addCleanup(setattr, hm, '_openssl_pairing_status', real)
+
+        dest = self.publish_live_bundle('nocheck.example.com')
+        before = self.read(dest)
+        cert = self.write(os.path.join(self.tmp, 'src5', 'fullchain.pem'),
+                          LEAF_CERT)
+        key = self.write(os.path.join(self.tmp, 'src5', 'privkey.pem'), LEAF_KEY)
+
+        with self.assertRaises(hm.CertificatePublishError):
+            hm.publish_pem_bundle(dest, [cert, key])
+
+        self.assertEqual(before, self.read(dest),
+                         'the live pem was disturbed by a refused publish')
+        self.assert_only_final_pems_in_certs_dir()
+
+    @FIX_ONLY
+    def test_binary_corrupt_live_bundle_can_still_be_republished(self):
+        """Republishing is how an operator heals a corrupt live pem.
+
+        A pem corrupted into binary (a partial write from before this fix, a
+        bad restore) is unreadable as text. backup_existing_pem() opens it in
+        text mode and caught only OSError, so the UnicodeDecodeError escaped
+        publish_pem_bundle() entirely: the single operation that would have put
+        a working certificate back blew up trying to archive the broken one.
+        The shell half recovers from this without complaint.
+        """
+        dest = os.path.join(self.certs, 'binary.example.com.pem')
+        with open(dest, 'wb') as fh:
+            fh.write(b'\x00\x01\x02\xfe\xff' * 128)
+        cert = self.write(os.path.join(self.tmp, 'src6', 'fullchain.pem'),
+                          LEAF_CERT)
+        key = self.write(os.path.join(self.tmp, 'src6', 'privkey.pem'), LEAF_KEY)
+
+        hm.publish_pem_bundle(dest, [cert, key])
+
+        self.assertEqual(GOOD_BUNDLE, self.read(dest),
+                         'a binary-corrupt live pem blocked its own repair')
+        self.assertTrue(self.edge_would_start())
+
+    @FIX_ONLY
+    def test_published_pem_file_mode(self):
+        """Publishing must not silently re-permission a private key.
+
+        The staged file is created by mkstemp at 0600; without the explicit
+        mode copy in write_config_atomically() every publish would tighten a
+        0644 bundle, and a future change in the other direction would loosen
+        one. Neither is a decision a write-safety fix gets to make as a side
+        effect, so pin it.
+        """
+        cert = self.write(os.path.join(self.tmp, 'src7', 'fullchain.pem'),
+                          LEAF_CERT)
+        key = self.write(os.path.join(self.tmp, 'src7', 'privkey.pem'), LEAF_KEY)
+
+        for mode in (0o644, 0o640, 0o600):
+            with self.subTest(oct(mode)):
+                dest = self.publish_live_bundle(f'mode{mode:o}.example.com')
+                os.chmod(dest, mode)
+                hm.publish_pem_bundle(dest, [cert, key])
+                self.assertEqual(mode,
+                                 stat.S_IMODE(os.stat(dest).st_mode),
+                                 'publishing changed who can read the key')
+
+        fresh = os.path.join(self.certs, 'fresh.example.com.pem')
+        hm.publish_pem_bundle(fresh, [cert, key])
+        fresh_mode = stat.S_IMODE(os.stat(fresh).st_mode)
+        self.assertEqual(0o644, fresh_mode,
+                         'a newly created bundle should match the 0644 that '
+                         '`cat > file` produced under the standard umask')
+        self.assertEqual(0, fresh_mode & 0o022,
+                         'a private key must never be group/world writable')
+
+
+@unittest.skipIf(TESTING_FOREIGN_TREE,
+                 'HAPROXY_MANAGER_DIR points at another tree')
+class TestPublisherApiIsPresent(unittest.TestCase):
+    """FIX_ONLY must never be able to hide the fix going missing.
+
+    With `FIX_ONLY = skipUnless(hasattr(hm, 'publish_pem_bundle'))`, renaming
+    that one function turned 10 of these 17 tests into skips and the run still
+    printed OK. This class fails loudly instead.
+    """
+
+    def test_publisher_api_is_present(self):
+        for name in ('publish_pem_bundle', 'validate_pem_bundle',
+                     'validate_pem_structure', 'backup_existing_pem',
+                     'cert_staging_dir', 'cert_backup_dir',
+                     'CertificatePublishError', '_openssl_pairing_status'):
+            self.assertTrue(
+                hasattr(hm, name),
+                f'haproxy_manager.{name} is gone - the tests that exercise it '
+                f'would otherwise skip themselves and report OK')
 
 
 class TestClusterSecretSelfHeal(CertPublishTestCase):
