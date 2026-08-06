@@ -1853,8 +1853,12 @@ def generate_config():
         )
         config_parts.append(default_headers)
 
-        # Update blocked IPs map file first
-        update_blocked_ips_map()
+        # Update blocked IPs map file first. promote_backup=False: the rollback
+        # snapshot was taken a few lines above and this map is part of the
+        # not-yet-validated change, so refreshing the backup copy here would
+        # overwrite the bytes rollback needs - the same class of bug as backing
+        # up after the write.
+        update_blocked_ips_map(promote_backup=False)
 
         # Add Listener Block
         listener_block = template_env.get_template('hap_listener.tpl').render(
@@ -2287,7 +2291,19 @@ def validate_config_file(config_path):
 
 
 def validate_haproxy_config():
-    """Validate the live HAProxy configuration file. Returns (is_valid, error)."""
+    """Validate the live HAProxy configuration file. Returns (is_valid, error).
+
+    NOTE the invalid/unavailable distinction validate_config_file() draws does
+    NOT survive here: this returns a bare bool, so a validator that could not
+    run is reported the same as a rejected config and the reload path rolls
+    back, logging "Config validation failed". That is deliberate - without a
+    working validator we cannot claim the new config is safe, and the reload
+    path is the one place where guessing wrong takes the edge down. The
+    distinction is only acted on inside create_backup(), where treating
+    "cannot check" as "bad" would mean refusing to keep any rollback target at
+    all. (The 2026-08 commit message said flatly that "a missing haproxy binary
+    is not read as a bad config"; that is true of create_backup() only.)
+    """
     status, message = validate_config_file(HAPROXY_CONFIG_PATH)
     if status == 'valid':
         logger.info("HAProxy configuration validation passed")
@@ -2399,12 +2415,89 @@ def reload_haproxy_safely(backup_status=None):
                 logger.error(error_msg)
                 return False, error_msg
     except Exception as e:
+        # KNOWN GAP (pre-existing, unchanged by the 2026-08 backup-ordering
+        # fix): this outer handler does NOT roll back. The window is narrow -
+        # everything after the validation gate has its own handler - but an
+        # exception raised between the gate and those handlers leaves the new
+        # config on disk. Left as-is deliberately; rolling back from here would
+        # also undo changes that had in fact loaded.
         error_msg = f"Critical error in reload process: {e}"
         logger.error(error_msg)
         return False, error_msg
 
-def update_blocked_ips_map():
-    """Update the blocked IPs map file from database"""
+def _blocked_ips_map_is_wellformed(path):
+    """True if every key in a blocked-IPs map is one HAProxy will parse.
+
+    map_ip() rejects the ENTIRE configuration if a single key is not an IP or
+    CIDR ("'198.51.10' is not a valid IPv4 or IPv6 address at line 2 of file
+    ..."), so this is the property that decides whether the file is safe to
+    record as a rollback target. Pure Python over a small file - deliberately
+    not another `haproxy -c`, which is the cost this check exists to avoid.
+    """
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                ipaddress.ip_network(line.split()[0], strict=False)
+    except (OSError, ValueError, IndexError):
+        return False
+    return True
+
+
+def _promote_blocked_ips_map_to_backup():
+    """Keep blocked_ips.map.backup in step with the map just written.
+
+    The /api/blocked-ips routes call update_blocked_ips_map() OUTSIDE
+    generate_config(): the map write IS the whole change there, published
+    against a config HAProxy is already running. Without promoting it, the live
+    map drifts from its backup, create_backup() misses its fast path on the
+    NEXT config change, and an edge that blocks IPs automatically (this fleet
+    does) pays an extra `haproxy -c` on the following customer-facing domain
+    add - permanently, since every block re-opens the drift.
+
+    Guarded twice:
+      * a config backup set must already exist - never fabricate a rollback
+        target out of nothing (see restore_backup()); and
+      * the map must be well-formed, so promoting it cannot leave a "rollback
+        target" HAProxy refuses to load. That would be this module's own bug
+        on a different file.
+    When either fails we leave the older backup map alone and the next
+    create_backup() takes the slow, `haproxy -c`-validated path - i.e. the
+    behaviour before this function existed. Nothing here can lose data.
+
+    Note the map is promoted after the write rather than after the caller's
+    reload: the routes only warn on a failed reload and carry on, so there is
+    no reload result to gate on. A well-formed map that HAProxy has not loaded
+    yet is still a loadable rollback target, which is the guarantee that
+    matters.
+    """
+    if not os.path.exists(HAPROXY_BACKUP_PATH):
+        return False
+    if not _blocked_ips_map_is_wellformed(BLOCKED_IPS_MAP_PATH):
+        logger.warning(
+            f"Not recording {BLOCKED_IPS_MAP_PATH} as known-good: it contains "
+            "an entry HAProxy cannot parse, which would make the whole "
+            "configuration invalid. Keeping the previous backup map."
+        )
+        return False
+    try:
+        shutil.copy2(BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH)
+        return True
+    except OSError as e:
+        logger.warning(f"Could not update the backup blocked IPs map: {e}")
+        return False
+
+
+def update_blocked_ips_map(promote_backup=True):
+    """Update the blocked IPs map file from database.
+
+    promote_backup=False is for callers that are in the middle of an
+    unvalidated configuration change - generate_config() has already taken the
+    rollback snapshot by the time it gets here, so refreshing the backup map
+    would overwrite the very bytes rollback needs.
+    """
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -2415,9 +2508,19 @@ def update_blocked_ips_map():
         # For IP blocking, we use: <ip_or_cidr> 1
         # This allows map_ip() to work with both single IPs and CIDR ranges
         os.makedirs(os.path.dirname(BLOCKED_IPS_MAP_PATH), exist_ok=True)
-        with open(BLOCKED_IPS_MAP_PATH, 'w') as f:
-            for ip in blocked_ips:
-                f.write(f"{ip} 1\n")
+        # Atomically, for the same reason haproxy.cfg is: `haproxy -c` LOADS
+        # this file (hap_listener.tpl matches on
+        # map_ip(/etc/haproxy/blocked_ips.map,0)), and a half-written final
+        # line is a FATAL config error rather than one dropped entry - verified
+        # against HAProxy 2.8. A truncated map is therefore exactly the failure
+        # this module's backup ordering exists to prevent, on a different file.
+        write_config_atomically(
+            BLOCKED_IPS_MAP_PATH,
+            ''.join(f"{ip} 1\n" for ip in blocked_ips)
+        )
+
+        if promote_backup:
+            _promote_blocked_ips_map_to_backup()
 
         logger.info(f"Updated blocked IPs map file with {len(blocked_ips)} IPs")
         return True

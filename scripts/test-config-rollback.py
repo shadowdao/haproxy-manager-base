@@ -31,8 +31,10 @@ __BROKEN__, which is how the tests inject an invalid configuration.
 """
 
 import os
+import re
 import sys
 import shutil
+import inspect
 import sqlite3
 import logging
 import tempfile
@@ -412,12 +414,79 @@ class TestBackupPrimitives(RollbackTestCase):
         self.assertEqual(self.read(hm.HAPROXY_BACKUP_PATH), good)
 
     def test_backup_set_covers_every_file_generate_config_writes(self):
-        pairs = dict(hm._config_backup_pairs())
-        for path in (hm.HAPROXY_CONFIG_PATH, hm.BLOCKED_IPS_MAP_PATH,
-                     hm.CORAZA_SPOE_CONFIG_PATH):
-            self.assertIn(path, pairs,
-                          f'{path} is written by generate_config() but is not '
-                          'part of the backed-up config set')
+        """Derived, not restated.
+
+        An earlier version of this test listed the three files it expected and
+        checked they were in the backup set, so it could never have noticed a
+        FOURTH file being added. Here the set of files generate_config() writes
+        is observed (and, for env-gated branches this fixture cannot safely
+        execute, read out of the source), and anything not backed up has to be
+        on the documented exclusion list below.
+        """
+        # Written by generate_config() but deliberately NOT restorable, with
+        # the reason. Everything else must be in the backup set: `haproxy -c`
+        # validates the config as a set, so a file it loads that is not
+        # restored alongside haproxy.cfg breaks rollback.
+        excluded = {
+            # Only ever created empty-when-missing (haproxy refuses to start
+            # with an ACL -f pointing at a missing file); its contents are
+            # owned by the /suspended API, not by generate_config(), so there
+            # is nothing here for a config rollback to undo.
+            'suspended_domains.list',
+            # Generated once and then read, never rewritten with new content.
+            # Its value is rendered INTO haproxy.cfg, so restoring an older
+            # haproxy.cfg alongside the current secret file is consistent.
+            'cluster-secret',
+        }
+        backed_up = {os.path.basename(p) for p, _ in hm._config_backup_pairs()}
+
+        # 1. Observed: run a generation with every patchable optional branch on
+        #    and see what actually changed on disk.
+        self.add_domain('derive.example.com', 'derive_backend')
+        os.environ['HAPROXY_CORAZA_SPOE_BACKEND'] = '127.0.0.1:9000'
+        self.addCleanup(os.environ.pop, 'HAPROXY_CORAZA_SPOE_BACKEND', None)
+        before = self._snapshot_etc()
+        hm.generate_config()
+        after = self._snapshot_etc()
+        touched = {name for name, blob in after.items()
+                   if before.get(name) != blob}
+        self.assertIn('coraza-spoe.cfg', touched,
+                      'fixture precondition: the Coraza branch did not run')
+
+        # 2. Read out of the source: branches this fixture must not execute
+        #    (suspension writes a hardcoded /etc/haproxy path that no test
+        #    global can redirect) still have to be accounted for.
+        touched |= {
+            os.path.basename(m)
+            for m in re.findall(r"'(/etc/haproxy/[\w.+-]+)'",
+                                inspect.getsource(hm.generate_config))
+        }
+
+        unaccounted = touched - backed_up - excluded
+        self.assertEqual(
+            unaccounted, set(),
+            f'generate_config() writes {sorted(unaccounted)}, which is neither '
+            'in the backup set nor on the documented exclusion list - a '
+            'rollback would restore a mixed-vintage config set')
+
+    def _snapshot_etc(self):
+        """Contents of every plain file in the fake /etc/haproxy.
+
+        Skips the backup halves (they are the thing being maintained), the
+        SQLite database and its journals, and the stats socket.
+        """
+        skip_prefixes = (os.path.basename(hm.DB_FILE),
+                         os.path.basename(hm.HAPROXY_SOCKET_PATH))
+        state = {}
+        for name in os.listdir(self.etc):
+            path = os.path.join(self.etc, name)
+            if not os.path.isfile(path) or name.endswith('.backup'):
+                continue
+            if name.startswith(skip_prefixes):
+                continue
+            with open(path, 'rb') as fh:
+                state[name] = fh.read()
+        return state
 
     def test_coraza_spoe_config_round_trips(self):
         self.generate_good_config()
@@ -452,14 +521,253 @@ class TestAtomicWrite(RollbackTestCase):
             fh.write('old content\n')
 
         # Anything that makes f.write() blow up mid-flight stands in for a full
-        # disk / killed container.
-        with self.assertRaises(Exception):
+        # disk / killed container. TypeError specifically, not Exception: a
+        # bare assertRaises(Exception) also swallows the AttributeError raised
+        # when write_config_atomically does not exist at all, so this test
+        # passed against the pre-fix tree and would keep passing if the
+        # function were deleted.
+        with self.assertRaises(TypeError):
             hm.write_config_atomically(path, object())
 
         self.assertEqual(self.read(path), 'old content\n',
                          'a failed write clobbered the previous config')
         leftovers = [n for n in os.listdir(self.etc) if n.endswith('.tmp')]
         self.assertEqual(leftovers, [], f'temp files left behind: {leftovers}')
+
+
+class TestBackupFailureGuard(RollbackTestCase):
+    """generate_config() refuses to write when no rollback target could be taken."""
+
+    def test_a_failed_backup_stops_the_config_from_being_written(self):
+        good = self.generate_good_config()
+        self.block_ip('192.0.2.10')
+        hm.update_blocked_ips_map()
+        good_map = self.read(hm.BLOCKED_IPS_MAP_PATH)
+
+        real_create_backup = hm.create_backup
+        hm.create_backup = lambda *a, **kw: (False, 'error')
+        self.addCleanup(setattr, hm, 'create_backup', real_create_backup)
+
+        self.add_domain('second.example.com', 'second_backend', '10.0.0.3')
+        with self.assertRaises(Exception) as ctx:
+            hm.generate_config()
+
+        self.assertIn('Refusing to regenerate', str(ctx.exception),
+                      'a backup failure was not reported as a refusal')
+        self.assertEqual(
+            self.read(hm.HAPROXY_CONFIG_PATH), good,
+            'a new config was written even though the snapshot failed - a bad '
+            'change could not have been rolled back')
+        self.assertEqual(
+            self.read(hm.BLOCKED_IPS_MAP_PATH), good_map,
+            'the blocked IPs map was rewritten even though the snapshot failed')
+
+
+class TestValidatorAvailability(RollbackTestCase):
+    """'the validator could not run' is not the same as 'the config is bad'."""
+
+    def _hide_the_haproxy_binary(self):
+        empty = os.path.join(self.tmp, 'empty-bin')
+        os.makedirs(empty, exist_ok=True)
+        os.environ['PATH'] = empty
+        # setUp's cleanup restores the original PATH.
+
+    def test_a_missing_validator_is_unavailable_not_invalid(self):
+        good = self.generate_good_config()
+        self._hide_the_haproxy_binary()
+
+        status, message = hm.validate_config_file(hm.HAPROXY_CONFIG_PATH)
+        self.assertEqual(status, 'unavailable',
+                         'a validator that could not run was reported as a '
+                         f'verdict on the config ({status}: {message})')
+
+        # And the consequence create_backup() draws from it: a config it could
+        # not check is still snapshotted, because refusing would leave the box
+        # with no rollback target at all. Contrast
+        # test_a_broken_current_config_does_not_replace_a_good_backup, where a
+        # real 'invalid' verdict yields 'kept_previous'.
+        with open(hm.HAPROXY_CONFIG_PATH, 'w') as fh:
+            fh.write('hand written, unverifiable\n')
+        ok, status = hm.create_backup()
+        self.assertTrue(ok)
+        self.assertEqual(status, 'created',
+                         'an unverifiable config was treated as a rejected one')
+        self.assertEqual(self.read(hm.HAPROXY_BACKUP_PATH),
+                         'hand written, unverifiable\n')
+        self.assertNotEqual(self.read(hm.HAPROXY_BACKUP_PATH), good)
+
+
+class TestFileComparison(RollbackTestCase):
+    """The fast path compares bytes, not sizes."""
+
+    def test_same_size_different_content_is_not_identical(self):
+        a = os.path.join(self.etc, 'a')
+        b = os.path.join(self.etc, 'b')
+        with open(a, 'w') as fh:
+            fh.write('aaaa\n')
+        with open(b, 'w') as fh:
+            fh.write('aaba\n')
+        self.assertEqual(os.path.getsize(a), os.path.getsize(b),
+                         'fixture: the two files must be the same size')
+        self.assertFalse(hm._files_identical(a, b),
+                         'two same-size files with different bytes compared equal')
+
+    def test_a_same_size_drifted_config_still_hits_the_validation_gate(self):
+        """The case the byte-compare exists for.
+
+        A config edited in place without changing its length (one character
+        swapped, a hostname replaced by another of the same width) must not be
+        mistaken for the known-good backup and waved through.
+        """
+        good = self.generate_good_config()
+        # Sized in BYTES, not characters: the rendered config contains
+        # non-ASCII (em dashes in template comments), so len(str) would be
+        # smaller than the file and this test would pass for the wrong reason.
+        size = os.path.getsize(hm.HAPROXY_CONFIG_PATH)
+        broken = f'# {BROKEN_TOKEN}\n'.encode()
+        broken += b'#' * (size - len(broken) - 1) + b'\n'
+        with open(hm.HAPROXY_CONFIG_PATH, 'wb') as fh:
+            fh.write(broken)
+        self.assertEqual(os.path.getsize(hm.HAPROXY_CONFIG_PATH), size,
+                         'fixture: the drifted config must be the same size')
+
+        ok, status = hm.create_backup()
+        self.assertTrue(ok)
+        self.assertEqual(
+            status, 'kept_previous',
+            'a same-size broken config was accepted as unchanged and skipped '
+            'the validation gate')
+        self.assertEqual(self.read(hm.HAPROXY_BACKUP_PATH), good,
+                         'the known-good backup was overwritten')
+
+
+class TestBlockedIpsMapWrites(RollbackTestCase):
+    """blocked_ips.map is loaded by `haproxy -c`, so it gets the same care.
+
+    Verified against HAProxy 2.8: with the map referenced by
+    map_ip(/etc/haproxy/blocked_ips.map,0), a half-written final line makes the
+    WHOLE configuration invalid ("'198.51.10' is not a valid IPv4 or IPv6
+    address at line 2 of file ..."), not merely a dropped entry.
+    """
+
+    def test_the_map_goes_through_the_atomic_writer(self):
+        seen = []
+        real_write = hm.write_config_atomically
+
+        def spy(path, content, *args, **kwargs):
+            seen.append(path)
+            return real_write(path, content, *args, **kwargs)
+
+        hm.write_config_atomically = spy
+        self.addCleanup(setattr, hm, 'write_config_atomically', real_write)
+
+        self.block_ip('192.0.2.10')
+        self.assertTrue(hm.update_blocked_ips_map())
+        self.assertIn(hm.BLOCKED_IPS_MAP_PATH, seen,
+                      'the blocked IPs map was written without the atomic '
+                      'writer - a truncated map is a fatal config')
+
+    def test_a_crash_before_the_rename_leaves_the_old_map_intact(self):
+        self.block_ip('192.0.2.10')
+        hm.update_blocked_ips_map()
+        good_map = self.read(hm.BLOCKED_IPS_MAP_PATH)
+
+        real_replace = os.replace
+
+        def boom(src, dst, *args, **kwargs):
+            if dst == hm.BLOCKED_IPS_MAP_PATH:
+                raise OSError('simulated crash between write and rename')
+            return real_replace(src, dst, *args, **kwargs)
+
+        os.replace = boom
+        self.addCleanup(setattr, os, 'replace', real_replace)
+
+        self.block_ip('198.51.100.20')
+        self.assertFalse(hm.update_blocked_ips_map(),
+                         'a failed map write was reported as success')
+        os.replace = real_replace
+
+        self.assertEqual(
+            self.read(hm.BLOCKED_IPS_MAP_PATH), good_map,
+            'an interrupted map write clobbered the map HAProxy is running')
+        leftovers = [n for n in os.listdir(self.etc) if n.endswith('.tmp')]
+        self.assertEqual(leftovers, [], f'temp files left behind: {leftovers}')
+
+    def test_a_malformed_map_is_not_recorded_as_known_good(self):
+        """The map backup must stay something HAProxy would actually load."""
+        self.generate_good_config()
+        good_map = self.read(hm.BLOCKED_IPS_MAP_BACKUP_PATH)
+
+        # Straight into the table, the way a bad row gets there in the first
+        # place - the API route is not the only writer.
+        self.block_ip('not-an-ip')
+        hm.update_blocked_ips_map()
+
+        self.assertEqual(
+            self.read(hm.BLOCKED_IPS_MAP_BACKUP_PATH), good_map,
+            'a map HAProxy cannot parse was promoted to the rollback target')
+
+    def test_no_map_backup_is_fabricated_before_a_config_exists(self):
+        """Nothing to stay in step with means nothing to write."""
+        self.block_ip('192.0.2.10')
+        self.assertTrue(hm.update_blocked_ips_map())
+        self.assertFalse(
+            os.path.exists(hm.BLOCKED_IPS_MAP_BACKUP_PATH),
+            'a rollback target was invented out of a map write alone')
+
+
+class TestValidationCost(RollbackTestCase):
+    """`haproxy -c` runs are the customer-facing cost of a config change.
+
+    generate_config() runs synchronously inside the API call that adds a
+    domain, and on an edge with hundreds of certificates `haproxy -c` is the
+    expensive part. These counts are the contract; changing them should be a
+    deliberate decision, not a side effect.
+    """
+
+    def _count_validations(self, action):
+        calls = []
+        real_validate = hm.validate_config_file
+
+        def spy(path):
+            calls.append(path)
+            return real_validate(path)
+
+        hm.validate_config_file = spy
+        try:
+            action()
+        finally:
+            hm.validate_config_file = real_validate
+        return len(calls)
+
+    def test_blocking_an_ip_does_not_add_a_validation_to_the_next_change(self):
+        self.generate_good_config()
+
+        def add(domain, backend, address):
+            self.add_domain(domain, backend, address)
+            hm.generate_config()
+
+        steady = self._count_validations(
+            lambda: add('a.example.com', 'a_backend', '10.0.0.4'))
+        self.assertEqual(
+            steady, 1,
+            'a steady-state config change should cost exactly one `haproxy -c` '
+            '(the pre-reload gate); the known-good fast path should skip the '
+            f'other one, but {steady} ran')
+
+        # What POST /api/blocked-ips does: rewrite the map outside
+        # generate_config(). This fleet blocks IPs automatically, so it happens
+        # between most config changes.
+        self.block_ip('192.0.2.10')
+        hm.update_blocked_ips_map()
+
+        after_block = self._count_validations(
+            lambda: add('b.example.com', 'b_backend', '10.0.0.5'))
+        self.assertEqual(
+            after_block, steady,
+            'an IP block left the map out of step with its backup, so the next '
+            f'domain add paid {after_block} `haproxy -c` runs instead of '
+            f'{steady} - on the customer-facing call')
 
 
 if __name__ == '__main__':
