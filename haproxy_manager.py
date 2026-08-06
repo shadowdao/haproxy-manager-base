@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import json
 import ipaddress
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -105,7 +106,19 @@ HAPROXY_CONFIG_PATH = '/etc/haproxy/haproxy.cfg'
 HAPROXY_BACKUP_PATH = '/etc/haproxy/haproxy.cfg.backup'
 BLOCKED_IPS_MAP_PATH = '/etc/haproxy/blocked_ips.map'
 BLOCKED_IPS_MAP_BACKUP_PATH = '/etc/haproxy/blocked_ips.map.backup'
+# Coraza SPOE engine file. `haproxy -c` parses this too (the frontend's
+# `filter spoe engine coraza config <path>` line points at it), so it is part
+# of the same restorable config set as haproxy.cfg — rolling back haproxy.cfg
+# while leaving a broken coraza-spoe.cfg behind still fails validation.
+CORAZA_SPOE_CONFIG_PATH = '/etc/haproxy/coraza-spoe.cfg'
+CORAZA_SPOE_BACKUP_PATH = '/etc/haproxy/coraza-spoe.cfg.backup'
 HAPROXY_SOCKET_PATH = '/var/run/haproxy.sock'
+# HAProxy loads this path as a DIRECTORY (`bind ... ssl crt /etc/haproxy/certs`),
+# which means it tries to load EVERY file it finds in here. Nothing but final,
+# validated `<name>.pem` bundles may ever exist in this directory - no temp
+# files, no `.backup` copies. Staging and backups live in the sibling
+# directories below, on the same filesystem so os.replace() stays atomic.
+# See publish_pem_bundle().
 SSL_CERTS_DIR = '/etc/haproxy/certs'
 # Stable per-host secret for QUIC Retry/address-validation tokens. Lives in the
 # /etc/haproxy named volume so it survives container recreates; self-healed on
@@ -302,6 +315,340 @@ def find_certbot_live_dir(base_domain):
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[0][0]
 
+# ---------------------------------------------------------------------------
+# Certificate publishing
+# ---------------------------------------------------------------------------
+# Until 2026-08 every code path that refreshed a combined PEM did this:
+#
+#     with open(combined_path, 'w') as combined:            # TRUNCATES the file
+#         subprocess.run(['cat', cert, key], stdout=combined)   # rc ignored
+#
+# `combined_path` is the live bundle HAProxy is serving. open(...,'w') empties
+# it BEFORE a single byte of source material has been read, and the `cat` exit
+# status was never checked. Any failure in between - source unreadable, disk
+# full, container killed, certbot lineage half-written - left a truncated or
+# key-less PEM in place. HAProxy loads /etc/haproxy/certs as a directory, so one
+# unusable file there fails the whole `bind ... ssl crt` and takes down HTTPS
+# for every site on the host. Unlike a bad haproxy.cfg this is NOT recoverable
+# by config rollback, and re-issuing hits Let's Encrypt rate limits.
+#
+# Everything below exists to make publishing a bundle all-or-nothing:
+#   assemble in a staging dir -> validate -> back up the old one -> os.replace()
+# The live file is only ever swapped for a complete, validated replacement.
+
+
+class CertificatePublishError(Exception):
+    """A certificate bundle could not be published. The live PEM is untouched."""
+
+
+def _cert_sibling_dir(name):
+    """A directory next to SSL_CERTS_DIR (NOT inside it).
+
+    HAProxy loads SSL_CERTS_DIR as a crt directory and tries to load every file
+    in it, so staging and backup copies must live outside. Siblings share the
+    /etc/haproxy filesystem, which is what keeps os.replace() atomic.
+
+    Derived at call time so tests that repoint SSL_CERTS_DIR get matching
+    staging/backup dirs, the same pattern as _config_backup_pairs().
+    """
+    parent = os.path.dirname(SSL_CERTS_DIR.rstrip('/')) or '/'
+    return os.path.join(parent, name)
+
+
+def cert_staging_dir():
+    """Directory where bundles are assembled and validated before publishing."""
+    return _cert_sibling_dir('cert-staging')
+
+
+def cert_backup_dir():
+    """Directory holding the previous copy of each published bundle.
+
+    Mirrors the config backup on the parent branch (one `.backup` alongside
+    haproxy.cfg): one copy per cert, overwritten on each successful publish, so
+    an operator always has a manual path back to the bundle that was being
+    served before the last change.
+    """
+    return _cert_sibling_dir('cert-backups')
+
+
+# ENCRYPTED PRIVATE KEY is deliberately absent: HAProxy cannot use a
+# passphrase-protected key from a crt file, so a bundle containing one is not
+# publishable, and the structural layer is the only layer that names the
+# problem ("no complete private key block") rather than reporting it as an
+# unreadable key.
+_PEM_KEY_LABELS = ('PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY')
+
+
+def _pem_labels(text):
+    """Labels of well-formed PEM blocks in text, in order.
+
+    A block counts only if its BEGIN line is followed by the matching END line,
+    so a bundle truncated in the middle of a block yields no label for it -
+    which is exactly the corruption we are guarding against.
+    """
+    labels = []
+    open_label = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('-----BEGIN ') and line.endswith('-----'):
+            open_label = line[len('-----BEGIN '):-len('-----')].strip()
+        elif line.startswith('-----END ') and line.endswith('-----'):
+            end_label = line[len('-----END '):-len('-----')].strip()
+            if open_label is not None and end_label == open_label:
+                labels.append(end_label)
+            open_label = None
+    return labels
+
+
+def validate_pem_structure(text):
+    """Structural check on an assembled bundle. Returns (ok, message).
+
+    Pure Python and therefore ALWAYS available - it can never be skipped for
+    lack of a tool. It catches every failure mode the truncation bug produced:
+    empty file, certificate without a key, key without a certificate, and a
+    block cut off mid-write.
+
+    It is NOT sufficient on its own, which is why _openssl_pairing_status() is
+    mandatory rather than best-effort: a bundle of EMPTY pem blocks (a BEGIN
+    line immediately followed by its END line, no base64 between them) passes
+    every check here and is rejected only by openssl.
+    """
+    if not text.strip():
+        return False, 'bundle is empty'
+    labels = _pem_labels(text)
+    if not labels:
+        return False, 'bundle contains no complete PEM block (truncated?)'
+    if 'CERTIFICATE' not in labels:
+        return False, 'bundle contains no complete CERTIFICATE block'
+    if not any(label in _PEM_KEY_LABELS for label in labels):
+        return False, 'bundle contains no complete private key block'
+    return True, None
+
+
+def _openssl_pairing_status(path):
+    """Does the private key in `path` match the leaf certificate in `path`?
+
+    Returns (status, message) with status 'valid' | 'invalid' | 'unavailable'.
+
+    `openssl x509` reads the FIRST certificate in the file (our bundles are
+    fullchain-then-key, so that is the leaf) and `openssl pkey` scans past the
+    certificate blocks to the first private key, so both run against the
+    assembled bundle directly. Comparing the two public keys proves the pair.
+
+    'unavailable' means the openssl BINARY is absent - a verdict about our
+    tooling, not about the bundle. validate_pem_bundle() treats it as a HARD
+    FAILURE.
+
+    That is a deliberate reversal. This docstring used to say "the Dockerfile
+    installs haproxy, certbot, socat and curl but not the openssl CLI, so this
+    is a real possibility", and callers accepted the bundle on the structural
+    checks alone. The premise is false: openssl 3.x IS in the image, as a
+    dependency of ca-certificates (which certbot requires), and
+    generate_self_signed_cert() below already runs `openssl req` with
+    check=True during first-run setup - so no container has ever reached a
+    publish without it. The 'unavailable' branch never fired, which means the
+    pairing check has in fact always run, and THAT is what made the fail-open
+    harmless - not the stated reasoning. Structural validation on its own is
+    weak: a bundle of empty pem blocks passes validate_pem_structure() and is
+    caught only here.
+
+    So an absent openssl now means the image is broken, and we say so and stop
+    instead of quietly downgrading to the weaker check. The cost is that a
+    hypothetical openssl-less image stops publishing renewals - but it does so
+    immediately and loudly, in the monitored error log, at the first renewal,
+    rather than 90 days later; and publishing an unverified bundle can take the
+    whole :443 bind, i.e. every site on the host, down at the next reload.
+
+    There is no python `cryptography` fallback on purpose: this process runs on
+    /usr/local/bin/python3 (the base image's 3.12), where cryptography is not
+    importable. It is installed for Debian's /usr/bin/python3 as a certbot
+    dependency, and reaching for that interpreter would be a second unverified
+    premise of exactly the kind this comment is correcting.
+    """
+    try:
+        cert_pub = subprocess.run(
+            ['openssl', 'x509', '-in', path, '-noout', '-pubkey'],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return 'unavailable', 'openssl binary not found'
+    except Exception as e:
+        return 'unavailable', f'could not run openssl: {e}'
+    if cert_pub.returncode != 0:
+        return 'invalid', ('leaf certificate is unreadable: '
+                           f'{(cert_pub.stderr or "").strip()[:200]}')
+    try:
+        # -passin pass: plus a closed stdin so an (unexpected) encrypted key
+        # fails fast instead of blocking on a passphrase prompt.
+        key_pub = subprocess.run(
+            ['openssl', 'pkey', '-in', path, '-pubout', '-passin', 'pass:'],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return 'unavailable', 'openssl binary not found'
+    except Exception as e:
+        return 'unavailable', f'could not run openssl: {e}'
+    if key_pub.returncode != 0:
+        return 'invalid', ('private key is unreadable: '
+                           f'{(key_pub.stderr or "").strip()[:200]}')
+    if cert_pub.stdout.strip() != key_pub.stdout.strip():
+        return 'invalid', 'private key does not match the leaf certificate'
+    return 'valid', None
+
+
+def validate_pem_bundle(path):
+    """Validate a bundle file on disk. Returns (ok, message).
+
+    Structural validation AND the cryptographic pairing check, both mandatory -
+    see _openssl_pairing_status() for why a missing openssl is a failure rather
+    than a downgrade to structure-only.
+    """
+    try:
+        with open(path, 'r') as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError, not just OSError: a bundle corrupted into binary
+        # is unreadable as text but reads perfectly well as bytes, so `except
+        # OSError` let the decode error escape as an unhandled traceback.
+        return False, f'cannot read assembled bundle: {e}'
+
+    ok, msg = validate_pem_structure(text)
+    if not ok:
+        return False, msg
+
+    status, pair_msg = _openssl_pairing_status(path)
+    if status == 'invalid':
+        return False, pair_msg
+    if status == 'unavailable':
+        logger.error(
+            "Certificate key/leaf pairing check could not run for %s (%s) - "
+            "REFUSING to publish. openssl is required; structural validation "
+            "alone cannot tell a real bundle from empty pem blocks.",
+            path, pair_msg)
+        return False, (f'cert/key pairing check unavailable ({pair_msg}); '
+                       'refusing to publish on structural checks alone')
+    return True, None
+
+
+def backup_existing_pem(dest_path):
+    """Copy the currently published bundle aside before it is replaced.
+
+    Only a bundle that still validates is promoted to backup: overwriting a
+    good backup with an already-corrupt live file would turn "restore the
+    backup" into "restore different garbage". Same require_valid reasoning as
+    create_backup() for haproxy.cfg.
+
+    Never fatal - failing to take a backup must not stop us replacing a cert
+    with a validated one - but always logged.
+    """
+    if not os.path.exists(dest_path):
+        return None
+    try:
+        with open(dest_path, 'r') as fh:
+            ok, msg = validate_pem_structure(fh.read())
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError, not just OSError. A live pem corrupted into
+        # BINARY (the exact state a republish is meant to heal) raises
+        # UnicodeDecodeError here, and with only OSError caught it escaped all
+        # the way out of publish_pem_bundle() - so the one operation that would
+        # have put a working certificate back blew up on the way to taking a
+        # backup of the broken one. The shell half recovers from this fine;
+        # this is the only reason the Python half did not.
+        ok, msg = False, str(e)
+    backup_path = os.path.join(cert_backup_dir(), os.path.basename(dest_path))
+    if not ok:
+        logger.warning(
+            "Not backing up %s before replacing it: the file on disk is not a "
+            "valid bundle (%s). Keeping any previous backup at %s.",
+            dest_path, msg, backup_path)
+        return None
+    try:
+        os.makedirs(cert_backup_dir(), exist_ok=True)
+        shutil.copy2(dest_path, backup_path)
+        return backup_path
+    except Exception as e:
+        logger.error("Failed to back up %s to %s: %s",
+                     dest_path, backup_path, e)
+        return None
+
+
+def publish_pem_bundle(dest_path, source_paths):
+    """Publish cert+key as a combined PEM at dest_path, atomically.
+
+    source_paths are concatenated in order (fullchain first, then privkey) into
+    a staging file OUTSIDE the crt directory, validated there, and only then
+    moved into place with os.replace(). If anything fails, the exception is
+    raised and dest_path still holds the previous, working bundle - the live
+    PEM is never opened for writing at any point.
+
+    Returns the path of the backup taken (or None). Raises
+    CertificatePublishError on any failure.
+    """
+    for src in source_paths:
+        if not os.path.exists(src):
+            raise CertificatePublishError(
+                f'source certificate material missing: {src}')
+
+    parts = []
+    for src in source_paths:
+        try:
+            with open(src, 'r') as fh:
+                data = fh.read()
+        except (OSError, UnicodeDecodeError) as e:
+            # Binary-corrupt source material must be a clean, reported refusal,
+            # not an unhandled UnicodeDecodeError out of the request handler.
+            raise CertificatePublishError(f'cannot read {src}: {e}')
+        if not data.strip():
+            raise CertificatePublishError(f'source file is empty: {src}')
+        if not data.endswith('\n'):
+            # Guard against a cert whose last line runs into the key's BEGIN
+            # line; certbot always ends with a newline, but a hand-placed file
+            # might not.
+            data += '\n'
+        parts.append(data)
+    content = ''.join(parts)
+
+    ok, msg = validate_pem_structure(content)
+    if not ok:
+        raise CertificatePublishError(
+            f'assembled bundle for {dest_path} is not usable: {msg}')
+
+    dest_dir = os.path.dirname(dest_path) or '.'
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        os.makedirs(cert_staging_dir(), exist_ok=True)
+    except OSError as e:
+        raise CertificatePublishError(f'cannot prepare directories: {e}')
+
+    # os.replace() is only atomic within one filesystem. Checking up front
+    # turns an EXDEV rename failure into an operator-readable message; the
+    # outcome is the same either way (nothing published, live PEM untouched)
+    # because staging inside the crt directory is not an acceptable fallback.
+    try:
+        if os.stat(cert_staging_dir()).st_dev != os.stat(dest_dir).st_dev:
+            raise CertificatePublishError(
+                f'{cert_staging_dir()} and {dest_dir} are on different '
+                'filesystems, so a certificate cannot be swapped in atomically')
+    except OSError as e:
+        raise CertificatePublishError(f'cannot stat certificate dirs: {e}')
+
+    backup_path = backup_existing_pem(dest_path)
+
+    def _validate_staged(staged_path):
+        return validate_pem_bundle(staged_path)
+
+    try:
+        write_config_atomically(dest_path, content,
+                                staging_dir=cert_staging_dir(),
+                                validate=_validate_staged)
+    except Exception as e:
+        raise CertificatePublishError(
+            f'refused to publish {dest_path}: {e}. The previously served '
+            'certificate is still in place.')
+    logger.info("Published validated certificate bundle to %s%s", dest_path,
+                f' (previous copy backed up to {backup_path})'
+                if backup_path else '')
+    return backup_path
+
+
 def certbot_register():
     """Register with Let's Encrypt using the certbot client and agree to the terms of service"""
     result = subprocess.run(['certbot', 'show_account'],  capture_output=True)
@@ -330,12 +677,26 @@ def generate_self_signed_cert(ssl_certs_dir):
         '-subj', f'/CN={DOMAIN}'
     ], check=True)
 
-    # Combine cert and key for HAProxy
-    with open(self_sign_cert, 'wb') as combined:
+    # Combine cert and key for HAProxy. Same publisher as every other bundle:
+    # this file lands in the crt directory, so a half-written one would break
+    # the TLS bind for every site on the host, and because the function
+    # short-circuits on "file exists" a corrupt one would never be regenerated.
+    try:
+        publish_pem_bundle(self_sign_cert, ['/tmp/cert.pem', '/tmp/key.pem'])
+    except CertificatePublishError as e:
+        # do_initial_setup() calls this unguarded, so raising here would abort
+        # container startup before HAProxy is ever launched. Refusing to write
+        # an unusable default cert is right; taking the whole container down
+        # over it is not - start_haproxy() already degrades gracefully.
+        logger.critical("Could not publish the default self-signed certificate "
+                        "to %s: %s", self_sign_cert, e)
+        return False
+    finally:
         for file in ['/tmp/cert.pem', '/tmp/key.pem']:
-            with open(file, 'rb') as f:
-                combined.write(f.read())
-            os.remove(file)  # Clean up temporary files
+            try:
+                os.remove(file)  # Clean up temporary files
+            except OSError:
+                pass
     generate_config()
     return True
 
@@ -574,8 +935,15 @@ def request_ssl():
             # Ensure SSL certs directory exists
             os.makedirs(SSL_CERTS_DIR, exist_ok=True)
 
-            with open(combined_path, 'w') as combined:
-                subprocess.run(['cat', cert_path, key_path], stdout=combined)
+            try:
+                publish_pem_bundle(combined_path, [cert_path, key_path])
+            except CertificatePublishError as e:
+                # Nothing was written: any previously served bundle for this
+                # name is untouched and HAProxy is not reloaded.
+                error_msg = f'Certificate issued but not published: {e}'
+                logger.critical(error_msg)
+                log_operation('request_ssl', False, error_msg)
+                return jsonify({'status': 'error', 'message': error_msg}), 500
 
             # Update database
             with sqlite3.connect(DB_FILE) as conn:
@@ -604,8 +972,8 @@ def request_ssl():
         log_operation('request_ssl', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def _cleanup_superseded_lineages(keep_path, keep_lineage, bundle_names):
-    """Remove cert files + certbot lineages that the just-issued bundle supersedes.
+def _quarantine_superseded_certs(keep_path, keep_lineage, bundle_names):
+    """Move aside cert files that the just-issued bundle supersedes.
 
     A `.pem` in /etc/haproxy/certs/ is "superseded" iff its certificate's CN
     is one of the bundle's names AND the file isn't the bundle's own combined
@@ -613,10 +981,24 @@ def _cleanup_superseded_lineages(keep_path, keep_lineage, bundle_names):
     since that's what HAProxy SNI-matches against and what the file
     convention names it after.
 
-    Also drops the corresponding certbot renewal config so `certbot renew`
-    stops trying to renew the dead lineage on its next 12h cron tick.
+    This used to os.remove() the file and immediately `certbot delete` the
+    lineage, both BEFORE anything had checked that the replacement bundle was
+    usable — destroying the only two copies of a working certificate on the
+    strength of a `cat` whose exit status nobody read. Now:
 
-    Returns a small summary dict for logging / API response.
+      * the superseded file is MOVED to the cert backup directory instead of
+        unlinked, so an operator can put it back by hand;
+      * the certbot lineage is left alone here. Deleting it is irreversible
+        (archive, live and renewal config all go) and recovering means fresh,
+        rate-limited ACME orders, so it happens only in
+        _delete_superseded_lineages(), after HAProxy has actually loaded the
+        replacement.
+
+    Moving still solves the problem the removal existed for: the old file no
+    longer sits in the crt directory shadowing the new bundle's SNI match.
+
+    Returns a summary dict for logging / API response. Entries in 'removed'
+    carry the lineage name for the deletion phase.
     """
     summary = {'removed': [], 'errors': [], 'skipped': []}
 
@@ -668,24 +1050,52 @@ def _cleanup_superseded_lineages(keep_path, keep_lineage, bundle_names):
             continue
 
         try:
-            os.remove(fpath)
-            removed_entry = {'file': fname, 'cn': cn, 'lineage_deleted': False}
-            # Best-effort certbot lineage delete. Some files may not have a
-            # corresponding lineage (e.g. self-signed dev certs); ignore those.
-            try:
-                cb_proc = subprocess.run(
-                    ['certbot', 'delete', '--cert-name', lineage_name, '-n'],
-                    capture_output=True, text=True
-                )
-                removed_entry['lineage_deleted'] = (cb_proc.returncode == 0)
-                if cb_proc.returncode != 0:
-                    removed_entry['certbot_stderr'] = (cb_proc.stderr or '').strip()[:200]
-            except Exception as e:
-                removed_entry['certbot_error'] = str(e)
-            summary['removed'].append(removed_entry)
+            os.makedirs(cert_backup_dir(), exist_ok=True)
+            quarantine_path = os.path.join(cert_backup_dir(), fname)
+            # Move, not unlink: out of the crt directory (so it stops shadowing
+            # the new bundle) but still on disk for manual recovery.
+            shutil.move(fpath, quarantine_path)
+            summary['removed'].append({
+                'file': fname,
+                'cn': cn,
+                'lineage': lineage_name,
+                'moved_to': quarantine_path,
+                'lineage_deleted': False,
+            })
         except Exception as e:
             summary['errors'].append({'file': fname, 'error': str(e)})
 
+    return summary
+
+
+def _delete_superseded_lineages(summary):
+    """`certbot delete` the lineages quarantined by _quarantine_superseded_certs().
+
+    IRREVERSIBLE: certbot removes the lineage's archive, live symlinks and
+    renewal config. If it turns out we needed that certificate, the only way
+    back is a fresh ACME order, which Let's Encrypt rate-limits — an outage
+    measured in hours. So this is gated hardest of anything in this module: it
+    runs only after the replacement bundle has been assembled, validated,
+    published, AND loaded by a HAProxy that reloaded successfully.
+
+    Mutates `summary` in place. Best-effort: some files have no corresponding
+    lineage (e.g. self-signed dev certs) and a failure here is harmless — a
+    dead lineage merely wastes a renewal attempt on the next 12h cron tick.
+    """
+    for entry in summary.get('removed', []):
+        lineage_name = entry.get('lineage')
+        if not lineage_name:
+            continue
+        try:
+            cb_proc = subprocess.run(
+                ['certbot', 'delete', '--cert-name', lineage_name, '-n'],
+                capture_output=True, text=True
+            )
+            entry['lineage_deleted'] = (cb_proc.returncode == 0)
+            if cb_proc.returncode != 0:
+                entry['certbot_stderr'] = (cb_proc.stderr or '').strip()[:200]
+        except Exception as e:
+            entry['certbot_error'] = str(e)
     return summary
 
 @app.route('/api/ssl/bundle', methods=['POST'])
@@ -787,8 +1197,17 @@ def request_ssl_bundle():
         combined_path = f'{SSL_CERTS_DIR}/{primary}.pem'
 
         os.makedirs(SSL_CERTS_DIR, exist_ok=True)
-        with open(combined_path, 'w') as combined:
-            subprocess.run(['cat', cert_path, key_path], stdout=combined)
+        try:
+            publish_pem_bundle(combined_path, [cert_path, key_path])
+        except CertificatePublishError as e:
+            # Publishing is all-or-nothing, so at this point nothing has been
+            # written, no old certificate has been touched and no lineage has
+            # been deleted. Stop before any of that becomes untrue.
+            error_msg = f'Bundle issued but not published for {primary}: {e}'
+            logger.critical(error_msg)
+            log_operation('request_ssl_bundle', False, error_msg)
+            return jsonify({'status': 'error', 'message': error_msg,
+                            'primary': primary, 'names': names}), 500
 
         # Mark every name in the bundle as ssl_enabled, all pointing at the
         # same combined .pem. HAProxy serves one file for many SNI hostnames.
@@ -809,15 +1228,35 @@ def request_ssl_bundle():
         # `bind ... ssl crt /etc/haproxy/certs` directive. HAProxy then picks
         # one of them by alphabetical/load order — frequently the older
         # single-SAN file — and the new bundle has no effect on what's served.
-        # This block deletes those superseded files (and their certbot lineage)
+        # This block moves those superseded files out of the crt directory
         # before the generate_config() reload so HAProxy picks up the bundle.
-        cleanup_summary = _cleanup_superseded_lineages(
+        # It only runs once publish_pem_bundle() above has validated the
+        # replacement and put it in place, so the old certificate is never the
+        # only copy we have.
+        cleanup_summary = _quarantine_superseded_certs(
             keep_path=combined_path,
             keep_lineage=primary,
             bundle_names=set(names),
         )
 
-        generate_config()
+        # Raises if the config does not validate or HAProxy does not reload;
+        # the certbot lineages below are therefore only deleted once the new
+        # bundle is genuinely being served.
+        try:
+            generate_config()
+        except Exception:
+            if cleanup_summary['removed']:
+                logger.critical(
+                    "HAProxy did not reload after publishing the bundle for "
+                    "%s. The superseded certificate files were moved to %s and "
+                    "their certbot lineages were NOT deleted, so they can be "
+                    "restored by hand: %s",
+                    primary, cert_backup_dir(),
+                    [e['file'] for e in cleanup_summary['removed']])
+            raise
+
+        _delete_superseded_lineages(cleanup_summary)
+
         log_operation(
             'request_ssl_bundle', True,
             f'SSL bundle issued for {primary} covering {len(names)} names; '
@@ -854,11 +1293,12 @@ def renew_certificates():
             # Check if any certificates were renewed
             if 'Congratulations' in result.stdout or 'renewed' in result.stdout:
                 # Update combined certificates for HAProxy
+                publish_failures = []
                 with sqlite3.connect(DB_FILE) as conn:
                     cursor = conn.cursor()
                     cursor.execute('SELECT domain, ssl_cert_path FROM domains WHERE ssl_enabled = 1')
                     domains = cursor.fetchall()
-                    
+
                     for domain, cert_path in domains:
                         if cert_path and os.path.exists(cert_path):
                             # For wildcard domains, strip *. prefix for directory lookup
@@ -869,15 +1309,40 @@ def renew_certificates():
                                 letsencrypt_key = os.path.join(live_dir, 'privkey.pem')
 
                                 if os.path.exists(letsencrypt_cert) and os.path.exists(letsencrypt_key):
-                                    with open(cert_path, 'w') as combined:
-                                        subprocess.run(['cat', letsencrypt_cert, letsencrypt_key], stdout=combined)
-                
-                # Regenerate config and reload HAProxy
+                                    # A failure here leaves the currently
+                                    # served bundle in place. That certificate
+                                    # is still valid (renewal runs ~30 days
+                                    # before expiry and retries every 12h), so
+                                    # keeping it is strictly better than
+                                    # replacing it with something unverified.
+                                    try:
+                                        publish_pem_bundle(
+                                            cert_path,
+                                            [letsencrypt_cert, letsencrypt_key])
+                                    except CertificatePublishError as e:
+                                        logger.critical(
+                                            "Renewed certificate for %s was NOT "
+                                            "published: %s", domain, e)
+                                        publish_failures.append(
+                                            {'domain': domain, 'error': str(e)})
+
+                # Regenerate config and reload HAProxy. Safe to do with
+                # publish failures present: those certificates were left
+                # untouched, so nothing unvalidated is being loaded.
                 generate_config()
                 reload_result = subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli',
                                              capture_output=True, text=True, shell=True)
                 
                 if reload_result.returncode == 0:
+                    if publish_failures:
+                        error_msg = (
+                            f'{len(publish_failures)} renewed certificate(s) could '
+                            'not be published and are still being served from '
+                            'their previous bundle')
+                        log_operation('renew_certificates', False, error_msg)
+                        return jsonify({'status': 'partial_success',
+                                        'message': error_msg,
+                                        'failures': publish_failures}), 500
                     log_operation('renew_certificates', True, 'Certificates renewed and HAProxy reloaded')
                     return jsonify({'status': 'success', 'message': 'Certificates renewed and HAProxy reloaded'})
                 else:
@@ -1070,9 +1535,19 @@ def request_certificates():
                 # Ensure SSL certs directory exists
                 os.makedirs(SSL_CERTS_DIR, exist_ok=True)
 
-                with open(combined_path, 'w') as combined:
-                    subprocess.run(['cat', cert_path, key_path], stdout=combined)
-                
+                try:
+                    publish_pem_bundle(combined_path, [cert_path, key_path])
+                except CertificatePublishError as e:
+                    error_msg = f'Certificate issued but not published: {e}'
+                    logger.critical('%s (%s)', error_msg, domain)
+                    results.append({
+                        'domain': domain,
+                        'status': 'error',
+                        'message': error_msg,
+                    })
+                    error_count += 1
+                    continue
+
                 # Update database (add domain if it doesn't exist)
                 with sqlite3.connect(DB_FILE) as conn:
                     cursor = conn.cursor()
@@ -1693,11 +2168,13 @@ def dns_challenge_verify():
         os.makedirs(SSL_CERTS_DIR, exist_ok=True)
         combined_path = f'{SSL_CERTS_DIR}/_wildcard_.{base_domain}.pem'
 
-        with open(combined_path, 'w') as combined:
-            with open(cert_path, 'r') as cf:
-                combined.write(cf.read())
-            with open(key_path, 'r') as kf:
-                combined.write(kf.read())
+        try:
+            publish_pem_bundle(combined_path, [cert_path, key_path])
+        except CertificatePublishError as e:
+            error_msg = f'Wildcard certificate obtained but not published: {e}'
+            logger.critical(error_msg)
+            log_operation('dns_challenge_verify', False, error_msg)
+            return jsonify({'success': False, 'error': error_msg}), 500
 
         # Update database
         with sqlite3.connect(DB_FILE) as conn:
@@ -1743,6 +2220,40 @@ def get_or_create_cluster_secret():
                 secret = f.read().strip()
                 if secret:
                     return secret
+            # File exists but is blank — e.g. a create that died between
+            # open() and write(), or a volume restored empty. Without healing
+            # it here we fall through to the O_EXCL create below, which fails
+            # with FileExistsError, and the handler re-reads the same blank
+            # file: this function would return '' forever and the host would
+            # never get the stable secret its docstring promises.
+            #
+            # Rewrite in place under an exclusive lock rather than unlinking
+            # and recreating: the file is never momentarily absent, and two
+            # workers healing at once serialise instead of racing to install
+            # two different secrets.
+            try:
+                fd = os.open(CLUSTER_SECRET_PATH, os.O_RDWR)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    # Re-read under the lock: another worker may have healed it
+                    # while we were waiting.
+                    existing = os.read(fd, 4096).decode(errors='replace').strip()
+                    if existing:
+                        return existing
+                    secret = os.urandom(32).hex()
+                    os.ftruncate(fd, 0)
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.write(fd, secret.encode())
+                    os.fchmod(fd, 0o600)
+                    logger.warning(
+                        "Healed empty QUIC cluster-secret at %s",
+                        CLUSTER_SECRET_PATH)
+                    return secret
+                finally:
+                    os.close(fd)
+            except Exception as e:
+                logger.error("Failed to heal empty cluster-secret: %s", e)
+                return ''
         # Generate and persist exclusively (0600). hex => config-safe charset.
         secret = os.urandom(32).hex()
         fd = os.open(CLUSTER_SECRET_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1795,6 +2306,21 @@ def generate_config():
         
         config_parts = []
 
+        # Snapshot the last-known-good config BEFORE anything below touches a
+        # file in /etc/haproxy. Everything this function writes (haproxy.cfg,
+        # blocked_ips.map, coraza-spoe.cfg) is validated as one set by
+        # `haproxy -c`, so the rollback point has to predate the first of them.
+        # Taking it here (rather than inside reload_haproxy_safely(), which runs
+        # after the writes) is what makes rollback real - see create_backup().
+        backup_ok, backup_status = create_backup()
+        if not backup_ok:
+            # Could not even attempt a snapshot (I/O error). Writing a new
+            # config now would leave us with no way back, so refuse.
+            raise Exception(
+                "Refusing to regenerate config: failed to back up the current "
+                "configuration, so a failed change could not be rolled back"
+            )
+
         # Optional Coraza WAF integration. When HAPROXY_CORAZA_SPOE_BACKEND is
         # set on the haproxy-manager container, we render an extra TCP backend
         # pointing at a coraza-spoa sidecar AND inject a `filter spoe ...` line
@@ -1831,8 +2357,12 @@ def generate_config():
         )
         config_parts.append(default_headers)
 
-        # Update blocked IPs map file first
-        update_blocked_ips_map()
+        # Update blocked IPs map file first. promote_backup=False: the rollback
+        # snapshot was taken a few lines above and this map is part of the
+        # not-yet-validated change, so refreshing the backup copy here would
+        # overwrite the bytes rollback needs - the same class of bug as backing
+        # up after the write.
+        update_blocked_ips_map(promote_backup=False)
 
         # Add Listener Block
         listener_block = template_env.get_template('hap_listener.tpl').render(
@@ -1984,25 +2514,21 @@ backend default-backend
             # how the file was authored.
             if not coraza_spoe_cfg.endswith('\n'):
                 coraza_spoe_cfg += '\n'
-            coraza_spoe_path = '/etc/haproxy/coraza-spoe.cfg'
-            with open(coraza_spoe_path, 'w') as f:
-                f.write(coraza_spoe_cfg)
-            logger.info(f"Coraza SPOE engine config written to {coraza_spoe_path} "
+            write_config_atomically(CORAZA_SPOE_CONFIG_PATH, coraza_spoe_cfg)
+            logger.info(f"Coraza SPOE engine config written to "
+                        f"{CORAZA_SPOE_CONFIG_PATH} "
                         f"(SPOA target: {coraza_spoe_backend})")
-
-        # Write complete configuration to tmp
-        temp_config_path = "/etc/haproxy/haproxy.cfg"
 
         config_content = '\n'.join(config_parts)
         logger.debug("Generated HAProxy configuration")
 
-        # Write complete configuration to tmp
-        # Write new configuration to file
-        with open(HAPROXY_CONFIG_PATH, 'w') as f:
-            f.write(config_content)
-        
+        # Write new configuration to file (atomically - a truncated haproxy.cfg
+        # is as fatal as an invalid one). The rollback point was taken above,
+        # before this write.
+        write_config_atomically(HAPROXY_CONFIG_PATH, config_content)
+
         # Use safe reload with validation and rollback
-        success, message = reload_haproxy_safely()
+        success, message = reload_haproxy_safely(backup_status=backup_status)
         if success:
             logger.info("Configuration generated and HAProxy reloaded safely")
             log_operation('generate_config', True, 'Configuration generated and HAProxy reloaded safely')
@@ -2019,63 +2545,340 @@ backend default-backend
         traceback.print_exc()
         raise
 
-def create_backup():
-    """Create backup of current config and map files"""
+# ---------------------------------------------------------------------------
+# Config backup / rollback
+# ---------------------------------------------------------------------------
+# Rollback only works if the backup predates the write it is supposed to undo.
+# Until 2026-08 create_backup() ran from inside reload_haproxy_safely(), i.e.
+# AFTER generate_config() had already overwritten haproxy.cfg — so the "backup"
+# was a copy of the new (possibly broken) config and restore_backup() restored
+# the same broken bytes. The advertised rollback was a no-op and a fatal
+# haproxy.cfg persisted on disk, where start_haproxy() refuses to launch (the
+# June 2026 missing-template incident). create_backup() must now be called by
+# the writer, BEFORE the first byte is written.
+
+# Statuses returned by create_backup() that mean a rollback target exists.
+_ROLLBACK_AVAILABLE_STATUSES = ('created', 'kept_previous')
+
+
+def _files_identical(path_a, path_b):
+    """Byte-compare two files.
+
+    Deliberately not filecmp.cmp(): it memoises on (size, mtime), and
+    shutil.copy2() preserves mtime, so a stale cache entry could report a
+    changed config as unchanged. These files are small; read them.
+    """
     try:
-        if os.path.exists(HAPROXY_CONFIG_PATH):
-            shutil.copy2(HAPROXY_CONFIG_PATH, HAPROXY_BACKUP_PATH)
-        if os.path.exists(BLOCKED_IPS_MAP_PATH):
-            shutil.copy2(BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH)
-        logger.info("Backups created successfully")
-        return True
+        if os.path.getsize(path_a) != os.path.getsize(path_b):
+            return False
+        with open(path_a, 'rb') as fa, open(path_b, 'rb') as fb:
+            while True:
+                chunk_a = fa.read(65536)
+                chunk_b = fb.read(65536)
+                if chunk_a != chunk_b:
+                    return False
+                if not chunk_a:
+                    return True
+    except OSError:
+        return False
+
+
+def _config_set_matches_backup():
+    """True if every live config file is byte-identical to its backup copy.
+
+    After a successful reload the live set has already been recorded as
+    known-good (see promote_current_config_to_backup()), which is the common
+    case at the start of the next generation. Recognising it lets create_backup()
+    skip both the re-validation and the copy - worth doing because
+    `haproxy -c` on an edge with hundreds of certificates is not free and
+    generate_config() runs synchronously inside customer-facing API calls.
+    """
+    for live_path, backup_path in _config_backup_pairs():
+        if os.path.exists(live_path) != os.path.exists(backup_path):
+            return False
+        if (os.path.exists(live_path)
+                and not _files_identical(live_path, backup_path)):
+            return False
+    return True
+
+
+def _config_backup_pairs():
+    """(live, backup) pairs forming one restorable config set.
+
+    Built at call time rather than at import so the module-level path constants
+    stay patchable (tests, alternate deployments).
+    """
+    return (
+        (HAPROXY_CONFIG_PATH, HAPROXY_BACKUP_PATH),
+        (BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH),
+        (CORAZA_SPOE_CONFIG_PATH, CORAZA_SPOE_BACKUP_PATH),
+    )
+
+
+def write_config_atomically(path, content, staging_dir=None, validate=None):
+    """Write content to path via temp file + rename.
+
+    A half-written haproxy.cfg (disk full, container killed mid-write) is just
+    as fatal as an invalid one and is invisible to the caller. os.replace() is
+    atomic within a filesystem, so the file on disk is always either the whole
+    old config or the whole new one — never a truncated hybrid. This also keeps
+    the "existing config is already broken" case from being self-inflicted.
+
+    The same guarantee is what certificate bundles need, so this is the single
+    atomic publisher for both (see publish_pem_bundle()); the two extra
+    arguments exist for that caller:
+
+    staging_dir: where the temp file is created. Defaults to the destination's
+        own directory, which is right for /etc/haproxy but WRONG for
+        /etc/haproxy/certs — HAProxy loads that path as a crt directory and
+        tries to load every file in it, so a `.tmp` there (or one leaked by a
+        crash) can break the whole TLS bind. Must be on the same filesystem as
+        `path` or os.replace() cannot be atomic; if it is not, the rename fails
+        loudly and the destination is left untouched, which is the safe outcome.
+
+    validate: optional callable(temp_path) -> (ok, message), run on the staged
+        file BEFORE it is moved into place. Returning False aborts the publish
+        with the temp file removed and `path` still holding its previous
+        contents. This is the only ordering that lets us validate the
+        replacement without having destroyed the original first.
+    """
+    directory = staging_dir or os.path.dirname(path) or '.'
+    # Preserve the mode of the file we are replacing; mkstemp defaults to 0600
+    # and HAProxy config files are conventionally 0644.
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        mode = 0o644
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=os.path.basename(path) + '.', suffix='.tmp'
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        if validate is not None:
+            ok, message = validate(tmp_path)
+            if not ok:
+                raise ValueError(f'staged file failed validation: {message}')
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def create_backup(require_valid=True):
+    """Snapshot the CURRENT on-disk config set as the rollback point.
+
+    MUST be called BEFORE the new configuration is written — see the module
+    comment above. Calling it afterwards silently disarms rollback.
+
+    require_valid=True (default) refuses to promote a config that HAProxy
+    already rejects. Backing up a broken config would make "rollback" mean
+    "restore a different broken config"; keeping the older, validated backup
+    instead means a rollback always lands on something HAProxy will actually
+    start with. Cost is one `haproxy -c` run per config generation.
+
+    Returns (ok, status):
+      ok=False, status='error'      - the copy itself failed; caller decides.
+      status='created'              - backup now holds the current config.
+      status='kept_previous'        - current config missing or invalid; the
+                                      existing (older, good) backup was kept.
+      status='unavailable'          - nothing to roll back to at all (first
+                                      run, or broken config and no prior
+                                      backup). Rollback is NOT possible.
+    """
+    try:
+        snapshot_ok = True
+        reason = None
+
+        if not os.path.exists(HAPROXY_CONFIG_PATH):
+            snapshot_ok = False
+            reason = 'no existing HAProxy config on disk (first run?)'
+        elif _config_set_matches_backup():
+            # The backup already IS the current config, recorded when it last
+            # loaded successfully. Nothing to copy and nothing to re-validate.
+            logger.debug("Config backup already matches the live config")
+            return True, 'created'
+        elif require_valid:
+            status, msg = validate_config_file(HAPROXY_CONFIG_PATH)
+            if status == 'invalid':
+                snapshot_ok = False
+                reason = f'current config on disk does not validate: {msg}'
+            elif status == 'unavailable':
+                # The validator itself could not run (no haproxy binary, etc).
+                # That is NOT evidence the config is bad, and refusing to back
+                # up would leave us with no rollback target at all, so fall
+                # back to last-written semantics and say so loudly.
+                logger.warning(
+                    f"Could not verify current config before backup ({msg}); "
+                    "backing it up unverified"
+                )
+
+        if not snapshot_ok:
+            if os.path.exists(HAPROXY_BACKUP_PATH):
+                logger.warning(
+                    f"Not refreshing config backup: {reason}. Keeping the "
+                    f"existing backup at {HAPROXY_BACKUP_PATH} as the rollback "
+                    "target."
+                )
+                return True, 'kept_previous'
+            logger.error(
+                f"No config backup could be taken: {reason}, and no previous "
+                f"backup exists at {HAPROXY_BACKUP_PATH}. ROLLBACK IS NOT "
+                "AVAILABLE for this configuration change."
+            )
+            return True, 'unavailable'
+
+        for live_path, backup_path in _config_backup_pairs():
+            if os.path.exists(live_path):
+                shutil.copy2(live_path, backup_path)
+        logger.info("Backup of last-known-good config created successfully")
+        return True, 'created'
     except Exception as e:
         logger.error(f"Failed to create backup: {e}")
-        return False
+        return False, 'error'
 
-def restore_backup():
-    """Restore from backup files"""
+def promote_current_config_to_backup():
+    """Record the live config as the known-good rollback target.
+
+    Called ONLY after the config has both validated and been loaded by HAProxy,
+    so "backup" really means "the last configuration this box was running".
+    Must never be called before a reload attempt: doing so would make the
+    backup a copy of the config we may still have to roll back from - the same
+    class of bug as backing up after the write.
+
+    Without this, a box whose very first generation succeeded has no rollback
+    target at all until its second successful generation, and any corruption of
+    haproxy.cfg in between leaves nothing to recover to.
+    """
     try:
-        if os.path.exists(HAPROXY_BACKUP_PATH):
-            shutil.copy2(HAPROXY_BACKUP_PATH, HAPROXY_CONFIG_PATH)
-        if os.path.exists(BLOCKED_IPS_MAP_BACKUP_PATH):
-            shutil.copy2(BLOCKED_IPS_MAP_BACKUP_PATH, BLOCKED_IPS_MAP_PATH)
-        logger.info("Backups restored successfully")
+        for live_path, backup_path in _config_backup_pairs():
+            if os.path.exists(live_path):
+                shutil.copy2(live_path, backup_path)
+        logger.debug("Known-good config backup updated after successful reload")
         return True
     except Exception as e:
-        logger.error(f"Failed to restore backup: {e}")
+        # Non-fatal: the config is live and working, we just failed to record
+        # it. Loud, because the next change now has a staler rollback target.
+        logger.error(f"Failed to record known-good config backup: {e}")
         return False
 
-def validate_haproxy_config():
-    """Validate HAProxy configuration file"""
-    try:
-        result = subprocess.run(['haproxy', '-c', '-f', HAPROXY_CONFIG_PATH], 
-                              capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info("HAProxy configuration validation passed")
-            return True, None
-        else:
-            error_msg = f"HAProxy configuration validation failed: {result.stderr}"
-            logger.error(error_msg)
-            return False, error_msg
-    except Exception as e:
-        error_msg = f"Error validating HAProxy config: {e}"
-        logger.error(error_msg)
-        return False, error_msg
 
-def reload_haproxy_safely():
-    """Safely reload HAProxy with validation and rollback"""
+def restore_backup():
+    """Restore the backed-up config set over the live files.
+
+    Returns (restored, message). restored=False means NOTHING was rolled back
+    and the live config is still whatever the failed change left on disk —
+    callers MUST surface that difference, it is the difference between "we
+    recovered" and "this edge is sitting on a config HAProxy will not load".
+    """
+    if not os.path.exists(HAPROXY_BACKUP_PATH):
+        msg = (f"No config backup at {HAPROXY_BACKUP_PATH} - cannot roll back; "
+               f"{HAPROXY_CONFIG_PATH} still holds the failed configuration")
+        logger.critical(msg)
+        return False, msg
     try:
-        # Create backup before changes
-        if not create_backup():
-            return False, "Failed to create backup"
-        
+        for live_path, backup_path in _config_backup_pairs():
+            if os.path.exists(backup_path):
+                shutil.copy2(backup_path, live_path)
+        msg = f"Configuration restored from backup ({HAPROXY_BACKUP_PATH})"
+        logger.info(msg)
+        return True, msg
+    except Exception as e:
+        msg = (f"Failed to restore backup: {e} - {HAPROXY_CONFIG_PATH} may hold "
+               "a broken configuration")
+        logger.critical(msg)
+        return False, msg
+
+
+def validate_config_file(config_path):
+    """Run `haproxy -c` against config_path.
+
+    Returns (status, message) with status one of:
+      'valid'       - HAProxy parsed the file successfully
+      'invalid'     - HAProxy rejected it (message carries stderr)
+      'unavailable' - the validator could not be run at all (binary missing,
+                      timeout, ...). Deliberately distinct from 'invalid':
+                      it tells us nothing about the config.
+    """
+    try:
+        result = subprocess.run(['haproxy', '-c', '-f', config_path],
+                                capture_output=True, text=True)
+    except Exception as e:
+        return 'unavailable', f"Error validating HAProxy config: {e}"
+    if result.returncode == 0:
+        return 'valid', None
+    return 'invalid', f"HAProxy configuration validation failed: {result.stderr}"
+
+
+def validate_haproxy_config():
+    """Validate the live HAProxy configuration file. Returns (is_valid, error).
+
+    NOTE the invalid/unavailable distinction validate_config_file() draws does
+    NOT survive here: this returns a bare bool, so a validator that could not
+    run is reported the same as a rejected config and the reload path rolls
+    back, logging "Config validation failed". That is deliberate - without a
+    working validator we cannot claim the new config is safe, and the reload
+    path is the one place where guessing wrong takes the edge down. The
+    distinction is only acted on inside create_backup(), where treating
+    "cannot check" as "bad" would mean refusing to keep any rollback target at
+    all. (The 2026-08 commit message said flatly that "a missing haproxy binary
+    is not read as a bad config"; that is true of create_backup() only.)
+    """
+    status, message = validate_config_file(HAPROXY_CONFIG_PATH)
+    if status == 'valid':
+        logger.info("HAProxy configuration validation passed")
+        return True, None
+    logger.error(message)
+    return False, message
+
+def reload_haproxy_safely(backup_status=None):
+    """Safely reload HAProxy with validation and rollback.
+
+    PRECONDITION: the caller must already have called create_backup() BEFORE
+    writing the new config, and pass the status it returned. This function runs
+    after the new config is on disk, so it cannot take a meaningful backup
+    itself — doing so is exactly the bug this contract exists to prevent.
+
+    backup_status=None means the caller did not take a pre-write backup. We do
+    NOT create one here (that would overwrite a genuinely good backup with the
+    unverified new config); we log it and fall back to whatever backup already
+    exists on disk.
+    """
+    try:
+        if backup_status is None:
+            logger.error(
+                "reload_haproxy_safely() called without a pre-write backup "
+                "status - rollback will fall back to whatever backup already "
+                "exists on disk. Callers must call create_backup() BEFORE "
+                "writing the new configuration."
+            )
+        elif backup_status not in _ROLLBACK_AVAILABLE_STATUSES:
+            logger.warning(
+                f"Proceeding with reload without a rollback target "
+                f"(backup status: {backup_status})"
+            )
+
         # Validate new configuration
         is_valid, error_msg = validate_haproxy_config()
         if not is_valid:
             # Restore backup on validation failure
-            restore_backup()
+            restored, restore_msg = restore_backup()
+            if not restored:
+                logger.critical(
+                    "Config validation failed AND rollback was not possible - "
+                    f"{HAPROXY_CONFIG_PATH} holds an invalid configuration that "
+                    "HAProxy will refuse to start with"
+                )
+                return False, (f"Config validation failed: {error_msg} | "
+                               f"ROLLBACK FAILED: {restore_msg}")
             return False, f"Config validation failed: {error_msg}"
-        
+
         # Attempt reload
         if is_process_running('haproxy'):
             # Use HAProxy stats socket for graceful reload
@@ -2094,20 +2897,28 @@ def reload_haproxy_safely():
                 
                 if reload_result.returncode == 0:
                     logger.info("HAProxy reloaded successfully")
+                    # Now - and only now - is this config known good.
+                    promote_current_config_to_backup()
                     return True, "HAProxy reloaded successfully"
                 else:
                     # Reload failed, restore backup
-                    restore_backup()
-                    # Try to reload with backup config
-                    subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli', 
-                                 shell=True, capture_output=True)
+                    restored, restore_msg = restore_backup()
+                    if restored:
+                        # Try to reload with the restored (known-good) config
+                        subprocess.run(
+                            'echo "reload" | socat stdio /tmp/haproxy-cli',
+                            shell=True, capture_output=True)
                     error_msg = f"HAProxy reload failed: {reload_result.stderr}"
+                    if not restored:
+                        error_msg += f" | ROLLBACK FAILED: {restore_msg}"
                     logger.error(error_msg)
                     return False, error_msg
             except Exception as e:
                 # Critical error during reload, restore backup
-                restore_backup()
+                restored, restore_msg = restore_backup()
                 error_msg = f"Critical error during reload: {e}"
+                if not restored:
+                    error_msg += f" | ROLLBACK FAILED: {restore_msg}"
                 logger.error(error_msg)
                 return False, error_msg
         else:
@@ -2118,20 +2929,101 @@ def reload_haproxy_safely():
                     check=True, capture_output=True, text=True
                 )
                 logger.info("HAProxy started successfully")
+                # Now - and only now - is this config known good.
+                promote_current_config_to_backup()
                 return True, "HAProxy started successfully"
             except subprocess.CalledProcessError as e:
                 # Start failed, restore backup
-                restore_backup()
+                restored, restore_msg = restore_backup()
                 error_msg = f"Failed to start HAProxy: {e.stderr}"
+                if not restored:
+                    error_msg += f" | ROLLBACK FAILED: {restore_msg}"
                 logger.error(error_msg)
                 return False, error_msg
     except Exception as e:
+        # KNOWN GAP (pre-existing, unchanged by the 2026-08 backup-ordering
+        # fix): this outer handler does NOT roll back. The window is narrow -
+        # everything after the validation gate has its own handler - but an
+        # exception raised between the gate and those handlers leaves the new
+        # config on disk. Left as-is deliberately; rolling back from here would
+        # also undo changes that had in fact loaded.
         error_msg = f"Critical error in reload process: {e}"
         logger.error(error_msg)
         return False, error_msg
 
-def update_blocked_ips_map():
-    """Update the blocked IPs map file from database"""
+def _blocked_ips_map_is_wellformed(path):
+    """True if every key in a blocked-IPs map is one HAProxy will parse.
+
+    map_ip() rejects the ENTIRE configuration if a single key is not an IP or
+    CIDR ("'198.51.10' is not a valid IPv4 or IPv6 address at line 2 of file
+    ..."), so this is the property that decides whether the file is safe to
+    record as a rollback target. Pure Python over a small file - deliberately
+    not another `haproxy -c`, which is the cost this check exists to avoid.
+    """
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                ipaddress.ip_network(line.split()[0], strict=False)
+    except (OSError, ValueError, IndexError):
+        return False
+    return True
+
+
+def _promote_blocked_ips_map_to_backup():
+    """Keep blocked_ips.map.backup in step with the map just written.
+
+    The /api/blocked-ips routes call update_blocked_ips_map() OUTSIDE
+    generate_config(): the map write IS the whole change there, published
+    against a config HAProxy is already running. Without promoting it, the live
+    map drifts from its backup, create_backup() misses its fast path on the
+    NEXT config change, and an edge that blocks IPs automatically (this fleet
+    does) pays an extra `haproxy -c` on the following customer-facing domain
+    add - permanently, since every block re-opens the drift.
+
+    Guarded twice:
+      * a config backup set must already exist - never fabricate a rollback
+        target out of nothing (see restore_backup()); and
+      * the map must be well-formed, so promoting it cannot leave a "rollback
+        target" HAProxy refuses to load. That would be this module's own bug
+        on a different file.
+    When either fails we leave the older backup map alone and the next
+    create_backup() takes the slow, `haproxy -c`-validated path - i.e. the
+    behaviour before this function existed. Nothing here can lose data.
+
+    Note the map is promoted after the write rather than after the caller's
+    reload: the routes only warn on a failed reload and carry on, so there is
+    no reload result to gate on. A well-formed map that HAProxy has not loaded
+    yet is still a loadable rollback target, which is the guarantee that
+    matters.
+    """
+    if not os.path.exists(HAPROXY_BACKUP_PATH):
+        return False
+    if not _blocked_ips_map_is_wellformed(BLOCKED_IPS_MAP_PATH):
+        logger.warning(
+            f"Not recording {BLOCKED_IPS_MAP_PATH} as known-good: it contains "
+            "an entry HAProxy cannot parse, which would make the whole "
+            "configuration invalid. Keeping the previous backup map."
+        )
+        return False
+    try:
+        shutil.copy2(BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH)
+        return True
+    except OSError as e:
+        logger.warning(f"Could not update the backup blocked IPs map: {e}")
+        return False
+
+
+def update_blocked_ips_map(promote_backup=True):
+    """Update the blocked IPs map file from database.
+
+    promote_backup=False is for callers that are in the middle of an
+    unvalidated configuration change - generate_config() has already taken the
+    rollback snapshot by the time it gets here, so refreshing the backup map
+    would overwrite the very bytes rollback needs.
+    """
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -2142,9 +3034,19 @@ def update_blocked_ips_map():
         # For IP blocking, we use: <ip_or_cidr> 1
         # This allows map_ip() to work with both single IPs and CIDR ranges
         os.makedirs(os.path.dirname(BLOCKED_IPS_MAP_PATH), exist_ok=True)
-        with open(BLOCKED_IPS_MAP_PATH, 'w') as f:
-            for ip in blocked_ips:
-                f.write(f"{ip} 1\n")
+        # Atomically, for the same reason haproxy.cfg is: `haproxy -c` LOADS
+        # this file (hap_listener.tpl matches on
+        # map_ip(/etc/haproxy/blocked_ips.map,0)), and a half-written final
+        # line is a FATAL config error rather than one dropped entry - verified
+        # against HAProxy 2.8. A truncated map is therefore exactly the failure
+        # this module's backup ordering exists to prevent, on a different file.
+        write_config_atomically(
+            BLOCKED_IPS_MAP_PATH,
+            ''.join(f"{ip} 1\n" for ip in blocked_ips)
+        )
+
+        if promote_backup:
+            _promote_blocked_ips_map_to_backup()
 
         logger.info(f"Updated blocked IPs map file with {len(blocked_ips)} IPs")
         return True
