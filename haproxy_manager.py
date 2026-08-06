@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import json
 import ipaddress
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -105,6 +106,12 @@ HAPROXY_CONFIG_PATH = '/etc/haproxy/haproxy.cfg'
 HAPROXY_BACKUP_PATH = '/etc/haproxy/haproxy.cfg.backup'
 BLOCKED_IPS_MAP_PATH = '/etc/haproxy/blocked_ips.map'
 BLOCKED_IPS_MAP_BACKUP_PATH = '/etc/haproxy/blocked_ips.map.backup'
+# Coraza SPOE engine file. `haproxy -c` parses this too (the frontend's
+# `filter spoe engine coraza config <path>` line points at it), so it is part
+# of the same restorable config set as haproxy.cfg — rolling back haproxy.cfg
+# while leaving a broken coraza-spoe.cfg behind still fails validation.
+CORAZA_SPOE_CONFIG_PATH = '/etc/haproxy/coraza-spoe.cfg'
+CORAZA_SPOE_BACKUP_PATH = '/etc/haproxy/coraza-spoe.cfg.backup'
 HAPROXY_SOCKET_PATH = '/var/run/haproxy.sock'
 SSL_CERTS_DIR = '/etc/haproxy/certs'
 # Stable per-host secret for QUIC Retry/address-validation tokens. Lives in the
@@ -1795,6 +1802,21 @@ def generate_config():
         
         config_parts = []
 
+        # Snapshot the last-known-good config BEFORE anything below touches a
+        # file in /etc/haproxy. Everything this function writes (haproxy.cfg,
+        # blocked_ips.map, coraza-spoe.cfg) is validated as one set by
+        # `haproxy -c`, so the rollback point has to predate the first of them.
+        # Taking it here (rather than inside reload_haproxy_safely(), which runs
+        # after the writes) is what makes rollback real - see create_backup().
+        backup_ok, backup_status = create_backup()
+        if not backup_ok:
+            # Could not even attempt a snapshot (I/O error). Writing a new
+            # config now would leave us with no way back, so refuse.
+            raise Exception(
+                "Refusing to regenerate config: failed to back up the current "
+                "configuration, so a failed change could not be rolled back"
+            )
+
         # Optional Coraza WAF integration. When HAPROXY_CORAZA_SPOE_BACKEND is
         # set on the haproxy-manager container, we render an extra TCP backend
         # pointing at a coraza-spoa sidecar AND inject a `filter spoe ...` line
@@ -1984,25 +2006,21 @@ backend default-backend
             # how the file was authored.
             if not coraza_spoe_cfg.endswith('\n'):
                 coraza_spoe_cfg += '\n'
-            coraza_spoe_path = '/etc/haproxy/coraza-spoe.cfg'
-            with open(coraza_spoe_path, 'w') as f:
-                f.write(coraza_spoe_cfg)
-            logger.info(f"Coraza SPOE engine config written to {coraza_spoe_path} "
+            write_config_atomically(CORAZA_SPOE_CONFIG_PATH, coraza_spoe_cfg)
+            logger.info(f"Coraza SPOE engine config written to "
+                        f"{CORAZA_SPOE_CONFIG_PATH} "
                         f"(SPOA target: {coraza_spoe_backend})")
-
-        # Write complete configuration to tmp
-        temp_config_path = "/etc/haproxy/haproxy.cfg"
 
         config_content = '\n'.join(config_parts)
         logger.debug("Generated HAProxy configuration")
 
-        # Write complete configuration to tmp
-        # Write new configuration to file
-        with open(HAPROXY_CONFIG_PATH, 'w') as f:
-            f.write(config_content)
-        
+        # Write new configuration to file (atomically - a truncated haproxy.cfg
+        # is as fatal as an invalid one). The rollback point was taken above,
+        # before this write.
+        write_config_atomically(HAPROXY_CONFIG_PATH, config_content)
+
         # Use safe reload with validation and rollback
-        success, message = reload_haproxy_safely()
+        success, message = reload_haproxy_safely(backup_status=backup_status)
         if success:
             logger.info("Configuration generated and HAProxy reloaded safely")
             log_operation('generate_config', True, 'Configuration generated and HAProxy reloaded safely')
@@ -2019,63 +2037,306 @@ backend default-backend
         traceback.print_exc()
         raise
 
-def create_backup():
-    """Create backup of current config and map files"""
+# ---------------------------------------------------------------------------
+# Config backup / rollback
+# ---------------------------------------------------------------------------
+# Rollback only works if the backup predates the write it is supposed to undo.
+# Until 2026-08 create_backup() ran from inside reload_haproxy_safely(), i.e.
+# AFTER generate_config() had already overwritten haproxy.cfg — so the "backup"
+# was a copy of the new (possibly broken) config and restore_backup() restored
+# the same broken bytes. The advertised rollback was a no-op and a fatal
+# haproxy.cfg persisted on disk, where start_haproxy() refuses to launch (the
+# June 2026 missing-template incident). create_backup() must now be called by
+# the writer, BEFORE the first byte is written.
+
+# Statuses returned by create_backup() that mean a rollback target exists.
+_ROLLBACK_AVAILABLE_STATUSES = ('created', 'kept_previous')
+
+
+def _files_identical(path_a, path_b):
+    """Byte-compare two files.
+
+    Deliberately not filecmp.cmp(): it memoises on (size, mtime), and
+    shutil.copy2() preserves mtime, so a stale cache entry could report a
+    changed config as unchanged. These files are small; read them.
+    """
     try:
-        if os.path.exists(HAPROXY_CONFIG_PATH):
-            shutil.copy2(HAPROXY_CONFIG_PATH, HAPROXY_BACKUP_PATH)
-        if os.path.exists(BLOCKED_IPS_MAP_PATH):
-            shutil.copy2(BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH)
-        logger.info("Backups created successfully")
-        return True
+        if os.path.getsize(path_a) != os.path.getsize(path_b):
+            return False
+        with open(path_a, 'rb') as fa, open(path_b, 'rb') as fb:
+            while True:
+                chunk_a = fa.read(65536)
+                chunk_b = fb.read(65536)
+                if chunk_a != chunk_b:
+                    return False
+                if not chunk_a:
+                    return True
+    except OSError:
+        return False
+
+
+def _config_set_matches_backup():
+    """True if every live config file is byte-identical to its backup copy.
+
+    After a successful reload the live set has already been recorded as
+    known-good (see promote_current_config_to_backup()), which is the common
+    case at the start of the next generation. Recognising it lets create_backup()
+    skip both the re-validation and the copy - worth doing because
+    `haproxy -c` on an edge with hundreds of certificates is not free and
+    generate_config() runs synchronously inside customer-facing API calls.
+    """
+    for live_path, backup_path in _config_backup_pairs():
+        if os.path.exists(live_path) != os.path.exists(backup_path):
+            return False
+        if (os.path.exists(live_path)
+                and not _files_identical(live_path, backup_path)):
+            return False
+    return True
+
+
+def _config_backup_pairs():
+    """(live, backup) pairs forming one restorable config set.
+
+    Built at call time rather than at import so the module-level path constants
+    stay patchable (tests, alternate deployments).
+    """
+    return (
+        (HAPROXY_CONFIG_PATH, HAPROXY_BACKUP_PATH),
+        (BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH),
+        (CORAZA_SPOE_CONFIG_PATH, CORAZA_SPOE_BACKUP_PATH),
+    )
+
+
+def write_config_atomically(path, content):
+    """Write content to path via temp file + rename.
+
+    A half-written haproxy.cfg (disk full, container killed mid-write) is just
+    as fatal as an invalid one and is invisible to the caller. os.replace() is
+    atomic within a filesystem, so the file on disk is always either the whole
+    old config or the whole new one — never a truncated hybrid. This also keeps
+    the "existing config is already broken" case from being self-inflicted.
+    """
+    directory = os.path.dirname(path) or '.'
+    # Preserve the mode of the file we are replacing; mkstemp defaults to 0600
+    # and HAProxy config files are conventionally 0644.
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        mode = 0o644
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=os.path.basename(path) + '.', suffix='.tmp'
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def create_backup(require_valid=True):
+    """Snapshot the CURRENT on-disk config set as the rollback point.
+
+    MUST be called BEFORE the new configuration is written — see the module
+    comment above. Calling it afterwards silently disarms rollback.
+
+    require_valid=True (default) refuses to promote a config that HAProxy
+    already rejects. Backing up a broken config would make "rollback" mean
+    "restore a different broken config"; keeping the older, validated backup
+    instead means a rollback always lands on something HAProxy will actually
+    start with. Cost is one `haproxy -c` run per config generation.
+
+    Returns (ok, status):
+      ok=False, status='error'      - the copy itself failed; caller decides.
+      status='created'              - backup now holds the current config.
+      status='kept_previous'        - current config missing or invalid; the
+                                      existing (older, good) backup was kept.
+      status='unavailable'          - nothing to roll back to at all (first
+                                      run, or broken config and no prior
+                                      backup). Rollback is NOT possible.
+    """
+    try:
+        snapshot_ok = True
+        reason = None
+
+        if not os.path.exists(HAPROXY_CONFIG_PATH):
+            snapshot_ok = False
+            reason = 'no existing HAProxy config on disk (first run?)'
+        elif _config_set_matches_backup():
+            # The backup already IS the current config, recorded when it last
+            # loaded successfully. Nothing to copy and nothing to re-validate.
+            logger.debug("Config backup already matches the live config")
+            return True, 'created'
+        elif require_valid:
+            status, msg = validate_config_file(HAPROXY_CONFIG_PATH)
+            if status == 'invalid':
+                snapshot_ok = False
+                reason = f'current config on disk does not validate: {msg}'
+            elif status == 'unavailable':
+                # The validator itself could not run (no haproxy binary, etc).
+                # That is NOT evidence the config is bad, and refusing to back
+                # up would leave us with no rollback target at all, so fall
+                # back to last-written semantics and say so loudly.
+                logger.warning(
+                    f"Could not verify current config before backup ({msg}); "
+                    "backing it up unverified"
+                )
+
+        if not snapshot_ok:
+            if os.path.exists(HAPROXY_BACKUP_PATH):
+                logger.warning(
+                    f"Not refreshing config backup: {reason}. Keeping the "
+                    f"existing backup at {HAPROXY_BACKUP_PATH} as the rollback "
+                    "target."
+                )
+                return True, 'kept_previous'
+            logger.error(
+                f"No config backup could be taken: {reason}, and no previous "
+                f"backup exists at {HAPROXY_BACKUP_PATH}. ROLLBACK IS NOT "
+                "AVAILABLE for this configuration change."
+            )
+            return True, 'unavailable'
+
+        for live_path, backup_path in _config_backup_pairs():
+            if os.path.exists(live_path):
+                shutil.copy2(live_path, backup_path)
+        logger.info("Backup of last-known-good config created successfully")
+        return True, 'created'
     except Exception as e:
         logger.error(f"Failed to create backup: {e}")
-        return False
+        return False, 'error'
 
-def restore_backup():
-    """Restore from backup files"""
+def promote_current_config_to_backup():
+    """Record the live config as the known-good rollback target.
+
+    Called ONLY after the config has both validated and been loaded by HAProxy,
+    so "backup" really means "the last configuration this box was running".
+    Must never be called before a reload attempt: doing so would make the
+    backup a copy of the config we may still have to roll back from - the same
+    class of bug as backing up after the write.
+
+    Without this, a box whose very first generation succeeded has no rollback
+    target at all until its second successful generation, and any corruption of
+    haproxy.cfg in between leaves nothing to recover to.
+    """
     try:
-        if os.path.exists(HAPROXY_BACKUP_PATH):
-            shutil.copy2(HAPROXY_BACKUP_PATH, HAPROXY_CONFIG_PATH)
-        if os.path.exists(BLOCKED_IPS_MAP_BACKUP_PATH):
-            shutil.copy2(BLOCKED_IPS_MAP_BACKUP_PATH, BLOCKED_IPS_MAP_PATH)
-        logger.info("Backups restored successfully")
+        for live_path, backup_path in _config_backup_pairs():
+            if os.path.exists(live_path):
+                shutil.copy2(live_path, backup_path)
+        logger.debug("Known-good config backup updated after successful reload")
         return True
     except Exception as e:
-        logger.error(f"Failed to restore backup: {e}")
+        # Non-fatal: the config is live and working, we just failed to record
+        # it. Loud, because the next change now has a staler rollback target.
+        logger.error(f"Failed to record known-good config backup: {e}")
         return False
 
-def validate_haproxy_config():
-    """Validate HAProxy configuration file"""
-    try:
-        result = subprocess.run(['haproxy', '-c', '-f', HAPROXY_CONFIG_PATH], 
-                              capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info("HAProxy configuration validation passed")
-            return True, None
-        else:
-            error_msg = f"HAProxy configuration validation failed: {result.stderr}"
-            logger.error(error_msg)
-            return False, error_msg
-    except Exception as e:
-        error_msg = f"Error validating HAProxy config: {e}"
-        logger.error(error_msg)
-        return False, error_msg
 
-def reload_haproxy_safely():
-    """Safely reload HAProxy with validation and rollback"""
+def restore_backup():
+    """Restore the backed-up config set over the live files.
+
+    Returns (restored, message). restored=False means NOTHING was rolled back
+    and the live config is still whatever the failed change left on disk —
+    callers MUST surface that difference, it is the difference between "we
+    recovered" and "this edge is sitting on a config HAProxy will not load".
+    """
+    if not os.path.exists(HAPROXY_BACKUP_PATH):
+        msg = (f"No config backup at {HAPROXY_BACKUP_PATH} - cannot roll back; "
+               f"{HAPROXY_CONFIG_PATH} still holds the failed configuration")
+        logger.critical(msg)
+        return False, msg
     try:
-        # Create backup before changes
-        if not create_backup():
-            return False, "Failed to create backup"
-        
+        for live_path, backup_path in _config_backup_pairs():
+            if os.path.exists(backup_path):
+                shutil.copy2(backup_path, live_path)
+        msg = f"Configuration restored from backup ({HAPROXY_BACKUP_PATH})"
+        logger.info(msg)
+        return True, msg
+    except Exception as e:
+        msg = (f"Failed to restore backup: {e} - {HAPROXY_CONFIG_PATH} may hold "
+               "a broken configuration")
+        logger.critical(msg)
+        return False, msg
+
+
+def validate_config_file(config_path):
+    """Run `haproxy -c` against config_path.
+
+    Returns (status, message) with status one of:
+      'valid'       - HAProxy parsed the file successfully
+      'invalid'     - HAProxy rejected it (message carries stderr)
+      'unavailable' - the validator could not be run at all (binary missing,
+                      timeout, ...). Deliberately distinct from 'invalid':
+                      it tells us nothing about the config.
+    """
+    try:
+        result = subprocess.run(['haproxy', '-c', '-f', config_path],
+                                capture_output=True, text=True)
+    except Exception as e:
+        return 'unavailable', f"Error validating HAProxy config: {e}"
+    if result.returncode == 0:
+        return 'valid', None
+    return 'invalid', f"HAProxy configuration validation failed: {result.stderr}"
+
+
+def validate_haproxy_config():
+    """Validate the live HAProxy configuration file. Returns (is_valid, error)."""
+    status, message = validate_config_file(HAPROXY_CONFIG_PATH)
+    if status == 'valid':
+        logger.info("HAProxy configuration validation passed")
+        return True, None
+    logger.error(message)
+    return False, message
+
+def reload_haproxy_safely(backup_status=None):
+    """Safely reload HAProxy with validation and rollback.
+
+    PRECONDITION: the caller must already have called create_backup() BEFORE
+    writing the new config, and pass the status it returned. This function runs
+    after the new config is on disk, so it cannot take a meaningful backup
+    itself — doing so is exactly the bug this contract exists to prevent.
+
+    backup_status=None means the caller did not take a pre-write backup. We do
+    NOT create one here (that would overwrite a genuinely good backup with the
+    unverified new config); we log it and fall back to whatever backup already
+    exists on disk.
+    """
+    try:
+        if backup_status is None:
+            logger.error(
+                "reload_haproxy_safely() called without a pre-write backup "
+                "status - rollback will fall back to whatever backup already "
+                "exists on disk. Callers must call create_backup() BEFORE "
+                "writing the new configuration."
+            )
+        elif backup_status not in _ROLLBACK_AVAILABLE_STATUSES:
+            logger.warning(
+                f"Proceeding with reload without a rollback target "
+                f"(backup status: {backup_status})"
+            )
+
         # Validate new configuration
         is_valid, error_msg = validate_haproxy_config()
         if not is_valid:
             # Restore backup on validation failure
-            restore_backup()
+            restored, restore_msg = restore_backup()
+            if not restored:
+                logger.critical(
+                    "Config validation failed AND rollback was not possible - "
+                    f"{HAPROXY_CONFIG_PATH} holds an invalid configuration that "
+                    "HAProxy will refuse to start with"
+                )
+                return False, (f"Config validation failed: {error_msg} | "
+                               f"ROLLBACK FAILED: {restore_msg}")
             return False, f"Config validation failed: {error_msg}"
-        
+
         # Attempt reload
         if is_process_running('haproxy'):
             # Use HAProxy stats socket for graceful reload
@@ -2094,20 +2355,28 @@ def reload_haproxy_safely():
                 
                 if reload_result.returncode == 0:
                     logger.info("HAProxy reloaded successfully")
+                    # Now - and only now - is this config known good.
+                    promote_current_config_to_backup()
                     return True, "HAProxy reloaded successfully"
                 else:
                     # Reload failed, restore backup
-                    restore_backup()
-                    # Try to reload with backup config
-                    subprocess.run('echo "reload" | socat stdio /tmp/haproxy-cli', 
-                                 shell=True, capture_output=True)
+                    restored, restore_msg = restore_backup()
+                    if restored:
+                        # Try to reload with the restored (known-good) config
+                        subprocess.run(
+                            'echo "reload" | socat stdio /tmp/haproxy-cli',
+                            shell=True, capture_output=True)
                     error_msg = f"HAProxy reload failed: {reload_result.stderr}"
+                    if not restored:
+                        error_msg += f" | ROLLBACK FAILED: {restore_msg}"
                     logger.error(error_msg)
                     return False, error_msg
             except Exception as e:
                 # Critical error during reload, restore backup
-                restore_backup()
+                restored, restore_msg = restore_backup()
                 error_msg = f"Critical error during reload: {e}"
+                if not restored:
+                    error_msg += f" | ROLLBACK FAILED: {restore_msg}"
                 logger.error(error_msg)
                 return False, error_msg
         else:
@@ -2118,11 +2387,15 @@ def reload_haproxy_safely():
                     check=True, capture_output=True, text=True
                 )
                 logger.info("HAProxy started successfully")
+                # Now - and only now - is this config known good.
+                promote_current_config_to_backup()
                 return True, "HAProxy started successfully"
             except subprocess.CalledProcessError as e:
                 # Start failed, restore backup
-                restore_backup()
+                restored, restore_msg = restore_backup()
                 error_msg = f"Failed to start HAProxy: {e.stderr}"
+                if not restored:
+                    error_msg += f" | ROLLBACK FAILED: {restore_msg}"
                 logger.error(error_msg)
                 return False, error_msg
     except Exception as e:
