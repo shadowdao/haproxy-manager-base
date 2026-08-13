@@ -21,6 +21,8 @@ set -eo pipefail
 mkdir -p /etc/haproxy
 [ -f /etc/haproxy/trusted_ips.list ] || : > /etc/haproxy/trusted_ips.list
 [ -f /etc/haproxy/trusted_ips.map ]  || : > /etc/haproxy/trusted_ips.map
+[ -f /etc/haproxy/cloudflare_ips.list ]  || : > /etc/haproxy/cloudflare_ips.list
+[ -f /etc/haproxy/trusted_proxies.list ] || : > /etc/haproxy/trusted_proxies.list
 
 cron &
 
