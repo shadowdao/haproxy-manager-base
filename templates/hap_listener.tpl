@@ -118,6 +118,42 @@ frontend web
     acl has_login_cookie req.cook(whplc) -m found
     http-request deny deny_status 403 if METH_POST wp_login_path !has_login_cookie !is_local !is_trusted_ip !is_whitelisted
 
+    # --- WordPress xmlrpc.php flood protection ---
+    # xmlrpc.php floods are a common, sustained abuse pattern that the generic
+    # limits above don't catch: those trigger at 3000/5000 req/10s (300-500
+    # req/s, sized for media-heavy pageloads), while observed xmlrpc floods run
+    # at just a few req/s for hours -- comfortably under that ceiling but still
+    # enough to pin PHP-FPM workers and show up as 503s for the rest of the
+    # site. Same shape of problem as wp-login credential stuffing, so it gets
+    # the same fix: track POSTs to xmlrpc.php per real client IP in a DEDICATED
+    # 60s table (sc2 / backend xmlrpc_bruteforce, defined in
+    # hap_security_tables.tpl -- kept separate from wp_bruteforce so the two
+    # endpoints' traffic can't inflate each other's counter, see that file for
+    # the reasoning) and tarpit once an IP exceeds the threshold.
+    #
+    # Threshold is 60/min (double wp-login's 30/min), not because xmlrpc abuse
+    # is less severe but because legitimate traffic here is machine-to-machine
+    # rather than a human filling out a form: Jetpack sync, the WordPress
+    # mobile app, and remote-publishing clients (e.g. an offline blog editor)
+    # can legitimately burst several xmlrpc calls in quick succession. 60/min
+    # (1 req/s average over the window) comfortably absorbs that burst while
+    # still tripping well before an hours-long few-req/s flood does real
+    # damage -- at 2 req/s sustained the 60s counter clears the threshold in
+    # under a minute.
+    #
+    # Tarpit (not deny), matching the wp-login rule: this is per-IP tracking
+    # of a bounded set of offenders, not the wp-login cookie challenge's
+    # distributed hundreds-of-thousands-of-IPs scenario where holding
+    # connections would exhaust HAProxy itself, so tying up the flooding IP's
+    # connections is the cheaper and more effective response. path_end (not
+    # path_beg) covers subdirectory WP installs, same reasoning as wp-login.
+    # Honors the same whitelist (RFC1918 / trusted_ips.list / trusted_ips.map)
+    # so health checks and trusted infrastructure are unaffected, and legit
+    # clients under the threshold are never blocked outright.
+    acl xmlrpc_path path_end /xmlrpc.php
+    http-request track-sc2 var(txn.real_ip) table xmlrpc_bruteforce if METH_POST xmlrpc_path
+    http-request tarpit deny_status 429 if METH_POST xmlrpc_path { sc_http_req_rate(2) gt 60 } !is_local !is_trusted_ip !is_whitelisted
+
     # WordPress REST batch endpoint lockdown ("wp2shell": CVE-2026-63030 +
     # CVE-2026-60137). Chaining a core SQL injection with REST batch-route
     # confusion gives unauthenticated RCE on WP 6.9.0-6.9.4 and 7.0.0-7.0.1
