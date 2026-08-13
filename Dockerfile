@@ -31,10 +31,15 @@ COPY haproxy_manager.py /haproxy/
 COPY scripts /haproxy/scripts
 COPY trusted_ips.list /etc/haproxy/trusted_ips.list
 COPY trusted_ips.map /etc/haproxy/trusted_ips.map
-COPY cloudflare_ips.list /etc/haproxy/cloudflare_ips.list
-COPY trusted_proxies.list /etc/haproxy/trusted_proxies.list
 # /etc/haproxy is a named volume in deployed containers, so baked-in files
-# under that path get shadowed by the volume on existing deployments.
+# under that path get shadowed by the volume on existing deployments. The
+# trusted_ips.* pair above predates that discovery and is handled by the
+# older start-up.sh guard (out of scope here). cloudflare_ips.list and
+# trusted_proxies.list are staged under /haproxy/defaults instead, so
+# start-up.sh can always read the image's baked copy regardless of what the
+# volume shadows /etc/haproxy with.
+COPY cloudflare_ips.list /haproxy/defaults/cloudflare_ips.list
+COPY trusted_proxies.list /haproxy/defaults/trusted_proxies.list
 # Place errorfiles outside the volumed path; the HAProxy config references
 # them by absolute path.
 COPY errors /haproxy/errors
