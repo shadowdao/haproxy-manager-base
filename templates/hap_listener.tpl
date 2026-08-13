@@ -22,6 +22,28 @@ frontend web
     # Capture Host header so it appears in httplog output (in %hr field)
     http-request capture req.hdr(Host) len 64
 
+    # --- Trusted-proxy gate (MUST precede real-IP resolution below) ---
+    # CF-Connecting-IP / X-Real-IP / X-Forwarded-For are client-supplied. Any
+    # peer that is not a known reverse proxy gets them stripped, so the
+    # set-var chain below falls through to `src` -- the real TCP peer.
+    #
+    # Without this, a direct client dictates txn.real_ip, and every control
+    # keyed on that variable trusts the attacker's own claim: rate limiting
+    # (track-sc0), the trusted-IP whitelist, the wp-login brute-force table and
+    # cookie challenge, the wp-json/batch/v1 virtual patch, IP blocking, and
+    # Coraza's src-ip. Spoofing a whitelisted IP bypassed all of them.
+    #
+    # ORDER MATTERS: these must come before the set-var lines. HAProxy applies
+    # http-request rules in file order, so a strip placed afterwards would
+    # validate cleanly and accomplish nothing.
+    #
+    # Cloudflare-fronted domains keep working: CF's edge matches
+    # from_trusted_proxy, so its CF-Connecting-IP survives.
+    acl from_trusted_proxy src -f /etc/haproxy/cloudflare_ips.list -f /etc/haproxy/trusted_proxies.list
+    http-request del-header CF-Connecting-IP if !from_trusted_proxy
+    http-request del-header X-Real-IP        if !from_trusted_proxy
+    http-request del-header X-Forwarded-For  if !from_trusted_proxy
+
     # Detect real client IP from proxy headers if they exist
     # Priority: CF-Connecting-IP (Cloudflare) > X-Real-IP > X-Forwarded-For > src
     acl has_cf_connecting_ip req.hdr(CF-Connecting-IP) -m found

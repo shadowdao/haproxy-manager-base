@@ -1,0 +1,13 @@
+# Additional trusted reverse proxies — peers permitted to set CF-Connecting-IP,
+# X-Real-IP and X-Forwarded-For. Anything NOT matched here or in
+# cloudflare_ips.list has those headers stripped before real-IP resolution.
+#
+# Referenced by templates/hap_listener.tpl.
+#
+# Leave EMPTY unless a real proxy sits in front of HAProxy on this host. Adding
+# a range here lets that peer assert any client identity, which bypasses rate
+# limits, IP blocks and the WAF for it.
+#
+# Do NOT commit real IPs — this repo is mirrored publicly. Add entries directly
+# on the server; the file lives in the /etc/haproxy named volume and persists
+# across container recreates.
