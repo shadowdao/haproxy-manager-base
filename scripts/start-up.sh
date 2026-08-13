@@ -21,8 +21,31 @@ set -eo pipefail
 mkdir -p /etc/haproxy
 [ -f /etc/haproxy/trusted_ips.list ] || : > /etc/haproxy/trusted_ips.list
 [ -f /etc/haproxy/trusted_ips.map ]  || : > /etc/haproxy/trusted_ips.map
-[ -f /etc/haproxy/cloudflare_ips.list ]  || : > /etc/haproxy/cloudflare_ips.list
-[ -f /etc/haproxy/trusted_proxies.list ] || : > /etc/haproxy/trusted_proxies.list
+
+# cloudflare_ips.list is SHIPPED DATA: it must always match what this image
+# bakes in (/haproxy/defaults), so a Cloudflare range refresh actually reaches
+# existing hosts instead of being permanently shadowed by the volume.
+# Overwrite it from the baked copy on every start.
+#
+# trusted_proxies.list is OPERATOR DATA: operators add entries directly on
+# the server and those must survive restarts/recreates. Seed it from the
+# baked copy only when it's missing; never overwrite an existing one.
+#
+# Both branches fall back to an empty file if the baked default is somehow
+# absent, because "acl ... -f <missing file>" is a fatal HAProxy config
+# error -- the list files must exist unconditionally by the time HAProxy starts.
+if [ -f /haproxy/defaults/cloudflare_ips.list ]; then
+    cp /haproxy/defaults/cloudflare_ips.list /etc/haproxy/cloudflare_ips.list
+else
+    [ -f /etc/haproxy/cloudflare_ips.list ] || : > /etc/haproxy/cloudflare_ips.list
+fi
+if [ ! -f /etc/haproxy/trusted_proxies.list ]; then
+    if [ -f /haproxy/defaults/trusted_proxies.list ]; then
+        cp /haproxy/defaults/trusted_proxies.list /etc/haproxy/trusted_proxies.list
+    else
+        : > /etc/haproxy/trusted_proxies.list
+    fi
+fi
 
 cron &
 
