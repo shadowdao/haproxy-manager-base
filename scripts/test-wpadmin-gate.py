@@ -48,6 +48,16 @@ ALLOWLIST = ('/admin-ajax.php', '/admin-post.php',
 EXCLUSIONS = ('!wp_admin_allowed', '!wp_admin_asset', '!has_wp_logged_in',
               '!wp_gate_exempt', '!is_local', '!is_trusted_ip', '!is_whitelisted')
 
+# The normalizer set, in the order it MUST render. Decoding has to precede the
+# path walkers or "%2e%2e" is decoded to ".." only after path-strip-dotdot has
+# already run, leaving the ".." unresolved -- measured against real HAProxy
+# 3.0.11, both orders side by side.
+NORMALIZERS = ('percent-to-uppercase',
+               'percent-decode-unreserved',
+               'path-merge-slashes',
+               'path-strip-dot',
+               'path-strip-dotdot full')
+
 
 def render_listener():
     return haproxy_manager.template_env.get_template('hap_listener.tpl').render(
@@ -55,6 +65,24 @@ def render_listener():
         suspension_enabled=False,
         coraza_spoe_backend=None,
     )
+
+
+def render_header():
+    return haproxy_manager.template_env.get_template('hap_header.tpl').render(
+        cluster_secret=None,
+    )
+
+
+def rule_lines(cfg, needle):
+    """Non-comment config lines containing `needle`.
+
+    Every assertion about a RULE must be scoped this way. This file's
+    surrounding comment blocks quote the ACL names and even whole rules, so a
+    bare `assertIn` over the rendered config passes just as happily when the
+    rule has been deleted and only its explanation remains.
+    """
+    return [ln.strip() for ln in cfg.split('\n')
+            if needle in ln and not ln.strip().startswith('#')]
 
 
 class WpAdminGate(unittest.TestCase):
@@ -175,6 +203,155 @@ class WpAdminGate(unittest.TestCase):
 
     def test_wp_admin_safe_path_acl_declared(self):
         self.assertRegex(self.cfg, r'acl\s+wp_admin_safe_path\s+path_reg')
+
+    def test_unsafe_wp_admin_path_is_denied_not_passed_through(self):
+        """wp_admin_safe_path being a POSITIVE condition on the redirect means
+        a path that fails it is simply not redirected -- which used to mean it
+        fell through to the backend UNGATED, i.e. exactly the PHP-booting
+        request the gate exists to stop. Normalisation removes the "//"
+        spelling of that, but not "/\\", so the fall-through must be closed
+        with an explicit deny rather than left implicit.
+        """
+        denies = rule_lines(self.cfg, '!wp_admin_safe_path')
+        self.assertTrue(denies,
+                        'no rule denies a wp-admin path that fails wp_admin_safe_path')
+        self.assertTrue(any(d.startswith('http-request deny') for d in denies),
+                        'the !wp_admin_safe_path rule must be a deny: %r' % denies)
+
+
+class UriNormalisation(unittest.TestCase):
+    """The gate matches the RAW path; the backend normalises and decodes it.
+    Every gap between those is a bypass -- five were found this way. These
+    tests pin the normalisation that closes the gap as a class.
+
+    NOTE: these are config-TEXT assertions. They are necessary but NOT
+    sufficient: the previous revision of this file passed while five live
+    bypasses shipped. The real evidence is the behavioural matrix run against
+    real haproxy 3.0.11 with raw sockets -- see
+    .superpowers/sdd/2026-08-14-wpadmin-edge-gate/task-4-normalize-report.md.
+    """
+
+    def setUp(self):
+        self.cfg = render_listener()
+        self.header = render_header()
+
+    def test_experimental_directives_exposed_in_global(self):
+        """normalize-uri is experimental in 3.0; without this HAProxy does not
+        start at all (ALERT, exit 1), which crash-loops the container.
+        """
+        self.assertTrue(
+            [ln for ln in self.header.split('\n')
+             if ln.strip() == 'expose-experimental-directives'],
+            'expose-experimental-directives missing from the global section')
+
+    def test_all_normalizers_render(self):
+        for norm in NORMALIZERS:
+            with self.subTest(normalizer=norm):
+                self.assertTrue(
+                    rule_lines(self.cfg, 'normalize-uri ' + norm),
+                    'missing normalizer: ' + norm)
+
+    def test_normalizer_order_decode_before_path_walkers(self):
+        """Reverse this order and /wp-admin/js/%2e%2e/plugins.php reaches the
+        ACLs as /wp-admin/js/../plugins.php -- decoded but unresolved.
+        """
+        rendered = [ln for ln in self.cfg.split('\n')
+                    if ln.strip().startswith('http-request normalize-uri')]
+        names = [ln.strip().split('normalize-uri ', 1)[1] for ln in rendered]
+        self.assertEqual(names, list(NORMALIZERS))
+
+    def test_normalisation_precedes_every_path_based_rule(self):
+        """A normalizer placed after a path rule normalises nothing for it."""
+        last_norm = max(self.cfg.index('http-request normalize-uri ' + n)
+                        for n in NORMALIZERS)
+        for marker in ('acl is_health_check', 'acl wp_login_path',
+                       'acl xmlrpc_path', 'acl wp_batch_path',
+                       'acl wp_admin_path', 'http-request set-path'):
+            with self.subTest(rule=marker):
+                self.assertLess(last_norm, self.cfg.index(marker),
+                                marker + ' renders before URI normalisation')
+
+    def test_query_sort_by_name_is_not_enabled(self):
+        """It reorders query parameters, breaking anything that signs or caches
+        on the exact query string, and buys this gate nothing (every rule here
+        matches on `path`, which excludes the query).
+        """
+        self.assertFalse(rule_lines(self.cfg, 'normalize-uri query-sort-by-name'))
+
+    def test_dotdot_normalizer_uses_full(self):
+        """Without "full", ".." segments that climb above the root are left in
+        place and /../../wp-admin/plugins.php survives -- measured.
+        """
+        lines = rule_lines(self.cfg, 'normalize-uri path-strip-dotdot')
+        self.assertTrue(lines)
+        for ln in lines:
+            self.assertTrue(ln.endswith('path-strip-dotdot full'), ln)
+
+    def test_encoded_separator_on_wp_admin_is_denied(self):
+        """percent-decode-unreserved deliberately leaves %2F encoded ("/" is
+        reserved), but OpenLiteSpeed decodes it and serves the file --
+        /wp-admin%2Fplugins.php was measured booting PHP on the OLS tier while
+        matching no wp-admin ACL. Normalisation cannot close this; it needs its
+        own rule.
+        """
+        denies = [ln for ln in rule_lines(self.cfg, 'path_has_encoded_sep')
+                  if ln.startswith('http-request deny')]
+        self.assertTrue(denies, 'no deny rule for encoded separators')
+        acl = rule_lines(self.cfg, 'acl path_has_encoded_sep')
+        self.assertTrue(acl)
+        self.assertIn('%2f', acl[0].lower())
+
+    def test_encoded_separator_deny_is_scoped_to_wp_admin(self):
+        """A blanket "deny any %2F in any path" would break non-WordPress
+        customer apps that legitimately pass an encoded slash in a path
+        parameter. The deny must be conditioned on the path mentioning
+        wp-admin.
+        """
+        denies = [ln for ln in rule_lines(self.cfg, 'path_has_encoded_sep')
+                  if ln.startswith('http-request deny')]
+        for d in denies:
+            self.assertIn('wp_admin_word', d)
+
+    def test_encoded_separator_deny_honors_the_same_whitelist(self):
+        denies = [ln for ln in rule_lines(self.cfg, 'path_has_encoded_sep')
+                  if ln.startswith('http-request deny')]
+        for d in denies:
+            for excl in ('!has_wp_logged_in', '!wp_gate_exempt', '!is_local',
+                         '!is_trusted_ip', '!is_whitelisted'):
+                with self.subTest(rule=d, exclusion=excl):
+                    self.assertIn(excl, d)
+
+    def test_encoded_separator_acl_matches_a_substring_not_a_prefix(self):
+        """/blog%2Fwp-admin/plugins.php hides the separator BEFORE "wp-admin",
+        where an anchored pattern never matches, and OLS still resolves it.
+        """
+        acl = rule_lines(self.cfg, 'acl path_has_encoded_sep')[0]
+        self.assertIn('-m sub', acl)
+
+    def test_wp_admin_asset_bypass_cannot_cover_a_php_entrypoint(self):
+        """The asset bypass anchored its prefix but not its suffix, so
+        /wp-admin/css/../plugins.php took it and the backend then resolved
+        ".." and booted plugins.php. path-strip-dotdot is the real fix; this
+        keeps the bypass structurally incapable of covering PHP.
+        """
+        acl = rule_lines(self.cfg, 'acl wp_admin_asset')[0]
+        self.assertIn('.php', acl,
+                      'wp_admin_asset must exclude .php explicitly')
+
+    def test_case_insensitive_acl_and_regsub_are_kept_in_sync(self):
+        """A case-insensitive wp_admin_path with a case-sensitive regsub is an
+        INFINITE REDIRECT LOOP: regsub finds no "/wp-admin/" in
+        "/WP-ADMIN/plugins.php", returns `path` unchanged, and the Location
+        then points at the request's own URL.
+        """
+        acl = rule_lines(self.cfg, 'acl wp_admin_path')[0]
+        setvar = rule_lines(self.cfg, 'set-var(txn.wp_login_url)')[0]
+        acl_ci = bool(re.search(r'path_reg\s+-i\s', acl))
+        regsub_ci = bool(re.search(r'regsub\([^)]*,\s*i\)', setvar))
+        self.assertEqual(
+            acl_ci, regsub_ci,
+            'wp_admin_path case-sensitivity (%s) and regsub flags (%s) disagree'
+            % (acl, setvar))
 
 
 if __name__ == '__main__':

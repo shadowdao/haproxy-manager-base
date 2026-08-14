@@ -27,6 +27,21 @@ global
     # SSL and Performance
     tune.ssl.default-dh-param 2048
 
+    # Required by the `http-request normalize-uri` chain at the top of the
+    # `web` frontend (hap_listener.tpl). normalize-uri is still flagged
+    # EXPERIMENTAL in HAProxy 3.0, and HAProxy REFUSES TO START without this
+    # opt-in -- not a warning, a fatal:
+    #   [ALERT] config : parsing [...] : 'normalize-uri' action is
+    #   experimental, must be allowed via a global
+    #   'expose-experimental-directives'
+    # (verified against real haproxy 3.0.11-9e587df: `haproxy -c` exits 1).
+    # So this line and the normalize-uri rules must be added/removed together;
+    # dropping this one alone crash-loops every container on the fleet.
+    #
+    # This exposes ONLY the experimental directives that are actually used --
+    # it does not change the behaviour of anything else in this file.
+    expose-experimental-directives
+
     # HTTP/3 over QUIC. The Debian haproxy package is built against system
     # OpenSSL via the compatibility shim (USE_QUIC_OPENSSL_COMPAT), which is
     # not a native QUIC TLS stack. HAProxy therefore rejects `quic*@` binds
