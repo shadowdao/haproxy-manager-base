@@ -35,8 +35,23 @@ global
     #   experimental, must be allowed via a global
     #   'expose-experimental-directives'
     # (verified against real haproxy 3.0.11-9e587df: `haproxy -c` exits 1).
-    # So this line and the normalize-uri rules must be added/removed together;
-    # dropping this one alone crash-loops every container on the fleet.
+    # So this line and the normalize-uri rules must be added/removed together.
+    #
+    # Dropping this one alone does NOT crash-loop the container -- the truth
+    # is worse: it is a SILENT TOTAL OUTAGE that nothing escalates. Container
+    # init (scripts/init.py -> haproxy_manager.do_initial_setup()) calls
+    # generate_config() (which still succeeds -- Jinja doesn't validate
+    # HAProxy semantics) and then start_haproxy(), which runs `haproxy -c`,
+    # sees it fail, logs an error, and RETURNS WITHOUT RAISING. init.py exits
+    # 0. scripts/start-up.sh then execs gunicorn as PID 1 regardless. Result:
+    # the container stays "Up", ports 80/443 are never bound, EVERY SITE ON
+    # THE HOST IS DOWN, and the in-container supervisor loop
+    # (ensure_haproxy.py, every HAPROXY_SUPERVISOR_INTERVAL seconds) retries
+    # the identical failing render forever without ever escalating. Worse
+    # still, GET /health keeps returning HTTP 200 -- health_check() only
+    # answers 500 on a database error; a dead haproxy just flips the JSON
+    # body's "haproxy_status" to "stopped" while the status code a naive
+    # monitor checks never changes. Do not trust /health alone to catch this.
     #
     # This exposes ONLY the experimental directives that are actually used --
     # it does not change the behaviour of anything else in this file.

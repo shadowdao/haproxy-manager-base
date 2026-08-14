@@ -75,19 +75,39 @@ frontend web
     #                              leaves those in place and the vector
     #                              survives -- measured, both forms tested.
     #
-    # DELIBERATELY NOT ENABLED: query-sort-by-name. It reorders query-string
-    # parameters, which silently breaks anything that signs or caches on the
+    # DELIBERATELY NOT ENABLED: query-sort-by-name. Reordering query-string
+    # parameters would silently break anything that signs or caches on the
     # exact query string (signed asset URLs, HMAC'd callbacks, CDN cache
-    # keys). It buys this gate nothing -- every rule here matches on `path`,
-    # which excludes the query string.
+    # keys). This is NOT because the enabled normalizers already leave the
+    # query alone -- see BLAST RADIUS just below, they don't -- it is a
+    # deliberate line drawn between "case-fold / decode", which RFC 3986
+    # defines as no-ops, and "reorder", which is not a no-op for a caller
+    # treating the query as an opaque signed string.
     #
     # BLAST RADIUS: this block applies to EVERY request for EVERY site on
-    # EVERY tier, so the decoding was kept minimal on purpose.
-    # percent-decode-unreserved touches only unreserved characters, so
-    # %20 (space), %2B, %C3%A9 and friends pass through byte-identical --
-    # verified. The only rewrite a normal site can notice is %7E -> ~ , which
-    # RFC 3986 defines as the same URI, plus the merge/dot resolution the
-    # backend would have performed anyway.
+    # EVERY tier, so the decoding was kept minimal on purpose -- and it is
+    # NOT scoped to the path. percent-to-uppercase and percent-decode-
+    # unreserved normalise the WHOLE request-target as HAProxy parses it --
+    # query string included, not just the path component the ACLs below
+    # match on -- and the BACKEND receives the rewritten query on the wire,
+    # not just an internal haproxy view of it. Measured against real HAProxy
+    # 3.0.11:
+    #   /a?sig=%2babc%2fdef  -> /a?sig=%2Babc%2Fdef   (percent-hex upper-cased)
+    #   /a?b=%41%42%43       -> /a?b=ABC               (unreserved chars decoded)
+    #   /a?tok=%7e%2d%5f%2e  -> /a?tok=~-_.            (unreserved chars decoded)
+    # Only parameter ORDER is preserved -- that guarantee is exactly why
+    # query-sort-by-name above is the one normalizer in this family left
+    # disabled. Per RFC 3986 both enabled rewrites are defined as the same
+    # URI (case in a percent-escape, and an unreserved character vs. its
+    # escape, carry no distinct meaning), but "the same URI" is not "the
+    # same bytes": an application that HMACs or otherwise signs the RAW
+    # query string, rather than parsing it first, could see a mutated value
+    # and fail to verify an otherwise-legitimate request. Checked against
+    # this fleet: no .NET backends (.NET's UrlEncode emits lowercase
+    # percent-hex, which percent-to-uppercase would rewrite) and no
+    # URL-in-path proxies, so there is no known victim today -- but do not
+    # assume "path only" from this block; that was the actual bug in an
+    # earlier draft of this comment.
     #
     # normalize-uri is EXPERIMENTAL in 3.0 and requires
     # `expose-experimental-directives` in the global section

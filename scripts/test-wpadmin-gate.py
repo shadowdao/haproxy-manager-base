@@ -15,6 +15,20 @@ Two properties are easy to get wrong and invisible to `haproxy -c`:
     those entries leaves every login page on the fleet unstyled, while still
     returning 200 -- a silent regression.
 
+A THIRD property, added after an adversarial mutation audit: every assertion
+here must be scoped to the CODE, not the surrounding prose. This file's own
+comment blocks quote ACL names, rule fragments and even whole rules to explain
+them -- which means a bare `assertIn` / `re.search` / `str.index` run over the
+raw rendered config passes just as happily when the real rule has been deleted
+(or merely commented out) and only its explanation survives. The audit proved
+this concretely: commenting out the entire redirect rule, or the
+`acl wp_admin_allowed` line, or all five normalizers, left the previous version
+of this file at 26/26 PASS. See `rule_lines()` below, and use it (or one of the
+guarded helpers built on it) for every assertion about whether a rule exists,
+what it says, or where it sits relative to another rule. Do not add a new
+`self.cfg.index(...)`, `self.assertIn(x, self.cfg)`, or `re.search(pattern,
+self.cfg)` to this file -- none of them can tell code from comment.
+
 Running
 -------
     python3 scripts/test-wpadmin-gate.py
@@ -73,16 +87,100 @@ def render_header():
     )
 
 
-def rule_lines(cfg, needle):
-    """Non-comment config lines containing `needle`.
+# ---------------------------------------------------------------------------
+# Comment-safe config inspection
+#
+# Every helper below operates on `rule_positions()`'s output, never on the raw
+# rendered string. That is the one rule this whole module exists to enforce on
+# itself: a mutation audit found that commenting out a real rule (prefixing it
+# with '#', or -- more slyly -- deleting it and appending its own text as a
+# TRAILING comment on the line above) left the previous version of these tests
+# fully green, because plain `str.index` / `assertIn` / `re.search` over
+# `self.cfg` cannot distinguish code from a comment that merely quotes it.
+# ---------------------------------------------------------------------------
 
-    Every assertion about a RULE must be scoped this way. This file's
-    surrounding comment blocks quote the ACL names and even whole rules, so a
-    bare `assertIn` over the rendered config passes just as happily when the
-    rule has been deleted and only its explanation remains.
+def rule_positions(cfg, needle):
+    """[(comment-stripped line, char offset in cfg)] for every non-comment
+    line containing `needle`, in document order.
+
+    Two things a bare substring/regex search over `self.cfg` gets wrong, both
+    fixed here:
+
+      1. A line that is ENTIRELY a comment (starts with '#' once stripped) is
+         dropped. This is necessary but not sufficient -- see (2).
+      2. A line that MIXES real config with a trailing comment
+         (`live-code  # note`, or the decoy `live-code  # was: <the other
+         rule's exact text>`) is truncated at the first ' #' before matching,
+         so text stuffed into a trailing comment cannot masquerade as the
+         rule itself. A real HAProxy comment always starts at a '#' preceded
+         by whitespace here -- none of these templates use bare '#' as a
+         value character -- so this truncation does not clip real rules.
+
+    Returning (line, position) pairs together -- rather than making callers
+    re-derive one from the other with a second `cfg.index(line)` -- also
+    avoids a subtler bug: if the same comment-stripped line occurs twice
+    (e.g. a duplicated rule), re-deriving the position with `str.index` always
+    finds the FIRST copy regardless of which one you meant. Walking the file
+    once and recording positions as we go keeps first/last unambiguous.
     """
-    return [ln.strip() for ln in cfg.split('\n')
-            if needle in ln and not ln.strip().startswith('#')]
+    out = []
+    pos = 0
+    for raw in cfg.split('\n'):
+        stripped = raw.strip()
+        if stripped and not stripped.startswith('#'):
+            code = stripped.split(' #', 1)[0].rstrip()
+            if code and needle in code:
+                out.append((code, pos))
+        pos += len(raw) + 1  # +1 for the '\n' split() consumed
+    return out
+
+
+def rule_lines(cfg, needle):
+    """Comment-stripped rule lines containing `needle` (text only, no
+    position). See `rule_positions()` for what this guards against. Every
+    assertion about a RULE's presence or content must go through this (or
+    `rule_positions`/the guarded helpers below) -- never a bare
+    `needle in cfg` or `re.search(pattern, cfg)`.
+    """
+    return [line for line, _ in rule_positions(cfg, needle)]
+
+
+def require_rule(cfg, needle, what=None):
+    """The single rule line containing `needle`.
+
+    Raises a plain AssertionError naming what was being looked for -- not
+    IndexError from an unguarded `rule_lines(...)[0]`, and not
+    `ValueError: substring not found` from a bare `cfg.index(...)` -- when
+    the rule is missing. A missing rule and a broken test harness must not
+    look identical in a failure report.
+
+    Raises the same way if `needle` is ambiguous (matches more than one rule
+    line): silently taking the first match in that case would hide the
+    ambiguity instead of surfacing it.
+    """
+    label = what or needle
+    lines = rule_lines(cfg, needle)
+    if not lines:
+        raise AssertionError('no rule found for %r (expected: %s)' % (needle, label))
+    if len(lines) > 1:
+        raise AssertionError(
+            '%r matched %d rule lines, expected exactly one (%s): %r'
+            % (needle, len(lines), label, lines))
+    return lines[0]
+
+
+def require_position(cfg, needle, what=None, last=False):
+    """(line, char offset) for an ordering assertion, guarded the same way as
+    `require_rule` -- but tolerant of the needle matching multiple lines
+    (e.g. a multi-line set-var "chain"), since ordering checks often want the
+    first or last of several. Pass last=True for the last occurrence.
+    """
+    label = what or needle
+    positions = rule_positions(cfg, needle)
+    if not positions:
+        raise AssertionError(
+            'no rule found for %r, cannot check ordering (expected: %s)' % (needle, label))
+    return positions[-1] if last else positions[0]
 
 
 class WpAdminGate(unittest.TestCase):
@@ -90,49 +188,69 @@ class WpAdminGate(unittest.TestCase):
     def setUp(self):
         self.cfg = render_listener()
 
-    def test_acls_declared(self):
-        self.assertRegex(self.cfg, r'acl\s+wp_admin_path\s+path_reg')
-        self.assertRegex(self.cfg, r'acl\s+wp_admin_asset\s+path_reg')
-        self.assertRegex(self.cfg, r'acl\s+wp_admin_allowed\s+path_end')
-        self.assertIn('/etc/haproxy/wpadmin_gate_exempt.list', self.cfg)
+    def test_wp_admin_path_acl_declared(self):
+        line = require_rule(self.cfg, 'acl wp_admin_path', 'wp_admin_path ACL')
+        self.assertIn('path_reg', line)
+
+    def test_wp_admin_asset_acl_declared(self):
+        line = require_rule(self.cfg, 'acl wp_admin_asset', 'wp_admin_asset ACL')
+        self.assertIn('path_reg', line)
+
+    def test_wp_admin_allowed_acl_declared(self):
+        line = require_rule(self.cfg, 'acl wp_admin_allowed', 'wp_admin_allowed ACL')
+        self.assertIn('path_end', line)
+
+    def test_wp_gate_exempt_acl_declared(self):
+        """Scoped to the ACL line itself, not `self.cfg` as a whole -- the
+        surrounding prose (see hap_listener.tpl's "per-site opt-out" comment)
+        also spells out /etc/haproxy/wpadmin_gate_exempt.list verbatim, so an
+        unscoped `assertIn` would still pass with the real ACL deleted.
+        """
+        line = require_rule(self.cfg, 'acl wp_gate_exempt', 'wp_gate_exempt ACL')
+        self.assertIn('/etc/haproxy/wpadmin_gate_exempt.list', line)
 
     def test_allowlist_entries_present(self):
         """wp-login.php loads its own css/js from /wp-admin/ -- see module docstring."""
+        line = require_rule(self.cfg, 'acl wp_admin_allowed', 'wp_admin_allowed ACL')
         for entry in ALLOWLIST:
             with self.subTest(entry=entry):
-                self.assertIn(entry, self.cfg)
+                self.assertIn(entry, line)
 
     def test_static_asset_dirs_allowed(self):
-        self.assertRegex(self.cfg, r'wp_admin_asset\s+path_reg.*\(css\|js\|images\)')
+        line = require_rule(self.cfg, 'acl wp_admin_asset', 'wp_admin_asset ACL')
+        self.assertRegex(line, r'path_reg.*\(css\|js\|images\)')
 
     def test_install_php_is_NOT_allowlisted(self):
         """install.php is deliberately gated -- a takeover vector on abandoned installs."""
-        m = re.search(r'acl\s+wp_admin_allowed\s+path_end([^\n]*)', self.cfg)
-        self.assertIsNotNone(m, 'wp_admin_allowed ACL not found')
-        self.assertNotIn('install.php', m.group(1))
+        line = require_rule(self.cfg, 'acl wp_admin_allowed', 'wp_admin_allowed ACL')
+        self.assertNotIn('install.php', line)
 
     def test_redirect_rule_has_all_exclusions(self):
-        m = re.search(r'http-request redirect[^\n]*wp_admin_path[^\n]*', self.cfg)
-        self.assertIsNotNone(m, 'wp-admin redirect rule not found')
-        rule = m.group(0)
+        rule = require_rule_by_predicate(
+            self.cfg, 'http-request redirect', lambda ln: 'wp_admin_path' in ln,
+            'wp-admin redirect rule')
         for excl in EXCLUSIONS:
             with self.subTest(exclusion=excl):
                 self.assertIn(excl, rule)
 
     def test_rule_renders_after_real_ip_resolution(self):
         """is_whitelisted reads txn.real_ip; before the set-var chain it is unset."""
-        setvar = self.cfg.index('set-var(txn.real_ip)')
-        rule = self.cfg.index('wp_admin_path')
-        self.assertLess(setvar, rule)
+        _, setvar_pos = require_position(self.cfg, 'set-var(txn.real_ip)',
+                                          'real_ip set-var chain')
+        _, rule_pos = require_position(self.cfg, 'wp_admin_path', 'wp_admin_path ACL/rule')
+        self.assertLess(setvar_pos, rule_pos,
+                         'wp_admin_path renders before txn.real_ip is resolved')
 
     def test_rule_renders_after_has_wp_logged_in_declared(self):
         """HAProxy resolves ACLs as it parses; use-before-declare fails."""
-        decl = self.cfg.index('acl has_wp_logged_in')
-        rule = self.cfg.index('wp_admin_path')
-        self.assertLess(decl, rule)
+        _, decl_pos = require_position(self.cfg, 'acl has_wp_logged_in',
+                                        'has_wp_logged_in ACL declaration')
+        _, rule_pos = require_position(self.cfg, 'wp_admin_path', 'wp_admin_path ACL/rule')
+        self.assertLess(decl_pos, rule_pos,
+                         'wp_admin_path renders before has_wp_logged_in is declared')
 
     def test_only_one_has_wp_logged_in_declaration(self):
-        self.assertEqual(self.cfg.count('acl has_wp_logged_in'), 1)
+        self.assertEqual(len(rule_lines(self.cfg, 'acl has_wp_logged_in')), 1)
 
     def test_allowlist_entries_are_anchored_to_wp_admin(self):
         """Bare `path_end /admin-ajax.php` also matches
@@ -143,9 +261,7 @@ class WpAdminGate(unittest.TestCase):
         wp-admin/. Scoped to the captured ACL line only, since the
         surrounding comment block also mentions these bare filenames.
         """
-        m = re.search(r'acl\s+wp_admin_allowed\s+path_end([^\n]*)', self.cfg)
-        self.assertIsNotNone(m, 'wp_admin_allowed ACL not found')
-        line = m.group(1)
+        line = require_rule(self.cfg, 'acl wp_admin_allowed', 'wp_admin_allowed ACL')
         for entry in ALLOWLIST:
             with self.subTest(entry=entry):
                 self.assertIn('/wp-admin' + entry, line)
@@ -160,20 +276,23 @@ class WpAdminGate(unittest.TestCase):
         after the set-var(txn.real_ip) chain (it must not disturb that
         load-bearing chain) and before the redirect rule that consumes it.
         """
-        self.assertIn('set-var(txn.wp_login_url)', self.cfg)
-        last_real_ip_setvar = self.cfg.rindex('set-var(txn.real_ip)')
-        wp_login_setvar = self.cfg.index('set-var(txn.wp_login_url)')
-        redirect_rule = self.cfg.index('http-request redirect code 302 location %[var(txn.wp_login_url)]')
-        self.assertLess(last_real_ip_setvar, wp_login_setvar,
+        _, last_real_ip_pos = require_position(self.cfg, 'set-var(txn.real_ip)',
+                                                'real_ip set-var chain', last=True)
+        _, wp_login_pos = require_position(self.cfg, 'set-var(txn.wp_login_url)',
+                                            'wp_login_url set-var')
+        _, redirect_pos = require_position(
+            self.cfg, 'http-request redirect code 302 location %[var(txn.wp_login_url)]',
+            'wp-admin redirect rule')
+        self.assertLess(last_real_ip_pos, wp_login_pos,
                          'wp_login_url set-var must render after the real_ip set-var chain')
-        self.assertLess(wp_login_setvar, redirect_rule,
+        self.assertLess(wp_login_pos, redirect_pos,
                          'wp_login_url set-var must render before the redirect rule that uses it')
 
     def test_redirect_rule_uses_setvar_not_inline_regsub(self):
         """Guards against reintroducing the rejected inline form."""
-        m = re.search(r'http-request redirect[^\n]*wp_admin_path[^\n]*', self.cfg)
-        self.assertIsNotNone(m, 'wp-admin redirect rule not found')
-        rule = m.group(0)
+        rule = require_rule_by_predicate(
+            self.cfg, 'http-request redirect', lambda ln: 'wp_admin_path' in ln,
+            'wp-admin redirect rule')
         self.assertIn('%[var(txn.wp_login_url)]', rule)
         self.assertNotIn('regsub', rule)
 
@@ -194,15 +313,16 @@ class WpAdminGate(unittest.TestCase):
         name and a bare substring match would pass even if the condition
         were dropped from the rule itself.
         """
-        m = re.search(r'http-request redirect[^\n]*wp_admin_path[^\n]*', self.cfg)
-        self.assertIsNotNone(m, 'wp-admin redirect rule not found')
-        rule = m.group(0)
+        rule = require_rule_by_predicate(
+            self.cfg, 'http-request redirect', lambda ln: 'wp_admin_path' in ln,
+            'wp-admin redirect rule')
         self.assertIn('wp_admin_safe_path', rule)
         self.assertNotIn('!wp_admin_safe_path', rule,
                           'wp_admin_safe_path must be a positive condition, not negated')
 
     def test_wp_admin_safe_path_acl_declared(self):
-        self.assertRegex(self.cfg, r'acl\s+wp_admin_safe_path\s+path_reg')
+        line = require_rule(self.cfg, 'acl wp_admin_safe_path', 'wp_admin_safe_path ACL')
+        self.assertIn('path_reg', line)
 
     def test_unsafe_wp_admin_path_is_denied_not_passed_through(self):
         """wp_admin_safe_path being a POSITIVE condition on the redirect means
@@ -217,6 +337,21 @@ class WpAdminGate(unittest.TestCase):
                         'no rule denies a wp-admin path that fails wp_admin_safe_path')
         self.assertTrue(any(d.startswith('http-request deny') for d in denies),
                         'the !wp_admin_safe_path rule must be a deny: %r' % denies)
+
+
+def require_rule_by_predicate(cfg, needle, predicate, what):
+    """Like require_rule(), but for rules identified by needle + a predicate
+    over the comment-stripped line (e.g. "the `http-request redirect` line
+    that also mentions wp_admin_path", since the frontend has more than one
+    `http-request redirect`). Raises a clear AssertionError, not IndexError
+    or a silently-empty match, if no line satisfies both.
+    """
+    candidates = [ln for ln in rule_lines(cfg, needle) if predicate(ln)]
+    if not candidates:
+        raise AssertionError('no rule found matching %s' % what)
+    if len(candidates) > 1:
+        raise AssertionError('%s matched more than one rule line: %r' % (what, candidates))
+    return candidates[0]
 
 
 class UriNormalisation(unittest.TestCase):
@@ -236,13 +371,18 @@ class UriNormalisation(unittest.TestCase):
         self.header = render_header()
 
     def test_experimental_directives_exposed_in_global(self):
-        """normalize-uri is experimental in 3.0; without this HAProxy does not
-        start at all (ALERT, exit 1), which crash-loops the container.
+        """normalize-uri is experimental in 3.0; without this HAProxy refuses
+        to start (`haproxy -c` exits 1, ALERT). That does NOT crash-loop the
+        container, though -- see hap_header.tpl's comment and
+        haproxy_manager.py's start_haproxy()/do_initial_setup(): the failure
+        is swallowed, and the container comes up with haproxy simply never
+        running. This test exists so that silent-outage mode is never
+        reintroduced by dropping this line.
         """
+        lines = rule_lines(self.header, 'expose-experimental-directives')
+        matches = [ln for ln in lines if ln == 'expose-experimental-directives']
         self.assertTrue(
-            [ln for ln in self.header.split('\n')
-             if ln.strip() == 'expose-experimental-directives'],
-            'expose-experimental-directives missing from the global section')
+            matches, 'expose-experimental-directives missing from the global section')
 
     def test_all_normalizers_render(self):
         for norm in NORMALIZERS:
@@ -255,26 +395,38 @@ class UriNormalisation(unittest.TestCase):
         """Reverse this order and /wp-admin/js/%2e%2e/plugins.php reaches the
         ACLs as /wp-admin/js/../plugins.php -- decoded but unresolved.
         """
-        rendered = [ln for ln in self.cfg.split('\n')
-                    if ln.strip().startswith('http-request normalize-uri')]
-        names = [ln.strip().split('normalize-uri ', 1)[1] for ln in rendered]
-        self.assertEqual(names, list(NORMALIZERS))
+        lines = [ln for ln in rule_lines(self.cfg, 'http-request normalize-uri')
+                 if ln.startswith('http-request normalize-uri')]
+        names = [ln.split('normalize-uri ', 1)[1] for ln in lines]
+        self.assertEqual(
+            names, list(NORMALIZERS),
+            'normalize-uri directives are missing, reordered, or duplicated: %r' % names)
 
     def test_normalisation_precedes_every_path_based_rule(self):
         """A normalizer placed after a path rule normalises nothing for it."""
-        last_norm = max(self.cfg.index('http-request normalize-uri ' + n)
-                        for n in NORMALIZERS)
+        norm_positions = []
+        for n in NORMALIZERS:
+            _, pos = require_position(self.cfg, 'http-request normalize-uri ' + n,
+                                       'normalizer: ' + n)
+            norm_positions.append(pos)
+        last_norm = max(norm_positions)
         for marker in ('acl is_health_check', 'acl wp_login_path',
                        'acl xmlrpc_path', 'acl wp_batch_path',
                        'acl wp_admin_path', 'http-request set-path'):
             with self.subTest(rule=marker):
-                self.assertLess(last_norm, self.cfg.index(marker),
-                                marker + ' renders before URI normalisation')
+                _, marker_pos = require_position(self.cfg, marker, marker)
+                self.assertLess(last_norm, marker_pos,
+                                 marker + ' renders before URI normalisation')
 
     def test_query_sort_by_name_is_not_enabled(self):
-        """It reorders query parameters, breaking anything that signs or caches
-        on the exact query string, and buys this gate nothing (every rule here
-        matches on `path`, which excludes the query).
+        """query-sort-by-name reorders query parameters, which would break
+        anything that signs or caches on the exact query string. This is NOT
+        because the enabled normalizers already leave the query alone --
+        percent-to-uppercase and percent-decode-unreserved rewrite the WHOLE
+        request-target, query string included (see hap_listener.tpl's BLAST
+        RADIUS comment) -- it is a deliberate line between "case-fold /
+        decode" (no-ops under RFC 3986) and "reorder" (not a no-op for a
+        signed/cached query string).
         """
         self.assertFalse(rule_lines(self.cfg, 'normalize-uri query-sort-by-name'))
 
@@ -283,7 +435,7 @@ class UriNormalisation(unittest.TestCase):
         place and /../../wp-admin/plugins.php survives -- measured.
         """
         lines = rule_lines(self.cfg, 'normalize-uri path-strip-dotdot')
-        self.assertTrue(lines)
+        self.assertTrue(lines, 'missing normalizer: path-strip-dotdot')
         for ln in lines:
             self.assertTrue(ln.endswith('path-strip-dotdot full'), ln)
 
@@ -297,9 +449,8 @@ class UriNormalisation(unittest.TestCase):
         denies = [ln for ln in rule_lines(self.cfg, 'path_has_encoded_sep')
                   if ln.startswith('http-request deny')]
         self.assertTrue(denies, 'no deny rule for encoded separators')
-        acl = rule_lines(self.cfg, 'acl path_has_encoded_sep')
-        self.assertTrue(acl)
-        self.assertIn('%2f', acl[0].lower())
+        acl_line = require_rule(self.cfg, 'acl path_has_encoded_sep', 'path_has_encoded_sep ACL')
+        self.assertIn('%2f', acl_line.lower())
 
     def test_encoded_separator_deny_is_scoped_to_wp_admin(self):
         """A blanket "deny any %2F in any path" would break non-WordPress
@@ -309,12 +460,14 @@ class UriNormalisation(unittest.TestCase):
         """
         denies = [ln for ln in rule_lines(self.cfg, 'path_has_encoded_sep')
                   if ln.startswith('http-request deny')]
+        self.assertTrue(denies, 'no deny rule for encoded separators')
         for d in denies:
             self.assertIn('wp_admin_word', d)
 
     def test_encoded_separator_deny_honors_the_same_whitelist(self):
         denies = [ln for ln in rule_lines(self.cfg, 'path_has_encoded_sep')
                   if ln.startswith('http-request deny')]
+        self.assertTrue(denies, 'no deny rule for encoded separators')
         for d in denies:
             for excl in ('!has_wp_logged_in', '!wp_gate_exempt', '!is_local',
                          '!is_trusted_ip', '!is_whitelisted'):
@@ -325,8 +478,8 @@ class UriNormalisation(unittest.TestCase):
         """/blog%2Fwp-admin/plugins.php hides the separator BEFORE "wp-admin",
         where an anchored pattern never matches, and OLS still resolves it.
         """
-        acl = rule_lines(self.cfg, 'acl path_has_encoded_sep')[0]
-        self.assertIn('-m sub', acl)
+        acl_line = require_rule(self.cfg, 'acl path_has_encoded_sep', 'path_has_encoded_sep ACL')
+        self.assertIn('-m sub', acl_line)
 
     def test_wp_admin_asset_bypass_cannot_cover_a_php_entrypoint(self):
         """The asset bypass anchored its prefix but not its suffix, so
@@ -334,8 +487,8 @@ class UriNormalisation(unittest.TestCase):
         ".." and booted plugins.php. path-strip-dotdot is the real fix; this
         keeps the bypass structurally incapable of covering PHP.
         """
-        acl = rule_lines(self.cfg, 'acl wp_admin_asset')[0]
-        self.assertIn('.php', acl,
+        acl_line = require_rule(self.cfg, 'acl wp_admin_asset', 'wp_admin_asset ACL')
+        self.assertIn('.php', acl_line,
                       'wp_admin_asset must exclude .php explicitly')
 
     def test_case_insensitive_acl_and_regsub_are_kept_in_sync(self):
@@ -344,14 +497,14 @@ class UriNormalisation(unittest.TestCase):
         "/WP-ADMIN/plugins.php", returns `path` unchanged, and the Location
         then points at the request's own URL.
         """
-        acl = rule_lines(self.cfg, 'acl wp_admin_path')[0]
-        setvar = rule_lines(self.cfg, 'set-var(txn.wp_login_url)')[0]
-        acl_ci = bool(re.search(r'path_reg\s+-i\s', acl))
-        regsub_ci = bool(re.search(r'regsub\([^)]*,\s*i\)', setvar))
+        acl_line = require_rule(self.cfg, 'acl wp_admin_path', 'wp_admin_path ACL')
+        setvar_line = require_rule(self.cfg, 'set-var(txn.wp_login_url)', 'wp_login_url set-var')
+        acl_ci = bool(re.search(r'path_reg\s+-i\s', acl_line))
+        regsub_ci = bool(re.search(r'regsub\([^)]*,\s*i\)', setvar_line))
         self.assertEqual(
             acl_ci, regsub_ci,
             'wp_admin_path case-sensitivity (%s) and regsub flags (%s) disagree'
-            % (acl, setvar))
+            % (acl_line, setvar_line))
 
 
 if __name__ == '__main__':
