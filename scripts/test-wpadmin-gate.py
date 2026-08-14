@@ -149,6 +149,33 @@ class WpAdminGate(unittest.TestCase):
         self.assertIn('%[var(txn.wp_login_url)]', rule)
         self.assertNotIn('regsub', rule)
 
+    def test_redirect_rule_requires_safe_path(self):
+        """OPEN REDIRECT guard. The redirect target is built by rewriting
+        `path` with regsub, which only replaces the matched substring --
+        everything before "/wp-admin/" survives untouched in the output.
+        Three concrete requests turn that into an off-site `Location:`
+        header: "//evil.example.com/wp-admin/x.php" (protocol-relative,
+        browsers resolve "//host/path" to "https://host/path"),
+        "/\\evil.example.com/wp-admin/x.php" (browsers normalise a leading
+        "/\\" the same as "//"), and an RFC 7230 absolute-form request
+        target ("https://evil.example.com/wp-admin/x.php") which can make
+        HAProxy's `path` fetch return a full URI. wp_admin_safe_path
+        (requiring a well-formed absolute path) must be a POSITIVE
+        condition on the redirect rule -- scoped to the captured rule line
+        only, since the surrounding comment block also mentions this ACL
+        name and a bare substring match would pass even if the condition
+        were dropped from the rule itself.
+        """
+        m = re.search(r'http-request redirect[^\n]*wp_admin_path[^\n]*', self.cfg)
+        self.assertIsNotNone(m, 'wp-admin redirect rule not found')
+        rule = m.group(0)
+        self.assertIn('wp_admin_safe_path', rule)
+        self.assertNotIn('!wp_admin_safe_path', rule,
+                          'wp_admin_safe_path must be a positive condition, not negated')
+
+    def test_wp_admin_safe_path_acl_declared(self):
+        self.assertRegex(self.cfg, r'acl\s+wp_admin_safe_path\s+path_reg')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

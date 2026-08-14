@@ -291,12 +291,50 @@ frontend web
     # via /etc/haproxy/wpadmin_gate_exempt.list (operator-managed, seeded
     # empty by start-up.sh) for sites where a plugin legitimately serves
     # unauthenticated visitors from a /wp-admin/ URL outside this allowlist.
+    # wp_admin_safe_path guards against an OPEN REDIRECT this gate would
+    # otherwise introduce. The redirect target below is built by rewriting
+    # `path` with regsub -- regsub only replaces the matched substring, so
+    # everything BEFORE the matched "/wp-admin/" survives untouched in the
+    # output. `path` is not guaranteed to be a clean site-relative string;
+    # three concrete requests turn that survival into an off-site
+    # `Location:` header (verified against real HAProxy semantics):
+    #   //evil.example.com/wp-admin/x.php        -> //evil.example.com/wp-login.php
+    #     (protocol-relative -- browsers resolve "//host/path" to
+    #     "https://host/path", so this redirects off-site with no scheme
+    #     needed)
+    #   /\evil.example.com/wp-admin/x.php        -> /\evil.example.com/wp-login.php
+    #     (browsers normalise a leading "/\" the same as "//")
+    #   https://evil.example.com/wp-admin/x.php  -> https://evil.example.com/wp-login.php
+    #     (RFC 7230 absolute-form request targets can make HAProxy's `path`
+    #     fetch return a full URI, not just the path component)
+    # None of these vectors reach WordPress today -- this gate is what would
+    # newly expose them as a phishing primitive on every customer domain on
+    # the fleet. wp_admin_safe_path requires a well-formed absolute path
+    # (leading "/" not followed by another "/" or a backslash) and is a
+    # POSITIVE condition on the redirect rule, not a negation: a path that
+    # fails it simply is not redirected and falls through to the backend --
+    # today's (pre-gate) behavior, so failing the check is never a
+    # regression, only a missed redirect on a pathological input. DO NOT
+    # remove this ACL as redundant with wp_admin_path -- wp_admin_path's
+    # `path_reg (^|/)wp-admin/` happily matches all three vectors above.
     acl wp_admin_path      path_reg (^|/)wp-admin/
+    # Four literal backslashes here is NOT a typo. HAProxy's config-line word
+    # parser treats backslash as its OWN escape character before the value
+    # ever reaches the regex engine: "\\" (two backslashes) in the config
+    # collapses to one literal backslash by the time PCRE compiles it, which
+    # leaves an unterminated character class ("[^/\]") and fails with
+    # "missing terminating ] for character class" -- verified against real
+    # HAProxy 3.0.11. Four backslashes ("\\\\") collapse to two ("\\"),
+    # which PCRE then reads as a single escaped-backslash class member --
+    # the intended "reject a literal backslash" semantics. Confirmed live:
+    # this form accepts /wp-admin/... and /blog/wp-admin/... while rejecting
+    # both //host/wp-admin/... and /\host/wp-admin/....
+    acl wp_admin_safe_path path_reg ^/[^/\\\\]
     acl wp_admin_allowed   path_end /wp-admin/admin-ajax.php /wp-admin/admin-post.php /wp-admin/load-styles.php /wp-admin/load-scripts.php
     acl wp_admin_asset     path_reg (^|/)wp-admin/(css|js|images)/
     acl wp_gate_exempt     hdr(host),lower -f /etc/haproxy/wpadmin_gate_exempt.list
     http-request set-var(txn.wp_login_url) path,regsub(/wp-admin/.*,/wp-login.php) if wp_admin_path
-    http-request redirect code 302 location %[var(txn.wp_login_url)]?redirect_to=%[path,url_enc] if wp_admin_path !wp_admin_allowed !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
+    http-request redirect code 302 location %[var(txn.wp_login_url)]?redirect_to=%[path,url_enc] if wp_admin_path wp_admin_safe_path !wp_admin_allowed !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
 
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
