@@ -40,6 +40,7 @@ COPY trusted_ips.map /etc/haproxy/trusted_ips.map
 # volume shadows /etc/haproxy with.
 COPY cloudflare_ips.list /haproxy/defaults/cloudflare_ips.list
 COPY trusted_proxies.list /haproxy/defaults/trusted_proxies.list
+COPY wpadmin_gate_exempt.list /haproxy/defaults/wpadmin_gate_exempt.list
 # Place errorfiles outside the volumed path; the HAProxy config references
 # them by absolute path.
 COPY errors /haproxy/errors

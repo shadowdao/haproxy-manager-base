@@ -1,0 +1,16 @@
+# Per-site opt-out from the WordPress admin edge gate.
+#
+# Hostnames listed here are EXEMPT: unauthenticated /wp-admin/* requests for
+# these sites pass through to PHP instead of being redirected to wp-login.php.
+# One hostname per line, lowercase. Matched against the Host header.
+#
+# Referenced by templates/hap_listener.tpl:
+#   acl wp_gate_exempt hdr(host),lower -f /etc/haproxy/wpadmin_gate_exempt.list
+#
+# Add a site here when a plugin legitimately serves unauthenticated visitors
+# from a /wp-admin/ URL that is not in the rule's allowlist. Symptom: "my
+# plugin's admin page redirects to login".
+#
+# Do NOT commit real customer domains — this repo is mirrored publicly. Add
+# entries directly on the server; the file lives in the /etc/haproxy named
+# volume and persists across container recreates.
