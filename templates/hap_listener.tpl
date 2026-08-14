@@ -183,6 +183,78 @@ frontend web
     http-request deny deny_status 403 if wp_batch_route !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
     http-request deny deny_status 403 if wp_batch_route_enc !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
 
+    # --- WordPress admin edge gate ---
+    # Measured on whp02, 2026-08-14: distributed unauthenticated GETs booting
+    # WordPress just to bounce back a login redirect --
+    #   2801 GET /wp-admin/profile.php   2781 GET /wp-admin/edit.php   2761 GET /wp-admin/plugins.php
+    # -- spread across many source IPs at roughly 4 req/min per IP, each hit
+    # burning a PHP-FPM/lsphp worker. Two sites absorbed 1,243 resulting 503s
+    # in nine hours as their pools saturated.
+    #
+    # IDENTITY, NOT RATE. This is the one rule in this file that tracks
+    # nothing and has no stick-table counter or threshold. Every rate-based
+    # control above (the generic limits, wp_bruteforce, xmlrpc_bruteforce) is
+    # per-IP, and per-IP rate is exactly what this attack is engineered to
+    # stay under: ~4 req/min from any single IP is indistinguishable from a
+    # slow human, and the source set is large enough that no threshold can be
+    # lowered to catch it without also catching real visitors. There is also
+    # no free stick-table slot left to try anyway -- sc0/sc1/sc2 are already
+    # used above and HAProxy's default tune.stick-counters is 3, so a fourth
+    # tracked counter is not an option here. DO NOT "simplify" this into a
+    # rate/threshold rule later: the whole point is that a threshold cannot
+    # see this traffic. Instead we gate on identity -- a real logged-in
+    # WordPress user always carries a wordpress_logged_in_* cookie (the same
+    # ACL the wp2shell block above already declares), and an unauthenticated
+    # request to a wp-admin page has no legitimate reason to boot PHP at all.
+    #
+    # 302, not 403. WordPress itself redirects an unauthenticated /wp-admin/
+    # request to wp-login.php, so replicating that at the edge means an admin
+    # whose session merely expired lands on the normal login screen instead
+    # of an error page -- we are not trading a bot problem for a support
+    # ticket. Bots get a cheap redirect they ignore.
+    #
+    # path_reg, not path_beg. A subdirectory install at /blog/wp-admin/ slips
+    # past a prefix match; path_reg with an optional leading "/" catches both
+    # root and subdirectory installs, same reasoning as the wp-login and
+    # xmlrpc path_end rules above.
+    #
+    # regsub rewrites the redirect target itself, so /blog/wp-admin/x.php
+    # redirects to /blog/wp-login.php rather than 404ing at the site root.
+    #
+    # redirect_to carries the path only (%[path,url_enc]), not the query
+    # string -- deliberate, see design spec. An admin bounced off
+    # post.php?post=123&action=edit lands back on a blank post.php rather
+    # than that exact post. Capturing the full URI needs capture.req.uri
+    # (extra config, and the captured value is length-capped) for a benefit
+    # that only matters on session expiry, so it was not worth it.
+    #
+    # THE ALLOWLIST IS MEASURED, NOT GUESSED -- taken from actual fleet
+    # traffic returning 200 on /wp-admin/*. admin-ajax.php and admin-post.php
+    # are the standard front-end AJAX/form-handler endpoints real themes and
+    # plugins call while logged out. Critically, wp-login.php loads its OWN
+    # css/js FROM /wp-admin/ (load-styles.php, load-scripts.php, and the
+    # static wp_admin_asset dirs below) -- miss those and every login page on
+    # the fleet renders unstyled with a broken password-strength meter, while
+    # wp-login.php itself still returns 200, making it a silent regression
+    # that "looks like" the gate is working.
+    #
+    # install.php is DELIBERATELY NOT allowlisted. It is legitimately
+    # reachable without a cookie during a fresh install, but it is also a
+    # standing scanner target and a real takeover vector on a site that was
+    # half-installed and then abandoned. Anyone genuinely installing uses the
+    # per-site exempt-list opt-out below instead.
+    #
+    # Honors the same whitelist as every other rule in this frontend
+    # (RFC1918 / trusted_ips.list / trusted_ips.map), and a per-site opt-out
+    # via /etc/haproxy/wpadmin_gate_exempt.list (operator-managed, seeded
+    # empty by start-up.sh) for sites where a plugin legitimately serves
+    # unauthenticated visitors from a /wp-admin/ URL outside this allowlist.
+    acl wp_admin_path      path_reg (^|/)wp-admin/
+    acl wp_admin_allowed   path_end /admin-ajax.php /admin-post.php /load-styles.php /load-scripts.php
+    acl wp_admin_asset     path_reg (^|/)wp-admin/(css|js|images)/
+    acl wp_gate_exempt     hdr(host),lower -f /etc/haproxy/wpadmin_gate_exempt.list
+    http-request redirect code 302 location %[path,regsub((^|/)wp-admin/.*,\1wp-login.php)]?redirect_to=%[path,url_enc] if wp_admin_path !wp_admin_allowed !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
+
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
     # Runtime updates: echo "add map #0 IP_ADDRESS 1" | socat stdio /var/run/haproxy.sock
