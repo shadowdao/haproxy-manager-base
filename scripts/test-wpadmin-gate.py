@@ -106,6 +106,49 @@ class WpAdminGate(unittest.TestCase):
     def test_only_one_has_wp_logged_in_declaration(self):
         self.assertEqual(self.cfg.count('acl has_wp_logged_in'), 1)
 
+    def test_allowlist_entries_are_anchored_to_wp_admin(self):
+        """Bare `path_end /admin-ajax.php` also matches
+        /wp-admin/evil/admin-ajax.php, which ALSO matches wp_admin_path
+        (path_reg only requires /wp-admin/ to appear somewhere) -- an
+        attacker-inserted path segment would then sail through the
+        allowlist ungated. Entries must be anchored to sit directly under
+        wp-admin/. Scoped to the captured ACL line only, since the
+        surrounding comment block also mentions these bare filenames.
+        """
+        m = re.search(r'acl\s+wp_admin_allowed\s+path_end([^\n]*)', self.cfg)
+        self.assertIsNotNone(m, 'wp_admin_allowed ACL not found')
+        line = m.group(1)
+        for entry in ALLOWLIST:
+            with self.subTest(entry=entry):
+                self.assertIn('/wp-admin' + entry, line)
+                self.assertNotRegex(
+                    line, r'(?<!wp-admin)' + re.escape(entry) + r'(?!\S)',
+                    'found a bare, unanchored allowlist entry: ' + entry)
+
+    def test_wp_login_url_setvar_renders_in_correct_order(self):
+        """The inline regsub-in-`location` form is rejected by real HAProxy
+        3.0.11 (invalid arg 2 in converter 'regsub'), so the regsub is
+        computed in its own set-var line instead. That set-var must render
+        after the set-var(txn.real_ip) chain (it must not disturb that
+        load-bearing chain) and before the redirect rule that consumes it.
+        """
+        self.assertIn('set-var(txn.wp_login_url)', self.cfg)
+        last_real_ip_setvar = self.cfg.rindex('set-var(txn.real_ip)')
+        wp_login_setvar = self.cfg.index('set-var(txn.wp_login_url)')
+        redirect_rule = self.cfg.index('http-request redirect code 302 location %[var(txn.wp_login_url)]')
+        self.assertLess(last_real_ip_setvar, wp_login_setvar,
+                         'wp_login_url set-var must render after the real_ip set-var chain')
+        self.assertLess(wp_login_setvar, redirect_rule,
+                         'wp_login_url set-var must render before the redirect rule that uses it')
+
+    def test_redirect_rule_uses_setvar_not_inline_regsub(self):
+        """Guards against reintroducing the rejected inline form."""
+        m = re.search(r'http-request redirect[^\n]*wp_admin_path[^\n]*', self.cfg)
+        self.assertIsNotNone(m, 'wp-admin redirect rule not found')
+        rule = m.group(0)
+        self.assertIn('%[var(txn.wp_login_url)]', rule)
+        self.assertNotIn('regsub', rule)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

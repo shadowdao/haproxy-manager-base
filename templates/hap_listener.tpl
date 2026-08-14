@@ -221,6 +221,38 @@ frontend web
     # regsub rewrites the redirect target itself, so /blog/wp-admin/x.php
     # redirects to /blog/wp-login.php rather than 404ing at the site root.
     #
+    # DO NOT write regsub's regex argument with a capturing group / literal
+    # parentheses, e.g. regsub((^|/)wp-admin/.*,\1wp-login.php) -- neither
+    # inlined into the redirect's `location` nor in a standalone set-var.
+    # HAProxy 3.0.11's converter-argument parser counts parens to find the
+    # end of the regsub(...) call itself, so the *inner* "(^|/)" grouping
+    # parens are misread as closing the outer call early -- it does not
+    # matter whether the argument is quoted ("...": still fails) or the
+    # parens are backslash-escaped (\(...\): still fails). Every such form
+    # was verified against real HAProxy 3.0.11-1+deb13u3 and all produce the
+    # same ALERT: "invalid arg 2 in converter 'regsub' : missing arguments
+    # (got 1/2)". This is a converter-argument-parsing limitation, not a
+    # log-format/`%[...]` issue -- the identical failure reproduces in a
+    # plain set-var (outside any log-format string), which rules out the
+    # `location` value's log-format context as the cause.
+    #
+    # The fix sidesteps groups/backreferences entirely: HTTP paths always
+    # start with "/", so the leading "(^|/)" alternation is redundant --
+    # matching the literal substring "/wp-admin/" (both slashes, no group)
+    # is sufficient to anchor to a real path segment (a false match like
+    # "/somewp-admin/" doesn't contain "/wp-admin/" as a substring, since
+    # there's no "/" directly before "wp-admin"). No backreference is
+    # needed either: regsub only replaces the matched substring, so
+    # replacing "/wp-admin/.*" with a literal "/wp-login.php" leaves
+    # whatever precedes it (the subdirectory-install prefix, if any)
+    # untouched. Computed in its own set-var so it is a plain sample
+    # expression, not something baked into the redirect's log-format
+    # string. Behaviorally verified live against real HAProxy 3.0.11:
+    # /wp-admin/edit.php -> /wp-login.php and
+    # /blog/wp-admin/plugins.php -> /blog/wp-login.php, both with
+    # redirect_to preserved. See
+    # .superpowers/sdd/2026-08-14-wpadmin-edge-gate/task-3b-report.md.
+    #
     # redirect_to carries the path only (%[path,url_enc]), not the query
     # string -- deliberate, see design spec. An admin bounced off
     # post.php?post=123&action=edit lands back on a blank post.php rather
@@ -238,6 +270,16 @@ frontend web
     # wp-login.php itself still returns 200, making it a silent regression
     # that "looks like" the gate is working.
     #
+    # Each allowlist entry is anchored to /wp-admin/<file>, not a bare
+    # filename suffix. A bare `path_end /admin-ajax.php` also matches
+    # /wp-admin/evil/admin-ajax.php -- which ALSO matches wp_admin_path
+    # (path_reg only requires /wp-admin/ to appear somewhere), so an
+    # attacker-inserted path segment would sail through this allowlist
+    # ungated and boot full WordPress, exactly the resource exhaustion this
+    # gate exists to stop. Anchoring still covers subdirectory installs via
+    # suffix matching (/blog/wp-admin/admin-ajax.php ends with
+    # /wp-admin/admin-ajax.php) while rejecting an inserted directory.
+    #
     # install.php is DELIBERATELY NOT allowlisted. It is legitimately
     # reachable without a cookie during a fresh install, but it is also a
     # standing scanner target and a real takeover vector on a site that was
@@ -250,10 +292,11 @@ frontend web
     # empty by start-up.sh) for sites where a plugin legitimately serves
     # unauthenticated visitors from a /wp-admin/ URL outside this allowlist.
     acl wp_admin_path      path_reg (^|/)wp-admin/
-    acl wp_admin_allowed   path_end /admin-ajax.php /admin-post.php /load-styles.php /load-scripts.php
+    acl wp_admin_allowed   path_end /wp-admin/admin-ajax.php /wp-admin/admin-post.php /wp-admin/load-styles.php /wp-admin/load-scripts.php
     acl wp_admin_asset     path_reg (^|/)wp-admin/(css|js|images)/
     acl wp_gate_exempt     hdr(host),lower -f /etc/haproxy/wpadmin_gate_exempt.list
-    http-request redirect code 302 location %[path,regsub((^|/)wp-admin/.*,\1wp-login.php)]?redirect_to=%[path,url_enc] if wp_admin_path !wp_admin_allowed !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
+    http-request set-var(txn.wp_login_url) path,regsub(/wp-admin/.*,/wp-login.php) if wp_admin_path
+    http-request redirect code 302 location %[var(txn.wp_login_url)]?redirect_to=%[path,url_enc] if wp_admin_path !wp_admin_allowed !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
 
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
