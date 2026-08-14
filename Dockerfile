@@ -23,7 +23,23 @@ LABEL org.opencontainers.image.title="haproxy-manager-base" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
-RUN apt update -y && apt dist-upgrade -y && apt install socat haproxy cron certbot curl jq net-tools -y && apt clean && rm -rf /var/lib/apt/lists/*
+# haproxy is PINNED. It was previously unpinned, so the binary could move under
+# us at Debian's timing — an upstream release that rejected our config would have
+# broken an unrelated commit's build, or worse, shipped an edge that refuses to
+# start (see the `haproxy -c` gate below for why that matters: a config HAProxy
+# rejects leaves the container Up with 80/443 unbound and /health still 200).
+#
+# Pinning does NOT make the gate redundant, and the gate does NOT make pinning
+# unnecessary — they compose. Pinned means the version moves deliberately; the
+# gate then answers immediately whether the new binary still accepts fleet config.
+# It also makes the image reproducible, which it previously was not.
+#
+# To move it: bump the version here, rebuild, and let the gate verify. If Debian
+# security-updates the package (e.g. -1+deb13u4) the build FAILS until this pin is
+# updated — that failure is the point, not a bug. Check availability with:
+#   apt-cache policy haproxy
+ARG HAPROXY_VERSION=3.0.11-1+deb13u3
+RUN apt update -y && apt dist-upgrade -y && apt install socat "haproxy=${HAPROXY_VERSION}" cron certbot curl jq net-tools -y && apt-mark hold haproxy && apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
 COPY ./templates /haproxy/templates
 COPY requirements.txt /haproxy/
