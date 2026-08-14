@@ -27,11 +27,12 @@ mkdir -p /etc/haproxy
 # existing hosts instead of being permanently shadowed by the volume.
 # Overwrite it from the baked copy on every start.
 #
-# trusted_proxies.list is OPERATOR DATA: operators add entries directly on
-# the server and those must survive restarts/recreates. Seed it from the
-# baked copy only when it's missing; never overwrite an existing one.
+# trusted_proxies.list and wpadmin_gate_exempt.list are OPERATOR DATA:
+# operators add entries directly on the server and those must survive
+# restarts/recreates. Seed each from the baked copy only when it's missing;
+# never overwrite an existing one.
 #
-# Both branches fall back to an empty file if the baked default is somehow
+# All branches fall back to an empty file if the baked default is somehow
 # absent, because "acl ... -f <missing file>" is a fatal HAProxy config
 # error -- the list files must exist unconditionally by the time HAProxy starts.
 if [ -f /haproxy/defaults/cloudflare_ips.list ]; then
@@ -44,6 +45,13 @@ if [ ! -f /etc/haproxy/trusted_proxies.list ]; then
         cp /haproxy/defaults/trusted_proxies.list /etc/haproxy/trusted_proxies.list
     else
         : > /etc/haproxy/trusted_proxies.list
+    fi
+fi
+if [ ! -f /etc/haproxy/wpadmin_gate_exempt.list ]; then
+    if [ -f /haproxy/defaults/wpadmin_gate_exempt.list ]; then
+        cp /haproxy/defaults/wpadmin_gate_exempt.list /etc/haproxy/wpadmin_gate_exempt.list
+    else
+        : > /etc/haproxy/wpadmin_gate_exempt.list
     fi
 fi
 

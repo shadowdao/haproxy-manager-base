@@ -22,6 +22,103 @@ frontend web
     # Capture Host header so it appears in httplog output (in %hr field)
     http-request capture req.hdr(Host) len 64
 
+    # --- URI normalisation (MUST be the first path-touching block here) ---
+    # Every path-based control in this frontend (the ACME health-check bypass,
+    # wp-login, xmlrpc, the wp-json/batch virtual patch, the wp-admin gate, the
+    # blocked-IP and suspension set-path rules, and everything Coraza inspects)
+    # matched the RAW request-target while the backend NORMALISED and DECODED
+    # it before resolving a file. Every gap between those two behaviours is a
+    # bypass, and each one had to be patched individually. Five were found in
+    # the wp-admin gate alone, all the same class:
+    #
+    #   //wp-admin/plugins.php            raw path starts "//" -> the safe-path
+    #                                     guard failed -> request fell through
+    #                                     ungated, backend served it
+    #   /wp-admin/css/../plugins.php      matched the css/js/images asset
+    #                                     bypass; backend resolved ".." and
+    #                                     booted plugins.php
+    #   /wp-admin/js/%2e%2e/plugins.php   same, with the ".." percent-encoded
+    #   /wp%2Dadmin/plugins.php           "wp-admin" spelled with %2D never
+    #                                     matched any wp-admin ACL at all
+    #   /wp-admin%2Fplugins.php           encoded separator; see the dedicated
+    #                                     rule in the wp-admin gate below
+    #
+    # Rather than keep bolting a counter-pattern onto each rule, normalise the
+    # URI once, here, so every rule below matches the SAME string the backend
+    # will resolve. HAProxy rewrites the request-target in place, so the
+    # backend receives the normalised form too.
+    #
+    # ORDER IS LOAD-BEARING and was determined empirically against real
+    # haproxy 3.0.11, not from the docs. The decoders must run BEFORE the path
+    # walkers: with the reverse order, /wp-admin/js/%2e%2e/plugins.php ends up
+    # as /wp-admin/js/../plugins.php -- decoded, but the ".." left unresolved,
+    # because path-strip-dotdot had already run by the time the "%2e%2e"
+    # became "..". Verified both directions side by side.
+    #
+    #   percent-to-uppercase       %2f -> %2F. Canonicalises the spelling of
+    #                              whatever stays encoded, so downstream rules
+    #                              need one case of each escape, not two.
+    #   percent-decode-unreserved  Decodes ONLY RFC 3986 unreserved chars
+    #                              (A-Za-z0-9-._~). This is what turns %2e%2e
+    #                              into .. and wp%2Dadmin into wp-admin.
+    #                              Reserved escapes are deliberately left
+    #                              alone -- %2F in particular, which is why
+    #                              the wp-admin gate needs its own encoded-
+    #                              slash rule (see below).
+    #   path-merge-slashes         //x -> /x. Also removes the entire class of
+    #                              "leading // defeats an anchored regex".
+    #   path-strip-dot             /a/./b -> /a/b.
+    #   path-strip-dotdot full     /a/b/../c -> /a/c. "full" additionally
+    #                              resolves ".." segments that would climb
+    #                              above the root (/../../wp-admin/x.php ->
+    #                              /wp-admin/x.php); without "full" HAProxy
+    #                              leaves those in place and the vector
+    #                              survives -- measured, both forms tested.
+    #
+    # DELIBERATELY NOT ENABLED: query-sort-by-name. Reordering query-string
+    # parameters would silently break anything that signs or caches on the
+    # exact query string (signed asset URLs, HMAC'd callbacks, CDN cache
+    # keys). This is NOT because the enabled normalizers already leave the
+    # query alone -- see BLAST RADIUS just below, they don't -- it is a
+    # deliberate line drawn between "case-fold / decode", which RFC 3986
+    # defines as no-ops, and "reorder", which is not a no-op for a caller
+    # treating the query as an opaque signed string.
+    #
+    # BLAST RADIUS: this block applies to EVERY request for EVERY site on
+    # EVERY tier, so the decoding was kept minimal on purpose -- and it is
+    # NOT scoped to the path. percent-to-uppercase and percent-decode-
+    # unreserved normalise the WHOLE request-target as HAProxy parses it --
+    # query string included, not just the path component the ACLs below
+    # match on -- and the BACKEND receives the rewritten query on the wire,
+    # not just an internal haproxy view of it. Measured against real HAProxy
+    # 3.0.11:
+    #   /a?sig=%2babc%2fdef  -> /a?sig=%2Babc%2Fdef   (percent-hex upper-cased)
+    #   /a?b=%41%42%43       -> /a?b=ABC               (unreserved chars decoded)
+    #   /a?tok=%7e%2d%5f%2e  -> /a?tok=~-_.            (unreserved chars decoded)
+    # Only parameter ORDER is preserved -- that guarantee is exactly why
+    # query-sort-by-name above is the one normalizer in this family left
+    # disabled. Per RFC 3986 both enabled rewrites are defined as the same
+    # URI (case in a percent-escape, and an unreserved character vs. its
+    # escape, carry no distinct meaning), but "the same URI" is not "the
+    # same bytes": an application that HMACs or otherwise signs the RAW
+    # query string, rather than parsing it first, could see a mutated value
+    # and fail to verify an otherwise-legitimate request. Checked against
+    # this fleet: no .NET backends (.NET's UrlEncode emits lowercase
+    # percent-hex, which percent-to-uppercase would rewrite) and no
+    # URL-in-path proxies, so there is no known victim today -- but do not
+    # assume "path only" from this block; that was the actual bug in an
+    # earlier draft of this comment.
+    #
+    # normalize-uri is EXPERIMENTAL in 3.0 and requires
+    # `expose-experimental-directives` in the global section
+    # (hap_header.tpl). Without it HAProxy does not start. Remove one and you
+    # must remove the other.
+    http-request normalize-uri percent-to-uppercase
+    http-request normalize-uri percent-decode-unreserved
+    http-request normalize-uri path-merge-slashes
+    http-request normalize-uri path-strip-dot
+    http-request normalize-uri path-strip-dotdot full
+
     # --- Trusted-proxy gate (MUST precede real-IP resolution below) ---
     # CF-Connecting-IP / X-Real-IP / X-Forwarded-For are client-supplied. Any
     # peer that is not a known reverse proxy gets them stripped, so the
@@ -182,6 +279,248 @@ frontend web
     http-request deny deny_status 403 if wp_batch_path !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
     http-request deny deny_status 403 if wp_batch_route !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
     http-request deny deny_status 403 if wp_batch_route_enc !has_wp_logged_in !is_local !is_trusted_ip !is_whitelisted
+
+    # --- WordPress admin edge gate ---
+    # Measured on whp02, 2026-08-14: distributed unauthenticated GETs booting
+    # WordPress just to bounce back a login redirect --
+    #   2801 GET /wp-admin/profile.php   2781 GET /wp-admin/edit.php   2761 GET /wp-admin/plugins.php
+    # -- spread across many source IPs at roughly 4 req/min per IP, each hit
+    # burning a PHP-FPM/lsphp worker. Two sites absorbed 1,243 resulting 503s
+    # in nine hours as their pools saturated.
+    #
+    # IDENTITY, NOT RATE. This is the one rule in this file that tracks
+    # nothing and has no stick-table counter or threshold. Every rate-based
+    # control above (the generic limits, wp_bruteforce, xmlrpc_bruteforce) is
+    # per-IP, and per-IP rate is exactly what this attack is engineered to
+    # stay under: ~4 req/min from any single IP is indistinguishable from a
+    # slow human, and the source set is large enough that no threshold can be
+    # lowered to catch it without also catching real visitors. There is also
+    # no free stick-table slot left to try anyway -- sc0/sc1/sc2 are already
+    # used above and HAProxy's default tune.stick-counters is 3, so a fourth
+    # tracked counter is not an option here. DO NOT "simplify" this into a
+    # rate/threshold rule later: the whole point is that a threshold cannot
+    # see this traffic. Instead we gate on identity -- a real logged-in
+    # WordPress user always carries a wordpress_logged_in_* cookie (the same
+    # ACL the wp2shell block above already declares), and an unauthenticated
+    # request to a wp-admin page has no legitimate reason to boot PHP at all.
+    #
+    # 302, not 403. WordPress itself redirects an unauthenticated /wp-admin/
+    # request to wp-login.php, so replicating that at the edge means an admin
+    # whose session merely expired lands on the normal login screen instead
+    # of an error page -- we are not trading a bot problem for a support
+    # ticket. Bots get a cheap redirect they ignore.
+    #
+    # path_reg, not path_beg. A subdirectory install at /blog/wp-admin/ slips
+    # past a prefix match; path_reg with an optional leading "/" catches both
+    # root and subdirectory installs, same reasoning as the wp-login and
+    # xmlrpc path_end rules above.
+    #
+    # regsub rewrites the redirect target itself, so /blog/wp-admin/x.php
+    # redirects to /blog/wp-login.php rather than 404ing at the site root.
+    #
+    # DO NOT write regsub's regex argument with a capturing group / literal
+    # parentheses, e.g. regsub((^|/)wp-admin/.*,\1wp-login.php) -- neither
+    # inlined into the redirect's `location` nor in a standalone set-var.
+    # HAProxy 3.0.11's converter-argument parser counts parens to find the
+    # end of the regsub(...) call itself, so the *inner* "(^|/)" grouping
+    # parens are misread as closing the outer call early -- it does not
+    # matter whether the argument is quoted ("...": still fails) or the
+    # parens are backslash-escaped (\(...\): still fails). Every such form
+    # was verified against real HAProxy 3.0.11-1+deb13u3 and all produce the
+    # same ALERT: "invalid arg 2 in converter 'regsub' : missing arguments
+    # (got 1/2)". This is a converter-argument-parsing limitation, not a
+    # log-format/`%[...]` issue -- the identical failure reproduces in a
+    # plain set-var (outside any log-format string), which rules out the
+    # `location` value's log-format context as the cause.
+    #
+    # The fix sidesteps groups/backreferences entirely: HTTP paths always
+    # start with "/", so the leading "(^|/)" alternation is redundant --
+    # matching the literal substring "/wp-admin/" (both slashes, no group)
+    # is sufficient to anchor to a real path segment (a false match like
+    # "/somewp-admin/" doesn't contain "/wp-admin/" as a substring, since
+    # there's no "/" directly before "wp-admin"). No backreference is
+    # needed either: regsub only replaces the matched substring, so
+    # replacing "/wp-admin/.*" with a literal "/wp-login.php" leaves
+    # whatever precedes it (the subdirectory-install prefix, if any)
+    # untouched. Computed in its own set-var so it is a plain sample
+    # expression, not something baked into the redirect's log-format
+    # string. Behaviorally verified live against real HAProxy 3.0.11:
+    # /wp-admin/edit.php -> /wp-login.php and
+    # /blog/wp-admin/plugins.php -> /blog/wp-login.php, both with
+    # redirect_to preserved. See
+    # .superpowers/sdd/2026-08-14-wpadmin-edge-gate/task-3b-report.md.
+    #
+    # redirect_to carries the path only (%[path,url_enc]), not the query
+    # string -- deliberate, see design spec. An admin bounced off
+    # post.php?post=123&action=edit lands back on a blank post.php rather
+    # than that exact post. Capturing the full URI needs capture.req.uri
+    # (extra config, and the captured value is length-capped) for a benefit
+    # that only matters on session expiry, so it was not worth it.
+    #
+    # THE ALLOWLIST IS MEASURED, NOT GUESSED -- taken from actual fleet
+    # traffic returning 200 on /wp-admin/*. admin-ajax.php and admin-post.php
+    # are the standard front-end AJAX/form-handler endpoints real themes and
+    # plugins call while logged out. Critically, wp-login.php loads its OWN
+    # css/js FROM /wp-admin/ (load-styles.php, load-scripts.php, and the
+    # static wp_admin_asset dirs below) -- miss those and every login page on
+    # the fleet renders unstyled with a broken password-strength meter, while
+    # wp-login.php itself still returns 200, making it a silent regression
+    # that "looks like" the gate is working.
+    #
+    # Each allowlist entry is anchored to /wp-admin/<file>, not a bare
+    # filename suffix. A bare `path_end /admin-ajax.php` also matches
+    # /wp-admin/evil/admin-ajax.php -- which ALSO matches wp_admin_path
+    # (path_reg only requires /wp-admin/ to appear somewhere), so an
+    # attacker-inserted path segment would sail through this allowlist
+    # ungated and boot full WordPress, exactly the resource exhaustion this
+    # gate exists to stop. Anchoring still covers subdirectory installs via
+    # suffix matching (/blog/wp-admin/admin-ajax.php ends with
+    # /wp-admin/admin-ajax.php) while rejecting an inserted directory.
+    #
+    # install.php is DELIBERATELY NOT allowlisted. It is legitimately
+    # reachable without a cookie during a fresh install, but it is also a
+    # standing scanner target and a real takeover vector on a site that was
+    # half-installed and then abandoned. Anyone genuinely installing uses the
+    # per-site exempt-list opt-out below instead.
+    #
+    # Honors the same whitelist as every other rule in this frontend
+    # (RFC1918 / trusted_ips.list / trusted_ips.map), and a per-site opt-out
+    # via /etc/haproxy/wpadmin_gate_exempt.list (operator-managed, seeded
+    # empty by start-up.sh) for sites where a plugin legitimately serves
+    # unauthenticated visitors from a /wp-admin/ URL outside this allowlist.
+    # EVERY ACL BELOW MATCHES THE NORMALISED PATH. The normalize-uri chain at
+    # the top of this frontend has already merged duplicate slashes, resolved
+    # "." / ".." segments (including percent-encoded ones) and decoded
+    # unreserved escapes by the time these run, so these patterns only have to
+    # describe the ONE canonical spelling the backend will resolve -- they do
+    # not have to anticipate every encoding of it. That is the whole point of
+    # the normalisation block; do not "harden" these regexes by re-adding
+    # encoding variants, fix the normalisation instead.
+    #
+    # wp_admin_safe_path guards against an OPEN REDIRECT this gate would
+    # otherwise introduce. The redirect target below is built by rewriting
+    # `path` with regsub -- regsub only replaces the matched substring, so
+    # everything BEFORE the matched "/wp-admin/" survives untouched in the
+    # output. `path` is not guaranteed to be a clean site-relative string;
+    # three concrete requests turn that survival into an off-site
+    # `Location:` header:
+    #   //evil.example.com/wp-admin/x.php        -> //evil.example.com/wp-login.php
+    #     (protocol-relative -- browsers resolve "//host/path" to
+    #     "https://host/path", so this redirects off-site with no scheme
+    #     needed). NOW NEUTRALISED UPSTREAM: path-merge-slashes rewrites this
+    #     to /evil.example.com/wp-admin/x.php before any ACL sees it, so the
+    #     Location becomes the same-origin /evil.example.com/wp-login.php.
+    #     Verified live.
+    #   /\evil.example.com/wp-admin/x.php        -> /\evil.example.com/wp-login.php
+    #     (browsers normalise a leading "/\" the same as "//"). STILL LIVE
+    #     after normalisation -- a backslash is not a slash, so no normalizer
+    #     touches it. This ACL is the only thing that stops it.
+    #   https://evil.example.com/wp-admin/x.php  -> https://evil.example.com/wp-login.php
+    #     (RFC 7230 absolute-form request targets can make HAProxy's `path`
+    #     fetch return a full URI, not just the path component). HAProxy's own
+    #     H1 parser answers 400 on this frontend; this ACL is the backstop.
+    # So wp_admin_safe_path is NOT redundant with the normalisation and must
+    # not be deleted as such -- one of its three vectors survives normalisation
+    # untouched.
+    #
+    # It is used TWO ways, and the pair matters:
+    #   - as a POSITIVE condition on the redirect, so a pathological path can
+    #     never produce a `Location:` header at all; and
+    #   - as an explicit deny, so such a path is not merely un-redirected.
+    # The deny is what closes the failure mode the positive-condition form
+    # introduced on its own: "not redirected" used to mean "falls through to
+    # the backend UNGATED", i.e. the exact PHP-booting request this gate
+    # exists to stop, reachable by prefixing "//" (that specific spelling is
+    # now normalised away, but "/\" is not). Post-normalisation the only
+    # paths that reach the deny are "/\..." ones, which cannot resolve to a
+    # real file on any tier, so nothing legitimate is denied.
+    # -i (case-insensitive) and the matching ",i" flag on the regsub below are
+    # a PAIR -- adding one without the other produces an infinite redirect
+    # loop, because a case-sensitive regsub finds no "/wp-admin/" in
+    # "/WP-ADMIN/plugins.php", returns `path` UNCHANGED, and the Location then
+    # points at the request's own URL. Verified live that the pair is correct:
+    # /WP-ADMIN/plugins.php -> /wp-login.php and /blog/WP-Admin/plugins.php ->
+    # /blog/wp-login.php.
+    #
+    # On this fleet's Linux backends /WP-ADMIN/plugins.php 404s without booting
+    # PHP, so this is hardening rather than a live-bypass fix; it matters if a
+    # docroot ever sits on a case-insensitive mount, where that same request
+    # WOULD boot PHP. The cost is that a site with a real directory literally
+    # named e.g. /docs/WP-Admin/ now gets gated -- the same false positive the
+    # lowercase pattern already has, which is what the per-site exempt list
+    # exists to resolve.
+    acl wp_admin_path      path_reg -i (^|/)wp-admin/
+    # Four literal backslashes here is NOT a typo. HAProxy's config-line word
+    # parser treats backslash as its OWN escape character before the value
+    # ever reaches the regex engine: "\\" (two backslashes) in the config
+    # collapses to one literal backslash by the time PCRE compiles it, which
+    # leaves an unterminated character class ("[^/\]") and fails with
+    # "missing terminating ] for character class" -- verified against real
+    # HAProxy 3.0.11. Four backslashes ("\\\\") collapse to two ("\\"),
+    # which PCRE then reads as a single escaped-backslash class member --
+    # the intended "reject a literal backslash" semantics.
+    acl wp_admin_safe_path path_reg ^/[^/\\\\]
+    acl wp_admin_allowed   path_end /wp-admin/admin-ajax.php /wp-admin/admin-post.php /wp-admin/load-styles.php /wp-admin/load-scripts.php
+    # The (?!.*\.php) lookahead is DEFENCE IN DEPTH, not the primary fix. This
+    # ACL grants an un-gated bypass to everything under wp-admin/css|js|images,
+    # and it used to anchor its prefix but not its suffix, so
+    # /wp-admin/css/../plugins.php took the bypass and the backend then
+    # resolved ".." and booted plugins.php. path-strip-dotdot now rewrites that
+    # to /wp-admin/plugins.php before this ACL runs, which is the real fix; the
+    # lookahead additionally makes the bypass structurally incapable of
+    # covering a PHP entrypoint even if a future encoding trick survives
+    # normalisation. It excludes ".php" ONLY -- no static asset contains that
+    # substring, so it cannot cause the silent "login page renders unstyled"
+    # regression that an extension allowlist would risk. Requires PCRE2, which
+    # both the Debian (deployed) and Alpine haproxy builds have (+PCRE2).
+    acl wp_admin_asset     path_reg (^|/)wp-admin/(css|js|images)/(?!.*\.php).*$
+    acl wp_gate_exempt     hdr(host),lower -f /etc/haproxy/wpadmin_gate_exempt.list
+    # ENCODED SEPARATOR. percent-decode-unreserved deliberately does NOT decode
+    # %2F -- "/" is a reserved character, and decoding it in the normalizer
+    # would change the path's structure (it would invent new segments), which
+    # is precisely why HAProxy refuses to. But OpenLiteSpeed DOES decode it and
+    # then serves the file: /wp-admin%2Fplugins.php was measured returning 302
+    # from a real WordPress site on the OLS tier, i.e. full PHP boot, while
+    # matching none of the ACLs above. Apache returns 404 for the same request
+    # (AllowEncodedSlashes Off), so this is an OLS-tier defect -- and OLS is the
+    # tier currently saturating.
+    #
+    # DENY, not "treat it as a wp-admin path and redirect". Two reasons:
+    #   1. The redirect target is computed by regsub(/wp-admin/.*) which finds
+    #      no "/wp-admin/" in "/wp-admin%2Fplugins.php", so `path` would come
+    #      back UNCHANGED and the Location would point at the request's own
+    #      URL -- an infinite redirect loop, not a gate.
+    #   2. Nothing legitimate emits it. A path segment cannot contain a literal
+    #      "/", so %2F inside a path is always either a probe or a proxy-
+    #      confusion attempt, and the Apache tier has been 404ing it all along,
+    #      so no site on the fleet can depend on it.
+    #
+    # SCOPED to paths that mention wp-admin, not all paths. A blanket "deny any
+    # %2F in any path" would also hit REST/API-style routes on non-WordPress
+    # customer apps that legitimately pass an encoded slash inside a path
+    # parameter. Scoping keeps the blast radius inside the attack surface this
+    # gate owns.
+    #
+    # Matching is on the SUBSTRING, not an anchored pattern, on purpose:
+    # /blog%2Fwp-admin/plugins.php hides the separator BEFORE "wp-admin", where
+    # an anchored (^|/)wp-admin/ never matches, and OLS still resolves it to
+    # /blog/wp-admin/plugins.php. Substring matching catches the separator
+    # wherever it is. percent-to-uppercase has already folded %2f into %2F;
+    # the -i is belt and braces so this rule stands on its own if the
+    # normalizer is ever reordered.
+    #
+    # %5C (encoded backslash) is denied on the same terms. On this fleet's
+    # Linux backends a backslash is an ordinary filename character, so
+    # /wp-admin%5Cplugins.php 404s rather than booting PHP -- measured, it is
+    # not a live bypass today. It is included because it is the same
+    # encoded-separator trick against a backend that happens to treat "\" as
+    # one, it costs nothing, and no legitimate path contains it.
+    acl wp_admin_word         path -i -m sub wp-admin
+    acl path_has_encoded_sep  path -i -m sub %2f %5c
+    http-request deny deny_status 403 if wp_admin_word path_has_encoded_sep !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
+    http-request deny deny_status 403 if wp_admin_path !wp_admin_safe_path !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
+    http-request set-var(txn.wp_login_url) path,regsub(/wp-admin/.*,/wp-login.php,i) if wp_admin_path
+    http-request redirect code 302 location %[var(txn.wp_login_url)]?redirect_to=%[path,url_enc] if wp_admin_path wp_admin_safe_path !wp_admin_allowed !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
 
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
