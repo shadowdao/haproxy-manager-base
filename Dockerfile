@@ -46,6 +46,37 @@ COPY wpadmin_gate_exempt.list /haproxy/defaults/wpadmin_gate_exempt.list
 COPY errors /haproxy/errors
 RUN chmod +x /haproxy/scripts/*
 RUN pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+# Build gate: no image ships unless the real haproxy binary accepts the config
+# this image's templates actually produce.
+#
+# On 2026-08-14 a template change rendered fine, passed all 13 unit tests, and
+# was rejected by HAProxy ("invalid arg 2 in converter 'regsub'"). It was only
+# caught because someone built an image by hand and ran `haproxy -c`. Nothing
+# in the build or in CI would have stopped it: .gitea/workflows/build-push.yaml
+# is checkout -> build -> push, and test-config-rollback.py's "haproxy" is a
+# shell stub that only rejects a sentinel token. In production an invalid
+# haproxy.cfg means init.py refuses to start HAProxy while the container stays
+# Up - ports 80/443 unbound, every site on the host down, /health still 200.
+#
+# This lives in the Dockerfile rather than in the workflow deliberately:
+#   * it cannot be skipped, and it protects local `docker build` too;
+#   * no workflow restructuring (build-push-action builds and pushes in one
+#     step, so gating in CI would mean splitting build from push);
+#   * it validates against the EXACT haproxy binary in this image. Line 26
+#     installs haproxy unpinned, so that binary moves between builds - this
+#     turns "the new haproxy rejects our config" from a silent production
+#     risk into a build failure.
+#
+# The unit suites run here too. They had never run anywhere automated either,
+# and they cost a few seconds.
+RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
+ && python3 /haproxy/scripts/test-trusted-proxy-gate.py \
+ && python3 /haproxy/scripts/test-xmlrpc-rate-limit.py \
+ && python3 /haproxy/scripts/test-config-rollback.py \
+ && python3 /haproxy/scripts/test-cert-write-safety.py \
+ && python3 /haproxy/scripts/test-cert-scripts.py \
+ && python3 /haproxy/scripts/validate-rendered-config.py
 # Create log directories
 RUN mkdir -p /var/log && touch /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
 RUN chmod 755 /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
