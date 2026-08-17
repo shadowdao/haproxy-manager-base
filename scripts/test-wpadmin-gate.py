@@ -491,6 +491,25 @@ class UriNormalisation(unittest.TestCase):
         self.assertIn('.php', acl_line,
                       'wp_admin_asset must exclude .php explicitly')
 
+    def test_wp_admin_asset_pattern_is_end_of_flags_guarded(self):
+        """A pattern starting with "(" makes HAProxy warn on EVERY load/reload:
+
+            parsing acl 'wp_admin_asset' : matching 'path_reg' for pattern
+            '(^|/)wp-admin/...' is likely a mistake ... Maybe you need to
+            remove the extraneous space before '('.
+
+        "--" is the end-of-flags marker HAProxy itself names as the fix. It is
+        cosmetic to matching but not to operations: an unsilenced warning on
+        every reload on every host trains people to skim past warnings, which
+        is how a real one gets missed. Assert the pattern is still the one we
+        think it is, so this can never pass by the pattern having been changed.
+        """
+        acl_line = require_rule(self.cfg, 'acl wp_admin_asset', 'wp_admin_asset ACL')
+        self.assertRegex(
+            acl_line, r'path_reg\s+--\s+\(',
+            'wp_admin_asset pattern begins with "(" and MUST be preceded by "--"')
+        self.assertIn('(^|/)wp-admin/(css|js|images)/', acl_line)
+
     def test_case_insensitive_acl_and_regsub_are_kept_in_sync(self):
         """A case-insensitive wp_admin_path with a case-sensitive regsub is an
         INFINITE REDIRECT LOOP: regsub finds no "/wp-admin/" in
