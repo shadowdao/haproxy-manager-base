@@ -473,7 +473,22 @@ frontend web
     # substring, so it cannot cause the silent "login page renders unstyled"
     # regression that an extension allowlist would risk. Requires PCRE2, which
     # both the Debian (deployed) and Alpine haproxy builds have (+PCRE2).
-    acl wp_admin_asset     path_reg (^|/)wp-admin/(css|js|images)/(?!.*\.php).*$
+    #
+    # THE "--" IS LOAD-BEARING, DO NOT DELETE IT. HAProxy warns on any pattern
+    # whose first character is "(", because it cannot tell an intended regex
+    # from a fetch-argument list someone typo'd a space into:
+    #   parsing acl 'wp_admin_asset' : matching 'path_reg' for pattern
+    #   '(^|/)wp-admin/...' is likely a mistake and probably not what you want.
+    #   Maybe you need to remove the extraneous space before '('.
+    # "--" is HAProxy's documented end-of-flags marker and is the fix it names
+    # itself ("please insert '--' between the match and the pattern"). It changes
+    # no matching semantics -- verified live on whp02: /wp-admin/css/login.min.css
+    # still passes and /wp-admin/css/x.php is still gated, before and after.
+    # Left unsilenced this fires on EVERY config load and reload on every host,
+    # where it trains operators to skim past warnings and can bury a real one.
+    # wp_admin_path escapes the warning only because its "-i" flag happens to
+    # consume the flag slot first; it is not otherwise special.
+    acl wp_admin_asset     path_reg -- (^|/)wp-admin/(css|js|images)/(?!.*\.php).*$
     acl wp_gate_exempt     hdr(host),lower -f /etc/haproxy/wpadmin_gate_exempt.list
     # ENCODED SEPARATOR. percent-decode-unreserved deliberately does NOT decode
     # %2F -- "/" is a reserved character, and decoding it in the normalizer
