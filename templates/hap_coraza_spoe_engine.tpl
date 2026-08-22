@@ -37,7 +37,22 @@ spoe-agent coraza
     timeout     processing  100ms
 
     use-backend coraza-spoa-backend
-    log         global
+
+    # NO `log global` here, deliberately.
+    #
+    # `log global` in a spoe-agent emits one line PER INSPECTED REQUEST, e.g.
+    #   SPOE: [coraza] <GROUP:coraza-req> sid=537 st=0 0/0/0/0/0 32/32 0/0 0/467
+    # Measured on whp01 immediately after access logging started working:
+    # 618 SPOE lines vs 669 real access lines -- it was ~48% of the log volume,
+    # i.e. it would roughly DOUBLE the edge's log footprint (~400 MB/day extra)
+    # to record `st=0` over and over.
+    #
+    # It carries nothing incident response needs: the WAF's verdict is already
+    # visible in the access log line (status 403 + the `id=` UUID, which joins
+    # to /var/log/coraza/audit.log for the rule_id), and per-transaction WAF
+    # detail is written by the SPOA itself to /var/log/coraza/spoa.log.
+    # Agent-level failures still surface via `option set-on-error error` ->
+    # var(txn.coraza.error) and the fail-open path in hap_listener.tpl.
 
 # Per-request inspection message. No `event` directive — fires only when
 # explicitly invoked from haproxy.cfg via `http-request send-spoe-group`.

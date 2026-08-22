@@ -29,7 +29,15 @@ frontend web
     # Any new capture MUST be appended AFTER this line, never inserted
     # above it, or the slot indices in the log-format silently shift and
     # the access log starts attributing the wrong string to the wrong field.
-    http-request capture req.hdr(User-Agent) len 200
+    # req.fhdr(), NOT req.hdr(): req.hdr() treats the header as a comma-
+    # separated list and returns only the LAST element. Real User-Agent strings
+    # contain commas -- "Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+    # AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    # captured with req.hdr() logs as just "like Gecko) Chrome/131.0.0.0
+    # Safari/537.36", silently losing the platform half -- which is exactly the
+    # half you need to tell a spoofed crawler from a real browser.
+    # Observed in production on whp01 before this was corrected.
+    http-request capture req.fhdr(User-Agent) len 200
 
     # --- Access logging -----------------------------------------------------
     # Scoped to THIS frontend on purpose: it references capture slots and
