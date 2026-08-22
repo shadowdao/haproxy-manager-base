@@ -582,7 +582,9 @@ frontend web
 
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line
-    # Runtime updates: echo "add map #0 IP_ADDRESS 1" | socat stdio /var/run/haproxy.sock
+    # Runtime updates (worker command, map referenced by PATH -- "#<id>" ids
+    # move on every config regeneration and "#0" silently adds nothing):
+    #   echo "@1 add map /etc/haproxy/blocked_ips.map IP_ADDRESS 1" | socat stdio /tmp/haproxy-cli
     # Checks the real client IP (from headers if present, otherwise src)
     # map_ip() converter supports both single IPs and CIDR ranges (e.g., 192.168.1.0/24)
     acl is_blocked_ip var(txn.real_ip),map_ip(/etc/haproxy/blocked_ips.map,0) -m int gt 0

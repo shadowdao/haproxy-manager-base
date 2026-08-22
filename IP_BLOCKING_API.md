@@ -508,19 +508,44 @@ curl -X POST http://localhost:8000/api/blocked-ips/sync \
 
 For advanced users, you can interact directly with HAProxy's runtime API:
 
+Three things about these commands are easy to get wrong, and each one fails
+**silently** (socat exits 0 either way — the rejection, if any, is only in the
+response body):
+
+* `/tmp/haproxy-cli` is HAProxy's **master** CLI socket. Map commands are
+  worker commands and need the `@1` prefix. Without it the reply is
+  `Unknown command: 'add', ...`.
+* Reference the map by its **file path**, never by `#<id>`. Ids are assigned at
+  config-parse time and move on every config regeneration (on a live edge,
+  `blocked_ips.map` is id 37, `trusted_ips.map` is 10 — there is no id 0).
+  Worse, `@1 add map #0 <ip> 1` returns an **empty** reply and adds nothing.
+* Entries must carry the value `1`. `haproxy.cfg` matches with
+  `map_ip(...,0) -m int gt 0`, so a valueless entry does not block. (`add map`
+  with no value is rejected: `'add map' expects three parameters ...`.)
+
 ```bash
+MAP=/etc/haproxy/blocked_ips.map
+
 # Add IP to runtime (immediate effect)
-echo "add map #0 192.168.1.100" | socat stdio /var/run/haproxy.sock
+echo "@1 add map $MAP 192.168.1.100 1" | socat stdio /tmp/haproxy-cli
 
 # Remove IP from runtime
-echo "del map #0 192.168.1.100" | socat stdio /var/run/haproxy.sock
+echo "@1 del map $MAP 192.168.1.100" | socat stdio /tmp/haproxy-cli
+
+# Confirm what actually happened (do not trust the exit status)
+echo "@1 get map $MAP 192.168.1.100" | socat stdio /tmp/haproxy-cli
 
 # Clear all blocked IPs from runtime
-echo "clear map #0" | socat stdio /var/run/haproxy.sock
+echo "@1 clear map $MAP" | socat stdio /tmp/haproxy-cli
 
-# Show all runtime map entries
-echo "show map #0" | socat stdio /var/run/haproxy.sock
+# Show all runtime map entries, and the map ids currently in use
+echo "@1 show map $MAP" | socat stdio /tmp/haproxy-cli
+echo "@1 show map" | socat stdio /tmp/haproxy-cli
 ```
+
+The runtime map is a **fast path only**. `/etc/haproxy/blocked_ips.map` is
+authoritative: HAProxy re-reads it on reload, so a failed runtime command
+delays a block until the next reload rather than losing it.
 
 ## Migration from ACL Method
 

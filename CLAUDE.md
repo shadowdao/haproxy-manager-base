@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **API Testing**: `./scripts/test-api.sh` - Tests all API endpoints with optional authentication
 - **Certificate Request Testing**: `./scripts/test-certificate-request.sh` - Tests certificate generation endpoints
 - **Stick-table contract**: `python3 scripts/test-stick-table-contract.py` - offline; holds the templates' `store` clauses, `STICK_TABLE_FIELD_CONTRACT`, and every consumer to each other. Run it after touching any `stick-table` line.
+- **Runtime-map contract**: `python3 scripts/test-runtime-map-contract.py` - offline; asserts the runtime map commands are `@1`-prefixed, reference the map by FILE PATH (never `#<id>`), carry the value `1`, and that every captured rejection is classified as a failure. Run it after touching any `add map`/`del map`/`clear map` path.
 - **Manual Testing**: Run `curl` commands against `http://localhost:8000` endpoints as shown in README.md
 
 ### Reading stick tables (and why it is easy to get silently wrong)
@@ -30,6 +31,29 @@ This is written down because `/api/security/stats` and `show-tarpit-ips.sh`
 reported "Scan Count"/"BLOCKED" figures parsed from `gpc0`/`gpc1` — fields no
 stick table has ever stored — for their entire existence. See the header of
 `haproxy_tarpit_config.txt` and the contract test.
+
+### Changing a runtime map (`add map` / `del map`)
+
+Same socket, two more ways to fail silently — and both were live in
+`add_ip_to_runtime_map()`/`remove_ip_from_runtime_map()` for their whole
+existence:
+
+* **Reference the map by FILE PATH, never `#<id>`.** Ids are assigned at
+  config-parse time and move on every config regeneration (on whp01
+  `blocked_ips.map` is 37, `trusted_ips.map` is 10 — there is no id 0). Use
+  `add map /etc/haproxy/blocked_ips.map <ip> 1`.
+* **A mutation answers NOTHING on success**, so an empty body is the only
+  success — any output at all is a rejection. Worse, `@1 add map #0 <ip> 1`
+  *also* answers nothing and adds nothing, so the body cannot prove an add
+  worked. **Read it back** with `@1 get map <path> <key>`.
+* Entries must carry the value `1`; haproxy.cfg matches with
+  `map_ip(...,0) -m int gt 0`, so a valueless entry does not block.
+
+In Python use `haproxy_cli(cmd, worker=True, expect_empty=True)` for mutations
+and `runtime_map_lookup()` / `runtime_map_keys()` to verify. The runtime map is
+only a fast path: `/etc/haproxy/blocked_ips.map` is authoritative and HAProxy
+re-reads it on reload, so a failed runtime command must degrade to
+"enforced on reload" and be reported, never swallowed.
 
 ### Running the Application
 - **Docker Build**: `docker build -t haproxy-manager .`
