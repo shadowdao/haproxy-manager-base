@@ -1872,73 +1872,281 @@ def sync_blocked_ips():
         log_operation('sync_blocked_ips', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+# ---------------------------------------------------------------------------
+# HAProxy runtime API (stick tables)
+#
+# WHY THIS SECTION IS SO DEFENSIVE
+# --------------------------------
+# The previous /api/security/stats read `gpc0` and `gpc1` out of `show table
+# web` and reported them as "scan count" / "offense count" / "blocked". No
+# stick table in this repo has EVER stored a general-purpose counter — see
+# STICK_TABLE_FIELD_CONTRACT below and the `store` clauses in
+# templates/hap_listener.tpl and templates/hap_security_tables.tpl. Three
+# separate silences let that survive:
+#
+#   1. `int(parts[3])` on a positional split raised ValueError on `exp=368842`
+#      and the loop just `continue`d, so every row was skipped and the endpoint
+#      always answered `active_threats: 0` with an empty list. An operator
+#      reading that saw "no threats" and could not tell it apart from "the
+#      parser is broken".
+#   2. The command was sent WITHOUT a worker prefix. /tmp/haproxy-cli is the
+#      MASTER socket; `show table web` there is answered with "Unknown command:
+#      'show', but maybe one of the following ones is a better match: ..." --
+#      and socat still exits 0, so `result.returncode != 0` never fired. The
+#      reported `total_tracked_ips` was literally the number of lines in that
+#      help text minus one (8), while the real table held 388 entries.
+#   3. The shell consumers defaulted every missing field to 0 (`${gpc0:-0}`),
+#      so a field that does not exist rendered as a confident zero.
+#
+# Rules for anything added here, all three aimed at the same failure mode:
+#   * Read the CONTRACT, not positions. Stick-table output is `name=value` /
+#     `name(window)=value` pairs whose order and presence follow the template's
+#     `store` clause. Positional indexing silently reads the wrong column the
+#     moment that clause changes.
+#   * NEVER default a missing field to a number. A field the table does not
+#     store must surface as an error naming the field, not as 0.
+#   * NEVER trust socat's exit status. HAProxy reports command errors in the
+#     response BODY and the socket still closes cleanly. Use haproxy_cli().
+#
+# scripts/test-stick-table-contract.py holds STICK_TABLE_FIELD_CONTRACT, the
+# rendered templates and the shell consumers to each other, and fails if any
+# one of them drifts.
+# ---------------------------------------------------------------------------
+
+# What each stick table ACTUALLY stores, per its `store` clause. The single
+# source of truth for every consumer in this repo. Keep in sync with the
+# templates -- the contract test enforces that, in both directions.
+STICK_TABLE_FIELD_CONTRACT = {
+    'web': ('conn_cur', 'conn_rate', 'http_req_rate', 'http_err_rate'),
+    'wp_bruteforce': ('http_req_rate',),
+    'xmlrpc_bruteforce': ('http_req_rate',),
+}
+
+# Metadata every stick-table entry carries regardless of the `store` clause.
+STICK_TABLE_ENTRY_META = ('key', 'use', 'exp', 'shard')
+
+# HAProxy answers a rejected runtime command in the response body and the
+# socket still closes 0. These are the prefixes it uses.
+_HAPROXY_CLI_ERROR_MARKERS = (
+    'Unknown command',
+    'No such table',
+    'Permission denied',
+    "Can't find the specified process",
+    'unknown process',
+    'Missing ',
+)
+
+_STICK_TABLE_TOKEN_RE = re.compile(r'^([a-z_][a-z0-9_]*)(?:\(([^)]*)\))?=(.*)$')
+_STICK_TABLE_HEADER_RE = re.compile(
+    r'^#\s*table:\s*(?P<name>[^,]+),\s*type:\s*(?P<type>[^,]+),\s*'
+    r'size:\s*(?P<size>\d+),\s*used:\s*(?P<used>\d+)')
+
+
+class HaproxyCliError(RuntimeError):
+    """A runtime-API command was rejected, timed out, or answered nothing.
+
+    Exists so a rejected command cannot be mistaken for an empty result. That
+    distinction is the whole point of this module's stick-table code.
+    """
+
+
+def _haproxy_socket_path():
+    return HAPROXY_SOCKET_PATH if os.path.exists(HAPROXY_SOCKET_PATH) else '/tmp/haproxy-cli'
+
+
+def _cli_response_is_error(text):
+    if text is None:
+        return True
+    head = text.lstrip()
+    return any(head.startswith(marker) for marker in _HAPROXY_CLI_ERROR_MARKERS)
+
+
+def _cli_send(command, socket_path, timeout):
+    proc = subprocess.run(
+        ['socat', 'stdio', socket_path],
+        input=command + '\n', capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise HaproxyCliError(
+            'socat failed talking to %s (exit %d): %s'
+            % (socket_path, proc.returncode, (proc.stderr or '').strip()))
+    return proc.stdout
+
+
+def haproxy_cli(command, worker=False, timeout=None):
+    """Send one runtime-API command and return its response, or raise.
+
+    `worker=True` marks a command that only the WORKER answers (show table,
+    show map, add map, ...). On this deployment the socket is HAProxy's MASTER
+    CLI, where those need an `@1` prefix; on a plain stats socket they must NOT
+    have one. Rather than guessing from configuration that can change under us,
+    try the prefixed form and fall back -- and raise if BOTH are rejected,
+    instead of returning HAProxy's help text as if it were data.
+    """
+    socket_path = _haproxy_socket_path()
+    timeout = timeout if timeout is not None else DEFAULT_SUBPROCESS_TIMEOUT
+    attempts = (['@1 ' + command, command] if worker else [command])
+    failures = []
+    for attempt in attempts:
+        try:
+            out = _cli_send(attempt, socket_path, timeout)
+        except subprocess.TimeoutExpired:
+            raise HaproxyCliError('timed out after %ss running %r on %s'
+                                  % (timeout, attempt, socket_path))
+        if out.strip() and not _cli_response_is_error(out):
+            return out
+        failures.append('%r -> %r' % (attempt, out.strip()[:200] or '<empty response>'))
+    raise HaproxyCliError(
+        'HAProxy rejected %r on %s (socat exited 0 -- the rejection is in the '
+        'response body, which is exactly why this is checked): %s'
+        % (command, socket_path, '; '.join(failures)))
+
+
+def parse_stick_table_entry(line):
+    """{field: {'value': str, 'window_ms': int|None}} for one `show table` row.
+
+    Parses `name=value` / `name(window)=value` pairs by NAME. The leading
+    `0x...:` allocation pointer is skipped -- reading it as the key is how the
+    old code came to report memory addresses as IP addresses.
+    """
+    fields = {}
+    for token in line.split():
+        m = _STICK_TABLE_TOKEN_RE.match(token)
+        if not m:
+            continue  # the 0x...: pointer, or anything else unnamed
+        name, window, value = m.group(1), m.group(2), m.group(3)
+        fields[name] = {
+            'value': value,
+            'window_ms': int(window) if window and window.isdigit() else None,
+        }
+    return fields
+
+
+def read_stick_table(table):
+    """(header dict, [(raw line, parsed fields)]) for a stick table.
+
+    Raises HaproxyCliError if the response is not a stick-table dump, or if any
+    row is missing a field the contract says the table stores. A field the
+    table does not carry is an ERROR here, never a zero.
+    """
+    expected = STICK_TABLE_FIELD_CONTRACT.get(table)
+    if expected is None:
+        raise HaproxyCliError(
+            'no field contract for stick table %r; add it to '
+            'STICK_TABLE_FIELD_CONTRACT (and to the templates) first' % table)
+
+    raw = haproxy_cli('show table %s' % table, worker=True)
+    lines = raw.strip().split('\n')
+    header = _STICK_TABLE_HEADER_RE.match(lines[0]) if lines else None
+    if not header:
+        raise HaproxyCliError(
+            'response to `show table %s` is not a stick-table dump; first line '
+            'was %r' % (table, lines[0][:200] if lines else ''))
+
+    entries = []
+    for line in lines[1:]:
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        fields = parse_stick_table_entry(line)
+        if 'key' not in fields:
+            raise HaproxyCliError(
+                'stick-table row for %r has no key= field: %r' % (table, line[:200]))
+        missing = [f for f in expected if f not in fields]
+        if missing:
+            raise HaproxyCliError(
+                'stick table %r no longer stores %s -- STICK_TABLE_FIELD_CONTRACT '
+                'and the `store` clause in templates/hap_listener.tpl have drifted '
+                'apart. Present: %s. Offending row: %r'
+                % (table, ', '.join(missing),
+                   ', '.join(sorted(fields)), line[:200]))
+        entries.append((line, fields))
+
+    return {
+        'name': header.group('name'),
+        'type': header.group('type'),
+        'size': int(header.group('size')),
+        'used': int(header.group('used')),
+    }, entries
+
+
 @app.route('/api/security/stats', methods=['GET'])
 @require_api_key
 def get_security_stats():
-    """Get current security statistics from HAProxy stick table"""
+    """Per-source connection and request rates from the `web` stick table.
+
+    Reports ONLY what the table stores: conn_cur, conn_rate, http_req_rate and
+    http_err_rate, each with the window HAProxy is actually counting over. It
+    deliberately does NOT classify a "threat level" or report a "blocked" flag:
+    the thresholds live in templates/hap_listener.tpl and a copy here would be
+    a second source of truth free to drift, which is the class of bug this
+    endpoint used to be. Sources at or over a limit are visible from the rates
+    themselves, and the enforcement that actually happened -- 429s, tarpits
+    (termination state PT), WAF denials -- is in the edge access log on the
+    HOST at /var/log/haproxy.log, which records per-request outcomes the stick
+    table never held.
+
+    Query params:
+      limit         max sources returned (default 50)
+      min_req_rate  only sources at or above this http_req_rate (default 1,
+                    i.e. sources with current activity; pass 0 for all)
+    """
     try:
-        if os.path.exists(HAPROXY_SOCKET_PATH):
-            socket_path = HAPROXY_SOCKET_PATH
-        else:
-            socket_path = '/tmp/haproxy-cli'
+        limit = max(1, min(int(request.args.get('limit', 50)), 1000))
+        min_req_rate = max(0, int(request.args.get('min_req_rate', 1)))
+    except ValueError:
+        return jsonify({'status': 'error',
+                        'message': 'limit and min_req_rate must be integers'}), 400
 
-        # Get stick table data
-        cmd = f'echo "show table web" | socat stdio {socket_path}'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            return jsonify({'status': 'error', 'message': 'Failed to get stick table data'}), 500
-
-        # Parse stick table output
-        lines = result.stdout.strip().split('\n')
-        threats = []
-
-        for line in lines[1:]:  # Skip header
-            parts = line.split()
-            if len(parts) >= 8:
-                ip = parts[0]
-                try:
-                    gpc0 = int(parts[3]) if len(parts) > 3 else 0
-                    gpc1 = int(parts[4]) if len(parts) > 4 else 0
-                    req_rate = int(parts[5]) if len(parts) > 5 else 0
-                    err_rate = int(parts[6]) if len(parts) > 6 else 0
-                    conn_rate = int(parts[7]) if len(parts) > 7 else 0
-
-                    # Only include IPs with significant activity
-                    if gpc0 > 0 or gpc1 > 0 or req_rate > 30 or err_rate > 5 or conn_rate > 10:
-                        threat_level = 'low'
-                        if gpc1 > 2:
-                            threat_level = 'critical'
-                        elif gpc0 > 0 or err_rate > 10:
-                            threat_level = 'high'
-                        elif req_rate > 40 or conn_rate > 15:
-                            threat_level = 'medium'
-
-                        threats.append({
-                            'ip': ip,
-                            'blocked': gpc0 > 0,
-                            'repeat_offender': gpc1 > 2,
-                            'offense_count': gpc1,
-                            'request_rate': req_rate,
-                            'error_rate': err_rate,
-                            'connection_rate': conn_rate,
-                            'threat_level': threat_level
-                        })
-                except (ValueError, IndexError):
-                    continue
-
-        # Sort by threat level
-        threats.sort(key=lambda x: (x['offense_count'], x['error_rate'], x['request_rate']), reverse=True)
-
-        return jsonify({
-            'status': 'success',
-            'total_tracked_ips': len(lines) - 1,
-            'active_threats': len(threats),
-            'threats': threats[:50]  # Limit to top 50
-        })
+    try:
+        header, entries = read_stick_table('web')
+    except HaproxyCliError as e:
+        log_operation('get_security_stats', False, str(e))
+        return jsonify({'status': 'error', 'message': str(e)}), 502
     except Exception as e:
         log_operation('get_security_stats', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    counters = STICK_TABLE_FIELD_CONTRACT['web']
+    windows = {}
+    sources = []
+    active = 0
+    for line, fields in entries:
+        row = {'ip': fields['key']['value']}
+        for name in counters:
+            # A non-numeric counter means HAProxy's output format changed under
+            # us. Say so; do not coerce it to 0 and report it as a measurement.
+            try:
+                row[name] = int(fields[name]['value'])
+            except ValueError:
+                msg = ('stick table web reported a non-numeric %s=%r; the '
+                       '`show table` output format has changed. Row: %r'
+                       % (name, fields[name]['value'], line[:200]))
+                log_operation('get_security_stats', False, msg)
+                return jsonify({'status': 'error', 'message': msg}), 502
+            if fields[name]['window_ms'] is not None:
+                windows.setdefault(name, fields[name]['window_ms'])
+        if any(row[name] > 0 for name in counters):
+            active += 1
+        if row['http_req_rate'] >= min_req_rate:
+            sources.append(row)
+
+    sources.sort(key=lambda r: (r['http_req_rate'], r['http_err_rate'],
+                                r['conn_rate'], r['conn_cur']), reverse=True)
+
+    return jsonify({
+        'status': 'success',
+        'table': header['name'],
+        'table_size': header['size'],
+        'total_tracked_ips': header['used'],
+        'sources_with_activity': active,
+        'counters': list(counters),
+        'counter_windows_ms': windows,
+        'returned': len(sources[:limit]),
+        'min_req_rate': min_req_rate,
+        'sources': sources[:limit],
+        'note': ('Current per-source rates only. The stick table stores no '
+                 'history and no counter of past blocks; enforcement events '
+                 'are in the edge access log on the host at /var/log/haproxy.log.'),
+    })
 
 @app.route('/api/security/temporary-block', methods=['POST'])
 @require_api_key

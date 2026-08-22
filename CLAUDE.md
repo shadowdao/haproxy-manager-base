@@ -7,7 +7,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Testing
 - **API Testing**: `./scripts/test-api.sh` - Tests all API endpoints with optional authentication
 - **Certificate Request Testing**: `./scripts/test-certificate-request.sh` - Tests certificate generation endpoints
+- **Stick-table contract**: `python3 scripts/test-stick-table-contract.py` - offline; holds the templates' `store` clauses, `STICK_TABLE_FIELD_CONTRACT`, and every consumer to each other. Run it after touching any `stick-table` line.
 - **Manual Testing**: Run `curl` commands against `http://localhost:8000` endpoints as shown in README.md
+
+### Reading stick tables (and why it is easy to get silently wrong)
+
+`/tmp/haproxy-cli` is HAProxy's **master** CLI socket. Worker commands
+(`show table`, `show map`, `add map`, ...) need an `@1` prefix. Without it
+HAProxy answers `Unknown command: 'show', ...` **and socat still exits 0** — so
+an exit-status check passes and the help text gets parsed as data. Always use
+`haproxy_cli(cmd, worker=True)` in Python, which inspects the response body.
+
+Stick-table entries are `name=value` / `name(window_ms)=value` pairs, not fixed
+columns; the first token is an allocation pointer (`0x...:`), not the key. Parse
+by NAME, and treat a missing field as an ERROR — never default it to `0`. The
+`web` table stores only `conn_cur`, `conn_rate`, `http_req_rate`,
+`http_err_rate`; it holds **no history and no counter of past blocks**. What was
+actually denied/tarpitted is in the edge access log on the **host** at
+`/var/log/haproxy.log` (shipped 2026.08.8), not in any stick table.
+
+This is written down because `/api/security/stats` and `show-tarpit-ips.sh`
+reported "Scan Count"/"BLOCKED" figures parsed from `gpc0`/`gpc1` — fields no
+stick table has ever stored — for their entire existence. See the header of
+`haproxy_tarpit_config.txt` and the contract test.
 
 ### Running the Application
 - **Docker Build**: `docker build -t haproxy-manager .`
