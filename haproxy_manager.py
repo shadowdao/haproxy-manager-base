@@ -1735,8 +1735,10 @@ def add_blocked_ip():
             log_operation('add_blocked_ip', False, f'Failed to update map file for {ip_address}')
             return jsonify({'status': 'error', 'message': 'Failed to update blocked IPs map file'}), 500
         
-        # Add to runtime map for immediate effect
-        add_ip_to_runtime_map(ip_address)
+        # Add to runtime map for immediate effect. The map FILE above is what
+        # actually enforces the block once HAProxy re-reads it; this is only
+        # the fast path, so a False here is reported, not fatal.
+        runtime_ok = add_ip_to_runtime_map(ip_address)
         
         # Reload HAProxy to ensure consistency
         try:
@@ -1753,8 +1755,18 @@ def add_blocked_ip():
         except Exception as e:
             logger.warning(f"Error reloading HAProxy after blocking IP {ip_address}: {e}")
         
-        log_operation('add_blocked_ip', True, f'IP {ip_address} blocked successfully')
-        return jsonify({'status': 'success', 'blocked_ip_id': blocked_ip_id, 'message': f'IP {ip_address} has been blocked'})
+        log_operation('add_blocked_ip', True,
+                      f'IP {ip_address} blocked successfully '
+                      f'(runtime map fast path: {"ok" if runtime_ok else "FAILED, enforced on reload"})')
+        return jsonify({
+            'status': 'success',
+            'blocked_ip_id': blocked_ip_id,
+            'message': f'IP {ip_address} has been blocked',
+            # False = the block is enforced from the map file at reload rather
+            # than instantly. The caller can tell the difference; it used to be
+            # reported as instant unconditionally.
+            'runtime_map_updated': runtime_ok
+        })
     except sqlite3.IntegrityError:
         log_operation('add_blocked_ip', False, f'IP {ip_address} is already blocked')
         return jsonify({'status': 'error', 'message': 'IP address is already blocked'}), 409
@@ -1790,8 +1802,9 @@ def remove_blocked_ip():
             log_operation('remove_blocked_ip', False, f'Failed to update map file for {ip_address}')
             return jsonify({'status': 'error', 'message': 'Failed to update blocked IPs map file'}), 500
         
-        # Remove from runtime map for immediate effect
-        remove_ip_from_runtime_map(ip_address)
+        # Remove from runtime map for immediate effect. As with blocking, the
+        # map file is authoritative and the reload below picks it up.
+        runtime_ok = remove_ip_from_runtime_map(ip_address)
         
         # Reload HAProxy to ensure consistency
         try:
@@ -1808,8 +1821,14 @@ def remove_blocked_ip():
         except Exception as e:
             logger.warning(f"Error reloading HAProxy after unblocking IP {ip_address}: {e}")
         
-        log_operation('remove_blocked_ip', True, f'IP {ip_address} unblocked successfully')
-        return jsonify({'status': 'success', 'message': f'IP {ip_address} has been unblocked'})
+        log_operation('remove_blocked_ip', True,
+                      f'IP {ip_address} unblocked successfully '
+                      f'(runtime map fast path: {"ok" if runtime_ok else "FAILED, applied on reload"})')
+        return jsonify({
+            'status': 'success',
+            'message': f'IP {ip_address} has been unblocked',
+            'runtime_map_updated': runtime_ok
+        })
     except Exception as e:
         log_operation('remove_blocked_ip', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -1843,31 +1862,67 @@ def sync_blocked_ips():
             cursor.execute('SELECT ip_address FROM blocked_ips ORDER BY ip_address')
             blocked_ips = [row[0] for row in cursor.fetchall()]
         
-        # Try to clear all entries from runtime map (might fail if empty, that's ok)
+        # Clear the runtime map and re-add every blocked IP. The map is
+        # referenced by FILE PATH: `clear map #0` (what this used to send, with
+        # no `@1` either) was answered by the master socket with "Unknown
+        # command: 'clear'" and socat exited 0, so this whole block was a no-op
+        # that reported a full sync.
         try:
-            if os.path.exists(HAPROXY_SOCKET_PATH):
-                socket_path = HAPROXY_SOCKET_PATH
-            else:
-                socket_path = '/tmp/haproxy-cli'
-            
-            subprocess.run(f'echo "clear map #0" | socat stdio {socket_path}', 
-                         shell=True, capture_output=True)
-        except:
-            pass  # Clear might fail if map is empty
-        
-        # Add all IPs to runtime map
-        success_count = 0
+            haproxy_cli('clear map %s' % BLOCKED_IPS_MAP_PATH,
+                        worker=True, expect_empty=True)
+        except HaproxyCliError as e:
+            log_operation('sync_blocked_ips', False, f'Failed to clear runtime map: {e}')
+            logger.warning("Failed to clear runtime map: %s. The map file is "
+                           "still authoritative and correct.", e)
+            return jsonify({
+                'status': 'error',
+                'message': f'Failed to clear runtime map: {e}',
+                'map_file_updated': True,
+                'runtime_map_synced': False,
+                'total_ips': len(blocked_ips)
+            }), 500
+
+        # verify=False here: one `show map` read-back below costs a single
+        # round trip instead of one per IP, and answers the same question for
+        # the whole set.
+        accepted = 0
         for ip in blocked_ips:
-            if add_ip_to_runtime_map(ip):
-                success_count += 1
-        
-        log_operation('sync_blocked_ips', True, f'Synced {success_count}/{len(blocked_ips)} IPs to runtime map')
+            if add_ip_to_runtime_map(ip, verify=False):
+                accepted += 1
+
+        # Ground truth, not a count of commands that did not visibly complain.
+        try:
+            present = runtime_map_keys(BLOCKED_IPS_MAP_PATH)
+        except HaproxyCliError as e:
+            log_operation('sync_blocked_ips', False, f'Could not read back runtime map: {e}')
+            return jsonify({
+                'status': 'error',
+                'message': f'Could not read back the runtime map to verify the sync: {e}',
+                'map_file_updated': True,
+                'runtime_map_synced': False,
+                'total_ips': len(blocked_ips)
+            }), 500
+
+        missing = [ip for ip in blocked_ips if ip not in present]
+        synced = len(blocked_ips) - len(missing)
+        ok = not missing
+        if missing:
+            logger.warning(
+                "Runtime map sync incomplete: %d/%d IPs are not in %s (first "
+                "few: %s). They remain blocked via the map file on reload.",
+                len(missing), len(blocked_ips), BLOCKED_IPS_MAP_PATH, missing[:5])
+
+        log_operation('sync_blocked_ips', ok,
+                      f'Verified {synced}/{len(blocked_ips)} IPs present in the runtime map')
         return jsonify({
-            'status': 'success', 
-            'message': f'Synced {success_count}/{len(blocked_ips)} IPs to runtime map',
+            'status': 'success' if ok else 'partial',
+            'message': f'Verified {synced}/{len(blocked_ips)} IPs present in the runtime map',
             'total_ips': len(blocked_ips),
-            'synced_ips': success_count
-        })
+            'synced_ips': synced,
+            'accepted_commands': accepted,
+            'missing_ips': missing[:50],
+            'runtime_map_synced': ok
+        }), (200 if ok else 207)
     except Exception as e:
         log_operation('sync_blocked_ips', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -1930,6 +1985,10 @@ STICK_TABLE_ENTRY_META = ('key', 'use', 'exp', 'shard')
 _HAPROXY_CLI_ERROR_MARKERS = (
     'Unknown command',
     'No such table',
+    # `add map #0 ...` / `get map /etc/haproxy/nope.map ...` -- captured
+    # verbatim from HAProxy 3.0.11 on the live edge.
+    'Unknown map identifier',
+    'Key not found',
     'Permission denied',
     "Can't find the specified process",
     'unknown process',
@@ -1947,7 +2006,14 @@ class HaproxyCliError(RuntimeError):
 
     Exists so a rejected command cannot be mistaken for an empty result. That
     distinction is the whole point of this module's stick-table code.
+
+    `.responses` holds the raw, stripped response body of every attempt, so a
+    caller can tell one rejection apart from another (`del map` answering
+    "Key not found." is a no-op, not a failure) without regex-matching the
+    formatted message.
     """
+
+    responses = ()
 
 
 def _haproxy_socket_path():
@@ -1972,7 +2038,7 @@ def _cli_send(command, socket_path, timeout):
     return proc.stdout
 
 
-def haproxy_cli(command, worker=False, timeout=None):
+def haproxy_cli(command, worker=False, timeout=None, expect_empty=False):
     """Send one runtime-API command and return its response, or raise.
 
     `worker=True` marks a command that only the WORKER answers (show table,
@@ -1981,24 +2047,41 @@ def haproxy_cli(command, worker=False, timeout=None):
     have one. Rather than guessing from configuration that can change under us,
     try the prefixed form and fall back -- and raise if BOTH are rejected,
     instead of returning HAProxy's help text as if it were data.
+
+    `expect_empty=True` is for MUTATING commands (add/del/clear map, set map).
+    HAProxy answers those with nothing at all on success, so the rule inverts:
+    an empty body is the success, and ANY non-empty body is a rejection. That
+    is deliberately stricter than matching _HAPROXY_CLI_ERROR_MARKERS -- the
+    marker list can only ever recognise the rejections someone has already
+    seen, and a mutation that prints anything has not done what was asked. Two
+    real examples this catches that the marker list did not:
+    `'add map' expects three parameters ...` and `Unknown map identifier.`
     """
     socket_path = _haproxy_socket_path()
     timeout = timeout if timeout is not None else DEFAULT_SUBPROCESS_TIMEOUT
     attempts = (['@1 ' + command, command] if worker else [command])
     failures = []
+    bodies = []
     for attempt in attempts:
         try:
             out = _cli_send(attempt, socket_path, timeout)
         except subprocess.TimeoutExpired:
             raise HaproxyCliError('timed out after %ss running %r on %s'
                                   % (timeout, attempt, socket_path))
-        if out.strip() and not _cli_response_is_error(out):
+        body = out.strip()
+        if expect_empty:
+            if not body:
+                return out
+        elif body and not _cli_response_is_error(out):
             return out
-        failures.append('%r -> %r' % (attempt, out.strip()[:200] or '<empty response>'))
-    raise HaproxyCliError(
+        bodies.append(body)
+        failures.append('%r -> %r' % (attempt, body[:200] or '<empty response>'))
+    error = HaproxyCliError(
         'HAProxy rejected %r on %s (socat exited 0 -- the rejection is in the '
         'response body, which is exactly why this is checked): %s'
         % (command, socket_path, '; '.join(failures)))
+    error.responses = tuple(bodies)
+    raise error
 
 
 def parse_stick_table_entry(line):
@@ -2185,13 +2268,16 @@ def temporary_block():
         if not update_blocked_ips_map():
             return jsonify({'status': 'error', 'message': 'Failed to update map file'}), 500
 
-        add_ip_to_runtime_map(ip_address)
+        runtime_ok = add_ip_to_runtime_map(ip_address)
 
-        log_operation('temporary_block', True, f'Temporarily blocked {ip_address} for {duration_minutes} minutes')
+        log_operation('temporary_block', True,
+                      f'Temporarily blocked {ip_address} for {duration_minutes} minutes '
+                      f'(runtime map fast path: {"ok" if runtime_ok else "FAILED, enforced on reload"})')
         return jsonify({
             'status': 'success',
             'message': f'IP {ip_address} temporarily blocked for {duration_minutes} minutes',
-            'expires_at': expiry_time.isoformat()
+            'expires_at': expiry_time.isoformat(),
+            'runtime_map_updated': runtime_ok
         })
     except Exception as e:
         log_operation('temporary_block', False, str(e))
@@ -2204,6 +2290,10 @@ def clear_expired_blocks():
     try:
         current_time = datetime.now()
         expired_ips = []
+        # IPs the runtime fast path could not drop. They still come out of the
+        # map file below, so they unblock on the next reload -- but silently
+        # reporting them as cleared is what this whole change is about.
+        runtime_failures = []
 
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -2224,17 +2314,21 @@ def clear_expired_blocks():
                 # Remove expired IPs
                 for ip in expired_ips:
                     cursor.execute('DELETE FROM blocked_ips WHERE ip_address = ?', (ip,))
-                    remove_ip_from_runtime_map(ip)
+                    if not remove_ip_from_runtime_map(ip):
+                        runtime_failures.append(ip)
 
         # Update map file if any IPs were removed
         if expired_ips:
             update_blocked_ips_map()
 
-        log_operation('clear_expired_blocks', True, f'Cleared {len(expired_ips)} expired IP blocks')
+        log_operation('clear_expired_blocks', not runtime_failures,
+                      f'Cleared {len(expired_ips)} expired IP blocks '
+                      f'({len(runtime_failures)} not removed from the runtime map)')
         return jsonify({
-            'status': 'success',
+            'status': 'success' if not runtime_failures else 'partial',
             'message': f'Cleared {len(expired_ips)} expired IP blocks',
-            'cleared_ips': expired_ips
+            'cleared_ips': expired_ips,
+            'runtime_map_failures': runtime_failures
         })
     except Exception as e:
         log_operation('clear_expired_blocks', False, str(e))
@@ -3273,50 +3367,167 @@ def update_blocked_ips_map(promote_backup=True):
         logger.error(f"Failed to update blocked IPs map: {e}")
         return False
 
-def add_ip_to_runtime_map(ip_address):
-    """Add IP to HAProxy runtime map without reload"""
+# ---------------------------------------------------------------------------
+# Runtime map fast path (blocked IPs)
+#
+# WHAT WAS WRONG, AND WHY NOBODY NOTICED FOR ITS ENTIRE EXISTENCE
+# ---------------------------------------------------------------
+# add_ip_to_runtime_map()/remove_ip_from_runtime_map() sent
+# `add map #0 <ip> 1` / `del map #0 <ip>` to /tmp/haproxy-cli and returned True
+# whenever socat exited 0. Two independent defects, three silences:
+#
+#   1. NO `@1` PREFIX. /tmp/haproxy-cli is HAProxy's MASTER CLI socket. Map
+#      commands are worker commands. The master answers
+#      `Unknown command: 'add', but maybe one of the following ones is a better
+#      match: ...` -- and socat still exits 0, so `result.returncode == 0` was
+#      true and the function logged "Added IP x to runtime map".
+#   2. `#0` IS NOT A VALID MAP ID. Ids are assigned at config-parse time and
+#      move whenever the config is regenerated; on whp01 blocked_ips.map is
+#      id 37 and trusted_ips.map is 10. There is no id 0. Hardcoding ANY number
+#      is wrong -- reference the map by its FILE PATH, which is stable because
+#      it is what haproxy.cfg names in `map_ip(/etc/haproxy/blocked_ips.map,0)`.
+#   3. `add map #0 ...` fails SILENTLY EVEN WITH `@1`. Captured on HAProxy
+#      3.0.11: `@1 add map #0 192.0.2.88 1` returns an EMPTY body, exit 0, and
+#      adds nothing to any map -- while `@1 del map #0 <ip>` and
+#      `@1 show map #0` both answer `Unknown map identifier.`. So a
+#      response-body check alone cannot catch defect 2 on the add path. That is
+#      why every mutation here is READ BACK with `get map` instead of trusting
+#      either the exit status or the (empty) reply.
+#
+# The blocking itself never depended on this: update_blocked_ips_map() rewrites
+# /etc/haproxy/blocked_ips.map and the callers reload HAProxy, which re-reads
+# the file. The FILE IS AUTHORITATIVE; this is only the no-reload fast path.
+# Every function below therefore returns a bool the caller can report, and
+# never raises into a request handler -- a runtime-map failure must degrade to
+# "enforced on reload", not to "not blocked" and not to a 500.
+#
+# scripts/test-runtime-map-contract.py holds the command strings and the
+# classification of every captured response to these rules.
+# ---------------------------------------------------------------------------
+
+# The value every blocked_ips.map entry must carry. haproxy.cfg matches with
+# `map_ip(/etc/haproxy/blocked_ips.map,0) -m int gt 0`, so a keyed entry with
+# no value evaluates to 0 and is NOT blocked. Runtime map and file must agree.
+BLOCKED_IPS_MAP_VALUE = '1'
+
+_GET_MAP_FOUND_RE = re.compile(r'\bfound=(yes|no)\b')
+_GET_MAP_VALUE_RE = re.compile(r'\bvalue="([^"]*)"')
+
+
+def runtime_map_lookup(map_path, key):
+    """(found, value) for one key in a runtime map, or raise HaproxyCliError.
+
+    Reads back what `add map`/`del map` actually did. `get map` answers
+    `type=ip, case=sensitive, found=yes, idx=tree, key="1.2.3.4", value="1",
+    type="str"` or `type=ip, case=sensitive, found=no`; an unusable map
+    reference answers `Unknown map identifier.`, which haproxy_cli() rejects.
+    """
+    out = haproxy_cli('get map %s %s' % (map_path, key), worker=True)
+    match = _GET_MAP_FOUND_RE.search(out)
+    if not match:
+        raise HaproxyCliError(
+            'unparseable `get map %s %s` response (no found=yes/no): %r'
+            % (map_path, key, out.strip()[:200]))
+    if match.group(1) == 'no':
+        return (False, None)
+    value = _GET_MAP_VALUE_RE.search(out)
+    return (True, value.group(1) if value else None)
+
+
+def runtime_map_keys(map_path):
+    """The set of keys currently in a runtime map, or raise HaproxyCliError.
+
+    `show map <file>` emits `<0x-pointer> <key> <value>` per line. An empty map
+    legitimately emits nothing, which is why this does not go through the
+    non-empty check.
+    """
     try:
-        if os.path.exists(HAPROXY_SOCKET_PATH):
-            socket_path = HAPROXY_SOCKET_PATH
-        else:
-            socket_path = '/tmp/haproxy-cli'
+        out = haproxy_cli('show map %s' % map_path, worker=True)
+    except HaproxyCliError as e:
+        # An empty map is a real, distinguishable state -- not a rejection.
+        if e.responses and all(body == '' for body in e.responses):
+            return set()
+        raise
+    keys = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith('0x'):
+            keys.add(parts[1])
+    return keys
 
-        # Add to runtime map (map file ID 0 for blocked IPs)
-        # Format: add map #<id> <key> <value>
-        # For IP blocking, value is always "1"
-        cmd = f'echo "add map #0 {ip_address} 1" | socat stdio {socket_path}'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-        if result.returncode == 0:
-            logger.info(f"Added IP {ip_address} to runtime map")
-            return True
-        else:
-            logger.warning(f"Failed to add IP to runtime map: {result.stderr}")
-            return False
+def add_ip_to_runtime_map(ip_address, verify=True):
+    """Add IP to the running HAProxy's blocked map without a reload.
+
+    Returns True only when the entry is verifiably present with the value the
+    config matches on. False means the FILE + reload path is what will enforce
+    this block -- which it does regardless; see the section comment above.
+    """
+    try:
+        haproxy_cli(
+            'add map %s %s %s' % (BLOCKED_IPS_MAP_PATH, ip_address, BLOCKED_IPS_MAP_VALUE),
+            worker=True, expect_empty=True)
+        if verify:
+            found, value = runtime_map_lookup(BLOCKED_IPS_MAP_PATH, ip_address)
+            if not found:
+                raise HaproxyCliError(
+                    '`add map` was accepted but %s is not in %s afterwards -- '
+                    'the command did nothing (this is exactly how `#0` failed)'
+                    % (ip_address, BLOCKED_IPS_MAP_PATH))
+            if value != BLOCKED_IPS_MAP_VALUE:
+                raise HaproxyCliError(
+                    '%s is in %s with value %r, not %r -- haproxy.cfg matches '
+                    'with `-m int gt 0`, so this entry does NOT block'
+                    % (ip_address, BLOCKED_IPS_MAP_PATH, value, BLOCKED_IPS_MAP_VALUE))
+        logger.info(f"Added IP {ip_address} to runtime map (verified={verify})")
+        return True
+    except HaproxyCliError as e:
+        logger.warning(
+            "Runtime map fast path FAILED for %s: %s. The block is NOT lost -- "
+            "%s was rewritten and HAProxy re-reads it on reload -- but it does "
+            "not take effect until that reload completes.",
+            ip_address, e, BLOCKED_IPS_MAP_PATH)
+        return False
     except Exception as e:
-        logger.error(f"Error adding IP to runtime map: {e}")
+        logger.error(f"Error adding IP {ip_address} to runtime map: {e}")
         return False
 
-def remove_ip_from_runtime_map(ip_address):
-    """Remove IP from HAProxy runtime map without reload"""
+
+def remove_ip_from_runtime_map(ip_address, verify=True):
+    """Remove IP from the running HAProxy's blocked map without a reload.
+
+    Returns True only when the key is verifiably gone. `Key not found.` means
+    the runtime map never had it, which is the requested end state, so that is
+    a success -- but it is logged, because it also means the runtime map and
+    the file had drifted apart.
+    """
     try:
-        if os.path.exists(HAPROXY_SOCKET_PATH):
-            socket_path = HAPROXY_SOCKET_PATH
-        else:
-            socket_path = '/tmp/haproxy-cli'
-        
-        # Remove from runtime map (map file ID 0 for blocked IPs)
-        cmd = f'echo "del map #0 {ip_address}" | socat stdio {socket_path}'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            logger.info(f"Removed IP {ip_address} from runtime map")
-            return True
-        else:
-            logger.warning(f"Failed to remove IP from runtime map: {result.stderr}")
-            return False
+        try:
+            haproxy_cli('del map %s %s' % (BLOCKED_IPS_MAP_PATH, ip_address),
+                        worker=True, expect_empty=True)
+        except HaproxyCliError as e:
+            if not any(body.startswith('Key not found') for body in e.responses):
+                raise
+            logger.info(
+                "Runtime map had no entry for %s to remove (`Key not found.`); "
+                "the file and the runtime map had drifted", ip_address)
+        if verify:
+            found, _ = runtime_map_lookup(BLOCKED_IPS_MAP_PATH, ip_address)
+            if found:
+                raise HaproxyCliError(
+                    '`del map` was accepted but %s is STILL in %s'
+                    % (ip_address, BLOCKED_IPS_MAP_PATH))
+        logger.info(f"Removed IP {ip_address} from runtime map (verified={verify})")
+        return True
+    except HaproxyCliError as e:
+        logger.warning(
+            "Runtime map fast path FAILED for %s: %s. The unblock is NOT lost -- "
+            "%s was rewritten and HAProxy re-reads it on reload -- but the IP "
+            "stays blocked until that reload completes.",
+            ip_address, e, BLOCKED_IPS_MAP_PATH)
+        return False
     except Exception as e:
-        logger.error(f"Error removing IP from runtime map: {e}")
+        logger.error(f"Error removing IP {ip_address} from runtime map: {e}")
         return False
 
 def start_haproxy():

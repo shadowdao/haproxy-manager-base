@@ -50,13 +50,21 @@ http-request deny status 403 if { src -f /etc/haproxy/blocked_ips.map }
 - **Graceful error handling**
 
 ### 2. Runtime IP Management
+Map commands go to a **worker** (`@1`), reference the map by **file path**
+(ids move between config regenerations, and `#0` silently adds nothing), and
+carry the value `1` that `map_ip(...,0) -m int gt 0` matches on:
+
 ```bash
 # Add IP without reload (immediate effect)
-echo "add map #0 192.168.1.100" | socat stdio /var/run/haproxy.sock
+echo "@1 add map /etc/haproxy/blocked_ips.map 192.168.1.100 1" | socat stdio /tmp/haproxy-cli
 
 # Remove IP without reload
-echo "del map #0 192.168.1.100" | socat stdio /var/run/haproxy.sock
+echo "@1 del map /etc/haproxy/blocked_ips.map 192.168.1.100" | socat stdio /tmp/haproxy-cli
 ```
+
+socat exits 0 even when HAProxy rejects the command, so read the response body
+(or read the entry back with `@1 get map ...`) rather than the exit status.
+See IP_BLOCKING_API.md for the full set.
 
 ### 3. New API Endpoints
 
