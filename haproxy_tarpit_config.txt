@@ -1,3 +1,37 @@
+# =============================================================================
+# NOT IMPLEMENTED. THIS FILE IS A DESIGN SKETCH THAT WAS NEVER SHIPPED.
+# =============================================================================
+#
+# Nothing here is deployed, has ever been deployed, or is rendered into
+# haproxy.cfg. The real edge config is generated from templates/*.tpl. Compare:
+#
+#   THIS FILE proposes:  store gpc0,gpc1,gpc2,http_err_rate(30s),...
+#                        plus sc-inc-gpc0/1/2 scan-escalation rules
+#   templates/hap_listener.tpl ACTUALLY has:
+#                        store conn_cur,conn_rate(10s),http_req_rate(10s),http_err_rate(30s)
+#
+# There is no gpc0, no gpc1, no gpc2, and no scan-escalation state anywhere on
+# the edge, and never has been.
+#
+# WHY THE BANNER. This file was mistaken for the shipped config. Two consumers
+# -- /api/security/stats in haproxy_manager.py and scripts/show-tarpit-ips.sh --
+# were written to parse gpc0/gpc1 out of `show table web`, defaulting missing
+# fields to 0. The result was a "Scan Count" column and BLOCKED/TARPITTED
+# statuses that were pure fabrication, presented to an operator as fact, for
+# the entire life of both tools. Fixed 2026-08-22; scripts/test-stick-table-
+# contract.py now fails if any consumer's field expectations and the templates'
+# `store` clauses ever drift apart again.
+#
+# IF YOU WANT TO REVIVE ANY OF THIS: the counters must be added to a template
+# `store` clause and to STICK_TABLE_FIELD_CONTRACT in haproxy_manager.py first.
+# Adding them to a consumer alone produces confident zeros, not data. Note also
+# that sc0/sc1/sc2 are all in use and HAProxy's tune.stick-counters defaults to
+# 3, and that since 2026.08.8 the edge has real per-request access logging on
+# the host at /var/log/haproxy.log -- which records what was actually denied,
+# tarpitted and rate-limited, with request references. That log is a better
+# source for most of what this sketch was reaching for.
+# =============================================================================
+
 global
     daemon
     log stdout local0 info
