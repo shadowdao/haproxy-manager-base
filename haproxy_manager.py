@@ -2351,9 +2351,20 @@ def generate_config():
                 except Exception as e:
                     logger.error(f"Failed to create {suspended_list_path}: {e}")
 
+        # Access-log destination for the `log` line in the global section.
+        # Default 172.18.0.1:514 is the docker bridge gateway for WHP's
+        # `client-net`, i.e. the host, where rsyslog's imudp listener is bound
+        # by setup-haproxy-logrotate.sh. Overridable so this image stays usable
+        # on standalone/home deployments with a different bridge subnet or a
+        # remote log collector -- set HAPROXY_SYSLOG_TARGET to `<ip>:<port>`.
+        # UDP, so an absent listener drops log lines and never affects request
+        # handling.
+        syslog_target = os.environ.get('HAPROXY_SYSLOG_TARGET', '172.18.0.1:514').strip()
+
         # Add Haproxy Default Headers
         default_headers = template_env.get_template('hap_header.tpl').render(
             cluster_secret = get_or_create_cluster_secret(),
+            syslog_target = syslog_target,
         )
         config_parts.append(default_headers)
 

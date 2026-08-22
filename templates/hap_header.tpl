@@ -2,20 +2,46 @@
 # Global settings
 #---------------------------------------------------------------------
 global
-    # to have these messages end up in /var/log/haproxy.log you will
-    # need to:
+    # ACCESS LOG DESTINATION.
     #
-    # 1) configure syslog to accept network log events.  This is done
-    #    by adding the '-r' option to the SYSLOGD_OPTIONS in
-    #    /etc/sysconfig/syslog
+    # This used to be `log 127.0.0.1 local2`, which was a silent black hole:
+    # 127.0.0.1 is the CONTAINER's own loopback, nothing has ever listened on
+    # udp/514 in the container netns, and there is no /dev/log in the image.
+    # Every access log line -- ~1.5M/day across the whole edge -- was written
+    # to a socket with no receiver and dropped. Nothing errored, nothing
+    # warned, and `haproxy -c` was perfectly happy. The cost only shows up
+    # during an incident: per-IP 429s, tarpits, wp-admin gate redirects,
+    # WAF 403s and `silent-drop`s left no record anywhere, so the edge could
+    # not be asked what it had rejected. Only aggregate stick-table counters
+    # survived.
     #
-    # 2) configure local2 events to go to the /var/log/haproxy.log
-    #   file. A line like the following can be added to
-    #   /etc/sysconfig/syslog
+    # Now points at the DOCKER BRIDGE GATEWAY, where the host's rsyslog has an
+    # imudp listener bound (installed idempotently by WHP's
+    # setup-haproxy-logrotate.sh, which also writes the logrotate stanza).
+    # The host writes local2 to /var/log/haproxy.log and stops it there, so it
+    # does not also flood /var/log/messages or the Graylog forwarder.
     #
-    #    local2.*                       /var/log/haproxy.log
+    # WHY NOT `log stdout format raw local0`: it is INCOMPATIBLE with the
+    # `daemon` keyword below, and incompatible SILENTLY. Verified on the
+    # pinned 3.0.11 binary: with `daemon` set, a `log stdout` config serves
+    # traffic normally and emits ZERO log lines, and `haproxy -c` returns 0
+    # with no error and no warning -- so the CI config gate
+    # (scripts/validate-rendered-config.py) cannot catch it either. Making it
+    # work means dropping `daemon` / adding -db so haproxy stays in the
+    # foreground, which in turn breaks the three synchronous
+    # `subprocess.run(['haproxy', '-W', ...], check=True)` launch sites in
+    # haproxy_manager.py (they would block until the 180s timeout and then be
+    # killed). That is a change to the exact code path whose failure mode is
+    # "container Up, ports 80/443 never bound, every site down, /health still
+    # 200". Not worth it for a logging change.
     #
-    log         127.0.0.1 local2
+    # UDP means a dead listener degrades to dropped log lines, never to a
+    # stalled or failing request path -- the correct failure direction for an
+    # edge fronting ~60 customer sites.
+    #
+    # len 2048 accommodates the enriched log-format in hap_listener.tpl
+    # (URL + User-Agent + UUID); the default 1024 would truncate long ones.
+    log         {{ syslog_target }} len 2048 format rfc5424 local2 info
 
     chroot      /var/lib/haproxy
     pidfile     /var/run/haproxy.pid
@@ -122,7 +148,11 @@ defaults
     maxconn                 3000
 
     # Per-request unique reference, used:
-    #   - in the log line (httplog includes %ID)
+    #   - in the access log line, as the `id=` field of the custom log-format
+    #     in hap_listener.tpl. NOTE: `option httplog` does NOT include %ID
+    #     (verified against haproxy 3.0.11) -- this comment used to claim it
+    #     did, which made the support workflow below look supported when it
+    #     was not. The explicit log-format is what actually carries it.
     #   - echoed to clients in the X-Request-Reference response header on
     #     WAF blocks so a customer can quote it when opening a support ticket
     #   - embedded in /etc/haproxy/errors/403-waf.html so a blocked visitor

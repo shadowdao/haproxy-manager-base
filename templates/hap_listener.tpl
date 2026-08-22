@@ -19,8 +19,43 @@ frontend web
     # response, including haproxy-generated ones (blocks, default page).
     http-after-response set-header alt-svc "h3=\":443\"; ma=86400"
 
-    # Capture Host header so it appears in httplog output (in %hr field)
+    # Capture Host header so it appears in httplog output (in %hr field).
+    # ORDER IS LOAD-BEARING: this is capture slot 0, referenced by the
+    # access log-format below as %[capture.req.hdr(0)].
     http-request capture req.hdr(Host) len 64
+
+    # Capture slot 1 = User-Agent. Incident response needs it to tell a
+    # scanner from a browser, and it is not in `option httplog` output.
+    # Any new capture MUST be appended AFTER this line, never inserted
+    # above it, or the slot indices in the log-format silently shift and
+    # the access log starts attributing the wrong string to the wrong field.
+    http-request capture req.hdr(User-Agent) len 200
+
+    # --- Access logging -----------------------------------------------------
+    # Scoped to THIS frontend on purpose: it references capture slots and
+    # var(txn.real_ip), which only exist here. Putting it in `defaults` would
+    # apply it to the stats frontend and every backend too, where those
+    # samples are undefined.
+    #
+    # `log-format` overrides `option httplog` for this proxy (haproxy emits a
+    # harmless warning saying so). The first 16 fields are byte-identical to
+    # the 3.0 httplog default, so anything that already parses httplog keeps
+    # working; the `key=value` tail is additive.
+    #
+    # Why the default httplog is not enough for incident response:
+    #   %ci  is the PROXY's address for Cloudflare-fronted sites, not the
+    #        visitor. The real client is var(txn.real_ip), resolved further
+    #        down from CF-Connecting-IP / X-Real-IP / X-Forwarded-For and only
+    #        honoured from trusted proxies. BOTH are logged: cip= is who to
+    #        rate-limit or block, %ci is which edge it arrived through.
+    #   %ID  is NOT included by `option httplog` (verified against
+    #        haproxy 3.0.11). Without it the documented support workflow
+    #        -- X-Request-Reference -> access log -> coraza audit.log -> rule_id
+    #        -- cannot be completed. id= is what makes that join possible.
+    #   host=/ua= identify the vhost and client; %ST/%B/%tsc give status,
+    #        bytes and the termination state that distinguishes a rate-limit
+    #        deny (PR--) from a tarpit (PT--) from a normal close.
+    log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r cip=%[var(txn.real_ip)] id=%ID host=%[capture.req.hdr(0)] ua=%[capture.req.hdr(1)] sni=%[ssl_fc_sni] hv=%[fc_http_major]"
 
     # --- URI normalisation (MUST be the first path-touching block here) ---
     # Every path-based control in this frontend (the ACME health-check bypass,
