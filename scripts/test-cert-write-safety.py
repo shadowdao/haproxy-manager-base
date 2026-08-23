@@ -27,6 +27,8 @@ These tests pin the invariants:
   * nothing is published that is not a complete, validated cert+key pair;
   * no old certificate file is removed and no lineage deleted until the
     replacement is validated, in place, and actually loaded by HAProxy;
+  * removing ONE domain never unlinks a .pem, or deletes a certbot lineage,
+    that other still-configured domains are being served from;
   * only final .pem files ever exist in the crt directory.
 
 Running
@@ -892,6 +894,184 @@ class TestBundleValidation(CertPublishTestCase):
                          '`cat > file` produced under the standard umask')
         self.assertEqual(0, fresh_mode & 0o022,
                          'a private key must never be group/world writable')
+
+
+class TestSharedCertificateSurvivesDomainRemoval(CertPublishTestCase):
+    """Bug 5: DELETE /api/domain unlinked a PEM other live sites were served from.
+
+    `domains.domain` is UNIQUE; `domains.ssl_cert_path` is not, and nothing
+    ever made it so. request_ssl_bundle() issues one SAN certificate and points
+    every included name's row at the same /etc/haproxy/certs/<primary>.pem, so
+    sharing is not an edge case - it is the normal shape of the table. Measured
+    on production the day this was written: 39 of 71 distinct cert paths on one
+    host were referenced by more than one domain row (118 of 150 SSL-enabled
+    rows), and one shared path was
+    /etc/haproxy/certs/threeworldsoneheart.org.pem, referenced by the live
+    apex, its www, and a mail.* alias.
+
+    remove_domain() did, unconditionally:
+
+        os.remove(ssl_cert_path)
+        certbot delete --cert-name <domain>
+
+    Removing the mail.* alias would therefore have deleted the PEM the apex was
+    serving on, and (had the alias been the bundle primary) the lineage behind
+    it - HTTPS down for every other name in the bundle, with no local copy and
+    only a fresh, rate-limited ACME order to recover from.
+
+    These tests assert file-system and certbot-invocation outcomes, not which
+    branch was taken.
+    """
+
+    BUNDLE = '/etc/haproxy/certs'  # documentation only; SSL_CERTS_DIR is stubbed
+
+    def _cert_for(self, primary):
+        """Publish a bundle for `primary` and return its path."""
+        return self.publish_live_bundle(primary)
+
+    def remove(self, domain):
+        return self.client.delete('/api/domain', json={'domain': domain})
+
+    # -- last reference: the cleanup must still happen --------------------
+
+    def test_last_reference_removal_unlinks_the_pem(self):
+        cert = self._cert_for('example.com')
+        self.add_domain('example.com', 'be_example', ssl_cert_path=cert)
+
+        resp = self.remove('example.com')
+
+        self.assertEqual(200, resp.status_code, resp.data)
+        self.assertFalse(
+            os.path.exists(cert),
+            'nothing else referenced this bundle - it must be cleaned up, or '
+            'the crt directory accumulates certs for domains that are gone')
+
+    def test_last_reference_removal_deletes_the_lineage(self):
+        cert = self._cert_for('example.com')
+        self.add_domain('example.com', 'be_example', ssl_cert_path=cert)
+
+        self.remove('example.com')
+
+        self.assertEqual(
+            ['delete --cert-name example.com --non-interactive'],
+            self.certbot_deletes(),
+            'the last name on a lineage went away - the lineage should go too')
+
+    def test_lineage_deleted_is_the_bundles_not_the_domains_own_name(self):
+        """Removing a SAN member must target the lineage that issued the file."""
+        cert = self._cert_for('example.com')
+        self.add_domain('www.example.com', 'be_www', ssl_cert_path=cert)
+
+        self.remove('www.example.com')
+
+        self.assertEqual(
+            ['delete --cert-name example.com --non-interactive'],
+            self.certbot_deletes(),
+            'the lineage is named after the bundle primary (--cert-name), not '
+            'after whichever SAN happened to be removed last')
+
+    # -- shared reference: nothing may be destroyed -----------------------
+
+    def test_shared_pem_survives_removal_of_one_name(self):
+        cert = self._cert_for('example.com')
+        before = self.read(cert)
+        self.add_domain('example.com', 'be_apex', ssl_cert_path=cert)
+        self.add_domain('www.example.com', 'be_www', ssl_cert_path=cert)
+
+        resp = self.remove('www.example.com')
+
+        self.assertEqual(200, resp.status_code, resp.data)
+        self.assertTrue(
+            os.path.exists(cert),
+            'example.com is still configured and still served from this file')
+        self.assertEqual(before, self.read(cert),
+                         'the surviving bundle must be byte-for-byte intact')
+        self.assertTrue(self.edge_would_start(),
+                        'the edge must still load the crt directory')
+
+    def test_shared_pem_survives_removal_of_the_bundle_primary(self):
+        """The worst shape: the name being removed IS the lineage/file name."""
+        cert = self._cert_for('example.com')
+        before = self.read(cert)
+        self.add_domain('example.com', 'be_apex', ssl_cert_path=cert)
+        self.add_domain('www.example.com', 'be_www', ssl_cert_path=cert)
+
+        self.remove('example.com')
+
+        self.assertTrue(
+            os.path.exists(cert),
+            'www.example.com is still configured and is served from this exact '
+            'file - removing the apex must not unlink it')
+        self.assertEqual(before, self.read(cert))
+        self.assertTrue(self.edge_would_start())
+
+    def test_shared_lineage_is_not_certbot_deleted(self):
+        cert = self._cert_for('example.com')
+        self.add_domain('example.com', 'be_apex', ssl_cert_path=cert)
+        self.add_domain('www.example.com', 'be_www', ssl_cert_path=cert)
+
+        self.remove('example.com')
+
+        self.assertEqual(
+            [], self.certbot_deletes(),
+            'certbot delete destroys archive, live and renewal config for a '
+            'lineage that is still renewing the certificate www.example.com '
+            'is served with')
+
+    def test_production_shape_mail_alias_removal(self):
+        """The exact row that stopped a production cleanup.
+
+        mail.threeworldsoneheart.org carried
+        ssl_cert_path=/etc/haproxy/certs/threeworldsoneheart.org.pem - the live
+        PEM of a different, serving site.
+        """
+        cert = self._cert_for('threeworldsoneheart.org')
+        before = self.read(cert)
+        self.add_domain('threeworldsoneheart.org', 'be_apex', ssl_cert_path=cert)
+        self.add_domain('www.threeworldsoneheart.org', 'be_www', ssl_cert_path=cert)
+        self.add_domain('mail.threeworldsoneheart.org', 'be_mail', ssl_cert_path=cert)
+
+        self.remove('mail.threeworldsoneheart.org')
+
+        self.assertTrue(os.path.exists(cert),
+                        'two sites are still served from this bundle')
+        self.assertEqual(before, self.read(cert))
+        self.assertEqual([], self.certbot_deletes())
+        self.assertTrue(self.edge_would_start())
+
+    def test_removing_every_name_eventually_cleans_up(self):
+        """The guard defers cleanup, it does not cancel it."""
+        cert = self._cert_for('example.com')
+        self.add_domain('example.com', 'be_apex', ssl_cert_path=cert)
+        self.add_domain('www.example.com', 'be_www', ssl_cert_path=cert)
+
+        self.remove('www.example.com')
+        self.assertTrue(os.path.exists(cert), 'apex still needs it')
+
+        self.remove('example.com')
+        self.assertFalse(os.path.exists(cert),
+                         'the last reference is gone - now it may be removed')
+        self.assertEqual(
+            ['delete --cert-name example.com --non-interactive'],
+            self.certbot_deletes())
+
+    def test_unrelated_domains_certificate_is_untouched(self):
+        """Sharing is by exact path; different bundles stay independent."""
+        mine = self._cert_for('example.com')
+        theirs = self._cert_for('other.example')
+        theirs_before = self.read(theirs)
+        self.add_domain('example.com', 'be_mine', ssl_cert_path=mine)
+        self.add_domain('other.example', 'be_theirs', ssl_cert_path=theirs)
+
+        self.remove('example.com')
+
+        self.assertFalse(os.path.exists(mine))
+        self.assertTrue(os.path.exists(theirs),
+                        'a different bundle must not be collateral damage')
+        self.assertEqual(theirs_before, self.read(theirs))
+        self.assertEqual(
+            ['delete --cert-name example.com --non-interactive'],
+            self.certbot_deletes())
 
 
 @unittest.skipIf(TESTING_FOREIGN_TREE,
