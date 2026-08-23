@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Certificate Request Testing**: `./scripts/test-certificate-request.sh` - Tests certificate generation endpoints
 - **Stick-table contract**: `python3 scripts/test-stick-table-contract.py` - offline; holds the templates' `store` clauses, `STICK_TABLE_FIELD_CONTRACT`, and every consumer to each other. Run it after touching any `stick-table` line.
 - **Runtime-map contract**: `python3 scripts/test-runtime-map-contract.py` - offline; asserts the runtime map commands are `@1`-prefixed, reference the map by FILE PATH (never `#<id>`), carry the value `1`, and that every captured rejection is classified as a failure. Run it after touching any `add map`/`del map`/`clear map` path.
+- **Certificate destruction safety**: `python3 scripts/test-cert-write-safety.py` - offline; asserts a live `.pem` is never truncated, removed, or its certbot lineage deleted while any configured domain still references it (one bundle serves many names, so `ssl_cert_path` is routinely shared). Run it after touching any `os.remove`/`certbot delete`/PEM-write path.
 - **Manual Testing**: Run `curl` commands against `http://localhost:8000` endpoints as shown in README.md
 
 ### Reading stick tables (and why it is easy to get silently wrong)

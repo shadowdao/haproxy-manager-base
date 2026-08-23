@@ -1624,6 +1624,61 @@ def request_certificates():
     else:
         return jsonify(response), 500  # All failed
 
+def lineage_name_for_cert_path(cert_path):
+    """The certbot lineage name implied by a published bundle path.
+
+    Every writer in this module publishes to ``{SSL_CERTS_DIR}/<name>.pem`` and
+    issues that lineage with ``--cert-name <name>`` (see request_ssl() and
+    request_ssl_bundle()); _quarantine_superseded_certs() derives the lineage
+    from the filename the same way. So the basename minus ``.pem`` IS the
+    lineage, and it is NOT necessarily the domain being removed: a bundle
+    issued as ``--cert-name example.com`` also serves www.example.com and any
+    other SAN, all of whose DB rows point at ``/etc/haproxy/certs/example.com.pem``.
+    """
+    if not cert_path:
+        return None
+    base = os.path.basename(cert_path)
+    return base[:-len('.pem')] if base.endswith('.pem') else base
+
+
+def domains_referencing_cert_path(cursor, cert_path):
+    """Domains (still in the table) whose ssl_cert_path is exactly `cert_path`.
+
+    Call this AFTER the row being removed has been deleted, so the answer is
+    "who else still needs this file".
+
+    ssl_enabled is deliberately NOT filtered on. HAProxy binds the whole crt
+    directory, so a file is load-bearing for any row that names it; and the
+    asymmetry of the two mistakes is total - keeping a stale PEM costs nothing,
+    unlinking a live one is HTTPS down for every name it serves.
+    """
+    if not cert_path:
+        return []
+    cursor.execute(
+        'SELECT domain FROM domains WHERE ssl_cert_path = ? ORDER BY domain',
+        (cert_path,))
+    return [row[0] for row in cursor.fetchall()]
+
+
+def domains_referencing_lineage(cursor, lineage):
+    """Domains (still in the table) served by certbot lineage `lineage`.
+
+    Same shape as domains_referencing_cert_path(), one level further back:
+    `certbot delete --cert-name X` destroys the archive, live symlinks and
+    renewal config for X. If any remaining domain is served by a bundle
+    published from that lineage, deleting it means the next renewal silently
+    stops happening for all of them and the material cannot be recovered
+    without a fresh, rate-limited ACME order.
+    """
+    if not lineage:
+        return []
+    cursor.execute(
+        "SELECT domain, ssl_cert_path FROM domains "
+        "WHERE ssl_cert_path IS NOT NULL AND ssl_cert_path != ''")
+    return sorted({domain for domain, path in cursor.fetchall()
+                   if lineage_name_for_cert_path(path) == lineage})
+
+
 @app.route('/api/domain', methods=['DELETE'])
 @require_api_key
 def remove_domain():
@@ -1662,33 +1717,74 @@ def remove_domain():
             # Delete domain
             cursor.execute('DELETE FROM domains WHERE id = ?', (domain_id,))
 
+            # Refcount the certificate BEFORE anything is unlinked or deleted,
+            # with the row above already gone so the query answers "who else
+            # still needs this". One .pem serves many names: request_ssl_bundle()
+            # issues a single SAN cert and points EVERY included domain's row at
+            # the same /etc/haproxy/certs/<primary>.pem. Removing one of those
+            # names used to os.remove() that file and `certbot delete` its
+            # lineage unconditionally - taking HTTPS down for every other name
+            # in the bundle, and destroying the only recoverable copy with it.
+            cert_path_users = domains_referencing_cert_path(cursor, ssl_cert_path)
+            lineage = lineage_name_for_cert_path(ssl_cert_path) if ssl_cert_path else None
+            # The lineage to delete is the one this domain's bundle came from,
+            # not the domain's own name - for a SAN member those differ.
+            lineage_users = domains_referencing_lineage(cursor, lineage)
+
+        cert_retained_for = []
+        lineage_retained_for = []
+
         # Delete SSL certificate from HAProxy certs directory
         if ssl_enabled and ssl_cert_path:
-            try:
-                os.remove(ssl_cert_path)
-                logger.info(f"Removed HAProxy certificate file: {ssl_cert_path}")
-            except OSError as e:
-                logger.warning(f"Failed to remove certificate file {ssl_cert_path}: {e}")
+            if cert_path_users:
+                cert_retained_for = cert_path_users
+                logger.info(
+                    "Kept HAProxy certificate file %s while removing %s: still "
+                    "referenced by %d other domain(s): %s",
+                    ssl_cert_path, domain, len(cert_path_users),
+                    ', '.join(cert_path_users))
+            else:
+                try:
+                    os.remove(ssl_cert_path)
+                    logger.info(f"Removed HAProxy certificate file: {ssl_cert_path}")
+                except OSError as e:
+                    logger.warning(f"Failed to remove certificate file {ssl_cert_path}: {e}")
 
         # Remove certificate from certbot
         if ssl_enabled:
-            try:
-                result = subprocess.run(
-                    ['certbot', 'delete', '--cert-name', domain, '--non-interactive'],
-                    capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    logger.info(f"Removed Let's Encrypt certificate for {domain}")
-                else:
-                    logger.warning(f"Failed to remove Let's Encrypt certificate for {domain}: {result.stderr}")
-            except Exception as e:
-                logger.warning(f"Error removing Let's Encrypt certificate for {domain}: {e}")
+            if not lineage:
+                logger.info(
+                    "Skipping certbot delete for %s: no certificate path on the "
+                    "removed row, so no lineage can be attributed to it", domain)
+            elif lineage_users:
+                lineage_retained_for = lineage_users
+                logger.info(
+                    "Kept Let's Encrypt lineage %s while removing %s: still "
+                    "serving %d other domain(s): %s",
+                    lineage, domain, len(lineage_users), ', '.join(lineage_users))
+            else:
+                try:
+                    result = subprocess.run(
+                        ['certbot', 'delete', '--cert-name', lineage, '--non-interactive'],
+                        capture_output=True, text=True
+                    )
+                    if result.returncode == 0:
+                        logger.info(f"Removed Let's Encrypt certificate {lineage} for {domain}")
+                    else:
+                        logger.warning(f"Failed to remove Let's Encrypt certificate {lineage} for {domain}: {result.stderr}")
+                except Exception as e:
+                    logger.warning(f"Error removing Let's Encrypt certificate {lineage} for {domain}: {e}")
 
         # Regenerate HAProxy config
         generate_config()
 
         log_operation('remove_domain', True, f'Domain {domain} removed successfully')
-        return jsonify({'status': 'success', 'message': 'Domain configuration removed'})
+        return jsonify({
+            'status': 'success',
+            'message': 'Domain configuration removed',
+            'certificate_retained_for': cert_retained_for,
+            'lineage_retained_for': lineage_retained_for,
+        })
 
     except Exception as e:
         log_operation('remove_domain', False, str(e))
