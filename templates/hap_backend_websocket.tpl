@@ -7,7 +7,7 @@ backend {{ name }}-backend
     timeout tunnel 6h
     timeout http-keep-alive 6h
     option forwardfor
-    http-request add-header X-CLIENT-IP %[var(txn.real_ip)]
+    http-request set-header X-CLIENT-IP %[var(txn.real_ip)]
     http-request set-header X-Real-IP %[var(txn.real_ip)]
     http-request set-header X-Forwarded-For %[var(txn.real_ip)]
     http-request set-header X-Forwarded-Proto https if { ssl_fc }
@@ -24,7 +24,7 @@ backend {{ name }}-sse-backend
     timeout tunnel 6h
     timeout http-keep-alive 6h
     option forwardfor
-    http-request add-header X-CLIENT-IP %[var(txn.real_ip)]
+    http-request set-header X-CLIENT-IP %[var(txn.real_ip)]
     http-request set-header X-Real-IP %[var(txn.real_ip)]
     http-request set-header X-Forwarded-For %[var(txn.real_ip)]
     http-request set-header X-Forwarded-Proto https if { ssl_fc }
