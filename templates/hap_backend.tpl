@@ -4,7 +4,7 @@ backend {{ name }}-backend
     option forwardfor
     # Pass the real client IP to backend (from proxy headers or direct connection)
     # This is crucial for container-level logging and security tools
-    http-request add-header X-CLIENT-IP %[var(txn.real_ip)]
+    http-request set-header X-CLIENT-IP %[var(txn.real_ip)]
     http-request set-header X-Real-IP %[var(txn.real_ip)]
     http-request set-header X-Forwarded-For %[var(txn.real_ip)]
     http-request set-header X-Forwarded-Proto https if { ssl_fc }
@@ -29,7 +29,7 @@ backend {{ name }}-sse-backend
 
     option forwardfor
     # Pass the real client IP to backend (from proxy headers or direct connection)
-    http-request add-header X-CLIENT-IP %[var(txn.real_ip)]
+    http-request set-header X-CLIENT-IP %[var(txn.real_ip)]
     http-request set-header X-Real-IP %[var(txn.real_ip)]
     http-request set-header X-Forwarded-For %[var(txn.real_ip)]
     http-request set-header X-Forwarded-Proto https if { ssl_fc }
