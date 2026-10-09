@@ -774,6 +774,30 @@ def health_check():
             'error': str(e)
         }), 500
 
+# What this edge supports. WHP's orchestrator only switches to whole-site
+# re-bundling with unreachable_names when it sees these (HARD RULE: the WHP side
+# must not rely on 2026.10.3 behaviour against an older image, whose CN-only
+# quarantine + `certbot delete` would act on the larger bundles).
+EDGE_CAPABILITIES = ['bundle_renewed_flag', 'san_overlap_retirement',
+                     'unreachable_names', 'retired_lineage_tree']
+
+
+def _image_version():
+    for path in ('/haproxy/VERSION', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VERSION')):
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except OSError:
+            continue
+    return 'unknown'
+
+
+@app.route('/api/capabilities', methods=['GET'])
+@require_api_key
+def get_capabilities():
+    return jsonify({'version': _image_version(), 'capabilities': EDGE_CAPABILITIES})
+
+
 @app.route('/api/regenerate', methods=['GET'])
 @require_api_key
 def regenerate_conf():
@@ -1017,9 +1041,11 @@ def request_ssl():
 #     would lose its last valid certificate (the shared-PEM hazard: one bundle
 #     routinely serves several sites' names, see domains_referencing_cert_path);
 #   * nothing is deleted. The pem goes to the cert-retired sibling directory and
-#     the lineage's live/<name> and renewal/<name>.conf go to live-retired/ and
-#     renewal-retired/, so certbot stops renewing it and renew-certificates.sh
-#     stops re-publishing it. Every move is logged and can be reversed with mv.
+#     the lineage's live/<name>, archive/<name> and renewal/<name>.conf go
+#     together to /etc/letsencrypt/retired/<stamp>/ (retire_lineage_tree), so
+#     certbot stops renewing it, renew-certificates.sh stops re-publishing it,
+#     and the name can still be issued again later. Every move is logged and
+#     can be reversed with mv.
 #     (This used to `certbot delete` the lineage, which is irreversible.)
 
 # Where certbot keeps its lineages. A module global so the tests can repoint
@@ -1249,14 +1275,58 @@ def _quarantine_superseded_certs(keep_path, keep_lineage, bundle_names,
     return summary
 
 
+def retire_lineage_tree(lineage, stamp=None):
+    """Move a certbot lineage COMPLETELY out of certbot's view, without deleting.
+
+    live/<x>, archive/<x> and renewal/<x>.conf go together to
+    LETSENCRYPT_DIR/retired/<UTCstamp>/{live,archive,renewal}/. All three must
+    move: certbot's storage.RenewableCert.new_lineage() refuses to create a
+    lineage while archive/<x> exists ("archive directory exists for <x>") - and
+    it has already written an empty renewal/<x>.conf by then, which breaks every
+    later --cert-name <x> and every `certbot renew` parse (review H2, verified
+    against certbot 2.11). Moving only live/ and renewal/ (as the first version
+    of this did) therefore made the name permanently un-issuable.
+
+    The retired tree keeps the same depth as /etc/letsencrypt, so the relative
+    live/<x>/*.pem -> ../../archive/<x>/*N.pem symlinks still resolve, and a
+    restore is three mv's back. Returns {'retired_to': dir, 'moved': [...]}.
+    Raises on failure after moving back anything already moved.
+    """
+    stamp = stamp or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    root = os.path.join(LETSENCRYPT_DIR, 'retired', stamp)
+    n = 1
+    while any(os.path.exists(os.path.join(root, part, name)) for part, name in
+              (('live', lineage), ('archive', lineage), ('renewal', f'{lineage}.conf'))):
+        root = os.path.join(LETSENCRYPT_DIR, 'retired', f'{stamp}.{n}')
+        n += 1
+    plan = [(os.path.join(LETSENCRYPT_DIR, part, name), os.path.join(root, part, name))
+            for part, name in (('renewal', f'{lineage}.conf'), ('live', lineage),
+                               ('archive', lineage))]
+    moved = []
+    try:
+        for src, dst in plan:
+            if os.path.lexists(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
+                moved.append((src, dst))
+    except Exception:
+        for src, dst in reversed(moved):
+            try:
+                shutil.move(dst, src)
+            except Exception as e:  # pragma: no cover - logged, nothing else to do
+                logger.critical("Could not restore %s from %s: %s", src, dst, e)
+        raise
+    return {'retired_to': root, 'moved': [d for _, d in moved]}
+
+
 def _retire_superseded_lineages(keep_lineage, bundle_names, unreachable_names=(),
                                 keep_fingerprint=None):
-    """Move overlapping certbot lineages out of live/ and renewal/.
+    """Move overlapping certbot lineages out of certbot's tree (retire_lineage_tree).
 
     Same overlap and safety rules as _quarantine_superseded_certs(), evaluated
     against the pem files that are left in the crt dir. Runs only after HAProxy
-    has loaded the new bundle. Moving live/<x> to live-retired/<x> (same depth)
-    keeps its relative ../../archive symlinks valid, so `mv` back restores it.
+    has loaded the new bundle. keep_lineage is the bundle's --cert-name and is
+    never retired.
     """
     summary = {'retired': [], 'kept': [], 'errors': []}
     live_root = os.path.join(LETSENCRYPT_DIR, 'live')
@@ -1275,6 +1345,8 @@ def _retire_superseded_lineages(keep_lineage, bundle_names, unreachable_names=()
 
     for lineage in sorted(os.listdir(live_root)):
         lineage_dir = os.path.join(live_root, lineage)
+        # Hard guard: the bundle's own --cert-name lineage is never a candidate,
+        # whatever any other check says (review H1).
         if lineage == keep_lineage or not os.path.isdir(lineage_dir):
             continue
         cert_file = os.path.join(lineage_dir, 'cert.pem')
@@ -1299,24 +1371,12 @@ def _retire_superseded_lineages(keep_lineage, bundle_names, unreachable_names=()
             continue
         entry = {'lineage': lineage, 'names': sorted(info['names'])}
         try:
-            live_dest_root = os.path.join(LETSENCRYPT_DIR, 'live-retired')
-            os.makedirs(live_dest_root, exist_ok=True)
-            live_dest = _unique_dest(live_dest_root, lineage)
-            shutil.move(lineage_dir, live_dest)
-            entry['live_moved_to'] = live_dest
-            conf = os.path.join(LETSENCRYPT_DIR, 'renewal', f'{lineage}.conf')
-            if os.path.exists(conf):
-                conf_dest_root = os.path.join(LETSENCRYPT_DIR, 'renewal-retired')
-                os.makedirs(conf_dest_root, exist_ok=True)
-                conf_dest = _unique_dest(conf_dest_root, f'{lineage}.conf')
-                shutil.move(conf, conf_dest)
-                entry['renewal_moved_to'] = conf_dest
+            entry.update(retire_lineage_tree(lineage))
             logger.warning(
                 "Retired certbot lineage %s (names: %s) because it overlaps the "
-                "new %s bundle: live -> %s, renewal conf -> %s. Archive left in "
-                "place; reverse with mv to restore.", lineage,
-                ', '.join(entry['names']), keep_lineage, entry['live_moved_to'],
-                entry.get('renewal_moved_to', '(none)'))
+                "new %s bundle: live, archive and renewal conf moved to %s. "
+                "Restore with three mv's back.", lineage,
+                ', '.join(entry['names']), keep_lineage, entry['retired_to'])
             summary['retired'].append(entry)
         except Exception as e:
             entry['error'] = str(e)
@@ -1419,10 +1479,16 @@ def request_ssl_bundle():
         # Defensive: clear any stale lock left by a SIGKILLed prior run.
         clear_stale_certbot_locks()
 
-        # fullchain.pem starts with the leaf, so it identifies the certificate.
-        before_dir = find_certbot_live_dir(primary)
-        before_info = read_cert_info(os.path.join(before_dir, 'fullchain.pem')) \
-            if before_dir else None
+        # The lineage is EXACTLY live/<primary>: certbot was given
+        # --cert-name <primary>, which is authoritative. find_certbot_live_dir()
+        # must NOT be used here - it returns the newest of <primary> and
+        # <primary>-NNNN, so after a "not yet due" no-op a stale, more recently
+        # renewed <primary>-0001 would be published as <primary>.pem and the
+        # real <primary> lineage would then be retired as "superseded" (review
+        # H1, reproduced with brainjar.net). fullchain.pem starts with the leaf.
+        lineage_dir = os.path.join(LETSENCRYPT_DIR, 'live', primary)
+        before_info = read_cert_info(os.path.join(lineage_dir, 'fullchain.pem')) \
+            if os.path.isdir(lineage_dir) else None
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -1436,9 +1502,8 @@ def request_ssl_bundle():
                 'attempted_names': names,
             }), 500
 
-        # Locate the lineage. With --cert-name primary, this should be a
-        # stable directory name (no -NNNN suffix on the first issuance).
-        live_dir = find_certbot_live_dir(primary)
+        # --cert-name <primary> means the lineage is live/<primary>, exactly.
+        live_dir = lineage_dir if os.path.isdir(lineage_dir) else None
         if not live_dir:
             error_msg = f'Bundle issued but live dir not found for {primary}'
             log_operation('request_ssl_bundle', False, error_msg)
@@ -1501,7 +1566,7 @@ def request_ssl_bundle():
         # only copy we have.
         cleanup_summary = _quarantine_superseded_certs(
             keep_path=combined_path,
-            keep_lineage=os.path.basename(live_dir),
+            keep_lineage=primary,
             bundle_names=set(names),
             unreachable_names=unreachable_names,
         )
@@ -1525,7 +1590,7 @@ def request_ssl_bundle():
         # Only now that HAProxy has loaded the new bundle: stop certbot renewing
         # (and renew-certificates.sh re-publishing) overlapping old lineages.
         lineage_summary = _retire_superseded_lineages(
-            keep_lineage=os.path.basename(live_dir),
+            keep_lineage=primary,
             bundle_names=set(names),
             unreachable_names=unreachable_names,
             keep_fingerprint=new_info.get('fingerprint') if new_info else None,
@@ -1546,6 +1611,7 @@ def request_ssl_bundle():
             'names': names,
             'cert_path': combined_path,
             'renewed': bool(renewed),
+            'capabilities': EDGE_CAPABILITIES,
             'certbot_not_due': bool(certbot_not_due),
             'not_after': not_after,
             'not_after_iso': datetime.fromtimestamp(not_after, timezone.utc).isoformat()

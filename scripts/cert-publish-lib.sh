@@ -228,6 +228,57 @@ cert_not_after() {
     openssl x509 -enddate -noout -in "$1" 2>/dev/null </dev/null | sed 's/^notAfter=//'
 }
 
+cert_retired_dir() {
+    if [ -n "${CERT_RETIRED_DIR:-}" ]; then
+        echo "$CERT_RETIRED_DIR"
+    else
+        echo "$(dirname "${SSL_CERTS_DIR:-/etc/haproxy/certs}")/cert-retired"
+    fi
+}
+
+# cert_retire_expired_pems
+#
+# Move every EXPIRED *.pem out of $SSL_CERTS_DIR into cert-retired/ (a sibling,
+# never inside the crt dir). Sets CERT_RETIRED_EXPIRED to the number moved.
+#
+# Not publishing expired lineages stops the re-publish loop, but a pem that was
+# published while valid and has expired since stays in the crt dir and keeps
+# shadowing - that was exactly brain-jar.com.pem (review M2). An expired
+# certificate is never a valid certificate for anyone, so it can always go: the
+# only-valid-cert safety rule cannot be violated by moving it. Two exceptions:
+#   * default_self_signed_cert.pem - HAProxy's fallback, regenerated separately;
+#   * the LAST .pem in the directory - a crt directory with no certificate at
+#     all fails the whole :443 bind, which is worse than serving an expired one.
+# Nothing is deleted; reverse with mv.
+cert_retire_expired_pems() {
+    local dir="${SSL_CERTS_DIR:-/etc/haproxy/certs}" retired f base dest remaining
+    CERT_RETIRED_EXPIRED=0
+    retired="$(cert_retired_dir)"
+    for f in "$dir"/*.pem; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        [ "$base" = "default_self_signed_cert.pem" ] && continue
+        cert_is_expired "$f" || continue
+        remaining="$(find "$dir" -maxdepth 1 -type f -name '*.pem' | wc -l)"
+        if [ "$remaining" -le 1 ]; then
+            log_error "Expired certificate $f is the only certificate left in $dir - NOT retiring it (an empty crt directory fails the :443 bind)"
+            continue
+        fi
+        if ! mkdir -p "$retired"; then
+            log_error "cannot create $retired - expired $f left in place"
+            continue
+        fi
+        dest="$retired/$base"
+        [ -e "$dest" ] && dest="$dest.$(date -u +%Y%m%dT%H%M%SZ)"
+        if mv -- "$f" "$dest"; then
+            log_error "Retired EXPIRED certificate $base (notAfter $(cert_not_after "$dest")) from $dir to $dest - it could only shadow valid certificates"
+            CERT_RETIRED_EXPIRED=$((CERT_RETIRED_EXPIRED + 1))
+        else
+            log_error "failed to move expired $f to $dest"
+        fi
+    done
+}
+
 # cert_publish CERT_FILE KEY_FILE DEST_FILE
 #
 # Assemble CERT_FILE + KEY_FILE into DEST_FILE without ever exposing a

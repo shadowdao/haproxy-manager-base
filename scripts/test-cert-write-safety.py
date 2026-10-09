@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 BROKEN_TOKEN = '__BROKEN__'
@@ -644,6 +645,31 @@ def san(name):
         return fh.read()
 
 
+def make_certbot_lineage(le_dir, lineage, cert, key):
+    """archive/<x>/{cert,chain,fullchain,privkey}1.pem + live/<x>/*.pem
+    symlinks (../../archive/<x>/...1.pem) + renewal/<x>.conf, like certbot."""
+    archive = os.path.join(le_dir, 'archive', lineage)
+    live = os.path.join(le_dir, 'live', lineage)
+    os.makedirs(archive, exist_ok=True)
+    os.makedirs(live, exist_ok=True)
+    for kind, body in (('cert', cert), ('chain', cert), ('fullchain', cert), ('privkey', key)):
+        with open(os.path.join(archive, f'{kind}1.pem'), 'w') as fh:
+            fh.write(body)
+        link = os.path.join(live, f'{kind}.pem')
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(f'../../archive/{lineage}/{kind}1.pem', link)
+    os.makedirs(os.path.join(le_dir, 'renewal'), exist_ok=True)
+    with open(os.path.join(le_dir, 'renewal', f'{lineage}.conf'), 'w') as fh:
+        fh.write(f'archive_dir = {archive}\ncert = {live}/cert.pem\n')
+    return live
+
+
+def retired_path(le_dir, part, name):
+    hits = sorted(__import__('glob').glob(os.path.join(le_dir, 'retired', '*', part, name)))
+    return hits[-1] if hits else os.path.join(le_dir, 'retired', '<none>', part, name)
+
+
 FIX_ONLY_RETIRE = unittest.skipIf(
     TESTING_FOREIGN_TREE and not hasattr(hm, 'retirement_blockers'),
     'HAPROXY_MANAGER_DIR points at a tree without SAN-overlap retirement')
@@ -738,13 +764,14 @@ class TestSanOverlapRetirement(CertPublishTestCase):
         for name in ('brainjar.net', 'www.brainjar.net'):
             self.add_domain(name, name.replace('.', '_'))
 
-    def old_lineage(self, lineage, fixture):
-        live = os.path.join(self.le_live, lineage)
-        self.write(os.path.join(live, 'fullchain.pem'), san(f'{fixture}.crt'))
-        self.write(os.path.join(live, 'cert.pem'), san(f'{fixture}.crt'))
-        self.write(os.path.join(live, 'privkey.pem'), san(f'{fixture}.key'))
-        conf = self.write(os.path.join(self.le, 'renewal', f'{lineage}.conf'),
-                          f'# renewal conf for {lineage}\n')
+    def old_lineage(self, lineage, fixture, publish=True):
+        """A lineage laid out the way certbot does it: real files in
+        archive/<x>/*1.pem, relative symlinks in live/<x>/, a renewal conf."""
+        live = make_certbot_lineage(self.le, lineage, san(f'{fixture}.crt'),
+                                    san(f'{fixture}.key'))
+        conf = os.path.join(self.le, 'renewal', f'{lineage}.conf')
+        if not publish:
+            return live, conf, None
         pem = self.write(os.path.join(self.certs, f'{lineage}.pem'),
                          san(f'{fixture}.crt') + san(f'{fixture}.key'))
         return live, conf, pem
@@ -775,8 +802,14 @@ class TestSanOverlapRetirement(CertPublishTestCase):
         # re-publish it and certbot can no longer try to renew it.
         self.assertFalse(os.path.exists(live))
         self.assertFalse(os.path.exists(conf))
-        self.assertTrue(os.path.isdir(os.path.join(self.le, 'live-retired', 'brain-jar.com')))
-        self.assertTrue(os.path.exists(os.path.join(self.le, 'renewal-retired', 'brain-jar.com.conf')))
+        # live, archive AND renewal leave together (review H2), into one tree.
+        self.assertFalse(os.path.exists(os.path.join(self.le, 'archive', 'brain-jar.com')))
+        self.assertTrue(os.path.isdir(retired_path(self.le, 'live', 'brain-jar.com')))
+        self.assertTrue(os.path.isdir(retired_path(self.le, 'archive', 'brain-jar.com')))
+        self.assertTrue(os.path.exists(retired_path(self.le, 'renewal', 'brain-jar.com.conf')))
+        # Relative symlinks still resolve in the retired tree (restore = mv back).
+        self.assertIn('BEGIN CERTIFICATE', self.read(
+            os.path.join(retired_path(self.le, 'live', 'brain-jar.com'), 'cert.pem')))
         self.assertEqual([], self.certbot_deletes())
         self.assertTrue(os.path.exists(os.path.join(self.certs, 'brainjar.net.pem')))
         self.assertTrue(self.edge_would_start())
@@ -856,6 +889,95 @@ class TestSanOverlapRetirement(CertPublishTestCase):
         self.assertEqual(4922899200, noop['not_after'])
         self.assertIn('--keep-until-expiring', self.certbot_invocations()[-1])
 
+
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_not_due_noop_never_retires_its_own_cert_name_lineage(self):
+        """Review H1: find_certbot_live_dir() returns the NEWEST of brainjar.net
+        and brainjar.net-0001. After a certbot no-op that was the stale -0001:
+        it got published as brainjar.net.pem and the real brainjar.net lineage
+        was retired as "superseded"."""
+        del os.environ['TEST_CERTBOT_INSTALL_SRC']
+        os.environ['TEST_CERTBOT_NOT_DUE'] = '1'
+        real = make_certbot_lineage(self.le, 'brainjar.net', san('new_bundle.crt'), san('new_bundle.key'))
+        stale = make_certbot_lineage(self.le, 'brainjar.net-0001', san('dead_old.crt'), san('dead_old.key'))
+        later = time.time() + 60
+        os.utime(os.path.join(self.le, 'archive', 'brainjar.net-0001', 'fullchain1.pem'), (later, later))
+        # Production behaviour of find_certbot_live_dir(): newest wins.
+        hm.find_certbot_live_dir = lambda base: stale if base == 'brainjar.net' else None
+
+        data = self.bundle()
+
+        self.assertTrue(os.path.isdir(real), 'the --cert-name lineage itself was retired')
+        self.assertTrue(os.path.exists(os.path.join(self.le, 'renewal', 'brainjar.net.conf')))
+        self.assertNotIn('brainjar.net', [e['lineage'] for e in data['cleanup']['lineages']['retired']])
+        published = self.read(os.path.join(self.certs, 'brainjar.net.pem'))
+        self.assertIn(san('new_bundle.crt').strip().splitlines()[1], published,
+                      'published the stale -0001 certificate instead of live/brainjar.net')
+        self.assertFalse(data['renewed'])
+
+    @FIX_ONLY_RETIRE
+    def test_bundle_reports_capabilities(self):
+        data = self.bundle()
+        self.assertIn('san_overlap_retirement', data.get('capabilities', []))
+        caps = self.client.get('/api/capabilities').get_json()
+        self.assertIn('unreachable_names', caps['capabilities'])
+
+
+class TestRetiredLineageCanBeReissued(CertPublishTestCase):
+    """Review H2: retirement must leave certbot able to issue the name again."""
+
+    def setUp(self):
+        super().setUp()
+        self.le = hm.LETSENCRYPT_DIR
+
+    @FIX_ONLY_RETIRE
+    def test_retirement_removes_every_part_certbot_checks(self):
+        make_certbot_lineage(self.le, 'brain-jar.com', san('expired_old.crt'), san('expired_old.key'))
+        out = hm.retire_lineage_tree('brain-jar.com')
+        # certbot new_lineage() refuses if any of these exist for the name.
+        for part in (('live', 'brain-jar.com'), ('archive', 'brain-jar.com'),
+                     ('renewal', 'brain-jar.com.conf')):
+            self.assertFalse(os.path.lexists(os.path.join(self.le, *part)), part)
+            self.assertTrue(os.path.lexists(os.path.join(out['retired_to'], *part)), part)
+        self.assertIn('BEGIN CERTIFICATE',
+                      self.read(os.path.join(out['retired_to'], 'live', 'brain-jar.com', 'fullchain.pem')))
+
+    @FIX_ONLY_RETIRE
+    def test_second_retirement_of_the_same_name_does_not_collide(self):
+        make_certbot_lineage(self.le, 'x.example', san('new_bundle.crt'), san('new_bundle.key'))
+        a = hm.retire_lineage_tree('x.example', stamp='S')
+        make_certbot_lineage(self.le, 'x.example', san('new_bundle.crt'), san('new_bundle.key'))
+        b = hm.retire_lineage_tree('x.example', stamp='S')
+        self.assertNotEqual(a['retired_to'], b['retired_to'])
+        self.assertTrue(os.path.isdir(os.path.join(a['retired_to'], 'archive', 'x.example')))
+
+    @FIX_ONLY_RETIRE
+    def test_certbot_can_issue_the_name_again_after_retirement(self):
+        """Against certbot's own storage code (skipped where certbot is not
+        importable, e.g. the image's app python)."""
+        try:
+            from certbot._internal import storage
+        except ImportError:
+            self.skipTest('certbot not importable from this python')
+        import types
+        cfg = types.SimpleNamespace(
+            config_dir=self.le, renewal_configs_dir=os.path.join(self.le, 'renewal'),
+            default_archive_dir=os.path.join(self.le, 'archive'),
+            live_dir=os.path.join(self.le, 'live'))
+        real_rv = storage.relevant_values
+        storage.relevant_values = lambda c: {'server': 'https://acme.invalid/directory'}
+        self.addCleanup(setattr, storage, 'relevant_values', real_rv)
+        cert, key = san('new_bundle.crt').encode(), san('new_bundle.key').encode()
+
+        first = storage.RenewableCert.new_lineage('brain-jar.com', cert, key, cert, cfg)
+        self.assertEqual('brain-jar.com', first.lineagename)
+        hm.retire_lineage_tree('brain-jar.com')
+        again = storage.RenewableCert.new_lineage('brain-jar.com', cert, key, cert, cfg)
+        self.assertEqual('brain-jar.com', again.lineagename,
+                         'certbot could not re-create the lineage under the same name')
+        self.assertTrue(os.path.getsize(os.path.join(self.le, 'renewal', 'brain-jar.com.conf')) > 0)
 
 class TestExpiredCertificateIsNeverPublished(CertPublishTestCase):
 

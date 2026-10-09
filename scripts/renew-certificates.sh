@@ -98,10 +98,15 @@ while read -r domain; do
     fi
 done <<< "$DOMAINS"
 
-log_info "Certificate update completed: $UPDATED updated, $FAILED failed, $SKIPPED_EXPIRED expired lineage(s) skipped"
+# Already-published pems that have expired since are moved out too (they
+# can only shadow; see cert_retire_expired_pems).
+cert_retire_expired_pems
+RETIRED_EXPIRED=$CERT_RETIRED_EXPIRED
+
+log_info "Certificate update completed: $UPDATED updated, $FAILED failed, $SKIPPED_EXPIRED expired lineage(s) skipped, $RETIRED_EXPIRED expired pem(s) retired"
 
 # Reload HAProxy if any certificates were updated
-if [ $UPDATED -gt 0 ]; then
+if [ $UPDATED -gt 0 ] || [ "$RETIRED_EXPIRED" -gt 0 ]; then
     # Never reload onto unvalidated material: a reload that fails to load the
     # certs directory drops HTTPS for every site on this host.
     if ! haproxy_config_ok; then

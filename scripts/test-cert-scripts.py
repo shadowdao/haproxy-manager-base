@@ -662,6 +662,36 @@ class CertScriptBehaviour:
         self.assertEqual(read(existing), OTHER_BUNDLE,
                          'an expired lineage overwrote the file in the crt dir')
 
+    def test_already_published_expired_pem_is_retired(self):
+        """Review M2: skipping publication is not enough - an expired pem that
+        is ALREADY in the crt dir (brain-jar.com.pem) keeps shadowing."""
+        expired = write(os.path.join(self.certs_dir, 'brain-jar.com.pem'),
+                        san_fixture('expired_old.crt') + san_fixture('expired_old.key'))
+        result = self.run_it()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(os.path.exists(expired), 'expired pem still in the crt dir')
+        retired = os.path.join(self.haproxy_dir, 'cert-retired', 'brain-jar.com.pem')
+        self.assertTrue(os.path.exists(retired), 'expired pem was not moved to cert-retired/ (never delete)')
+        self.assertIn('Retired EXPIRED certificate brain-jar.com.pem', self.logs())
+        self.assertIn('1 expired pem(s) retired', self.logs())
+        self.assertTrue(self.reload_attempted())
+        self.assertEqual(read(self.live_pem), NEW_BUNDLE, 'valid neighbours untouched')
+        self.assert_certs_dir_is_clean()
+
+    def test_retiring_an_expired_pem_alone_triggers_a_reload(self):
+        self.seed_previous_bundle(NEW_BUNDLE)
+        shutil.rmtree(self.domain_dir)
+        other = os.path.join(self.le_live, 'other.example')
+        os.makedirs(other)
+        write(os.path.join(other, 'fullchain.pem'), san_fixture('expired_old.crt'))
+        write(os.path.join(other, 'privkey.pem'), san_fixture('expired_old.key'))
+        write(os.path.join(self.certs_dir, 'other.example.pem'),
+              san_fixture('expired_old.crt') + san_fixture('expired_old.key'))
+        result = self.run_it()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('0 updated', self.logs())
+        self.assertTrue(self.reload_attempted(), 'HAProxy must reload to drop the retired pem')
+
 
 class TestRenewCertificates(CertScriptBehaviour, CertScriptFixture):
     SCRIPT = 'renew-certificates.sh'
@@ -692,6 +722,25 @@ class TestCertPublishLibrary(CertScriptFixture):
                          'a valid certificate was reported as expired')
         self.assertEqual(1, self.call('cert_is_expired "$1"',
                                       os.path.join(self.tmp, 'missing')).returncode)
+
+    def test_expired_sweep_keeps_the_last_pem_and_the_default_cert(self):
+        exp = san_fixture('expired_old.crt') + san_fixture('expired_old.key')
+        only = write(os.path.join(self.certs_dir, 'only.pem'), exp)
+        r = self.call('cert_retire_expired_pems; echo "n=$CERT_RETIRED_EXPIRED"')
+        self.assertIn('n=0', r.stdout)
+        self.assertTrue(os.path.exists(only), 'emptied the crt dir: that fails the whole :443 bind')
+        dflt = write(os.path.join(self.certs_dir, 'default_self_signed_cert.pem'), exp)
+        r = self.call('cert_retire_expired_pems; echo "n=$CERT_RETIRED_EXPIRED"')
+        self.assertIn('n=1', r.stdout)
+        self.assertTrue(os.path.exists(dflt), 'the default self-signed cert is not ours to retire')
+        self.assertFalse(os.path.exists(only))
+
+    def test_expired_sweep_never_touches_a_valid_pem(self):
+        valid = write(os.path.join(self.certs_dir, 'a.pem'), NEW_BUNDLE)
+        write(os.path.join(self.certs_dir, 'b.pem'), OTHER_BUNDLE)
+        r = self.call('cert_retire_expired_pems; echo "n=$CERT_RETIRED_EXPIRED"')
+        self.assertIn('n=0', r.stdout)
+        self.assertEqual(read(valid), NEW_BUNDLE)
 
     def test_cert_publish_refuses_an_expired_certificate(self):
         cert = write(os.path.join(self.tmp, 'expired.crt'), san_fixture('expired_old.crt'))
