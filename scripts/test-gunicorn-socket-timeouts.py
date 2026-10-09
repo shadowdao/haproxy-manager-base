@@ -19,6 +19,10 @@ pin:
   * that a legitimately SLOW request (handling time > client timeout) is not
     cut off -- the timeout bounds socket I/O, not request duration;
   * the watchdog: a worker whose every thread is stuck is replaced;
+  * review round 1, at production shape (2 workers x 4 threads): 2050
+    connections that never send a byte are reaped (F1, stock gthread wedges
+    permanently), and slowloris drip connections are cut by the total header
+    deadline while /health stays responsive (F2);
   * the timeout is logged as one line, not a traceback per scanner;
   * haproxy_manager's socket.setdefaulttimeout: an in-process client call to a
     stalled upstream (accepts, never replies) times out instead of hanging;
@@ -29,7 +33,7 @@ Running
     python3 scripts/test-gunicorn-socket-timeouts.py
 
 stdlib unittest, like the other scripts/test-*.py; needs only the app's own
-requirements (gunicorn, Flask...). Runs in the Docker build gate. ~25s.
+requirements (gunicorn, Flask...). Runs in the Docker build gate. ~70s.
 """
 
 import os
@@ -89,7 +93,7 @@ def http_get(port, path='/', timeout=5):
 class Gunicorn:
     """A real gunicorn master on a free port, with its output captured."""
 
-    def __init__(self, worker_class, threads=1, env=None):
+    def __init__(self, worker_class, threads=1, env=None, workers=1):
         self.tmp = tempfile.mkdtemp(prefix='gunicorn-timeout-test-')
         with open(os.path.join(self.tmp, 'tapp.py'), 'w') as fh:
             fh.write(WSGI_APP)
@@ -101,7 +105,7 @@ class Gunicorn:
         self.proc = subprocess.Popen(
             [sys.executable, '-m', 'gunicorn',
              '--bind', '127.0.0.1:%d' % self.port,
-             '--workers', '1', '--threads', str(threads),
+             '--workers', str(workers), '--threads', str(threads),
              '--worker-class', worker_class,
              '--timeout', '120', '--graceful-timeout', '2',
              '--log-level', 'info', '--error-logfile', '-',
@@ -288,6 +292,128 @@ class TimeoutWorkerTests(unittest.TestCase):
             http_get(port, '/hang', timeout=60)
         except Exception:
             pass
+
+
+def raise_nofile(n):
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < n:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(n, hard), hard))
+        return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (ImportError, ValueError, OSError):
+        return None
+
+
+class ProductionShapeExhaustion(unittest.TestCase):
+    """Review round 1 (F1/F2), at the production shape: 2 workers x 4 threads,
+    default worker_connections=1000."""
+
+    def start(self, env):
+        g = Gunicorn(FIXED, threads=4, workers=2, env=env)
+        self.addCleanup(g.stop)
+        return g
+
+    def test_f1_2050_idle_conns_reaped_and_health_recovers(self):
+        # Stock gthread: 2x1000 never-readable conns fill every slot, the run
+        # loop stops polling, and the worker stays dead even after the
+        # attacker closes everything. Here they must be reaped after
+        # FIRST_BYTE_TIMEOUT -- even while the attacker still holds them open.
+        if (raise_nofile(4500) or 0) < 4300:
+            self.skipTest('RLIMIT_NOFILE too low for 2050 client sockets')
+        g = self.start({'HAPROXY_MGR_FIRST_BYTE_TIMEOUT': '3'})
+        socks = []
+        self.addCleanup(lambda: [x.close() for x in socks])
+        for _ in range(2050):
+            s = socket.socket()
+            s.settimeout(2)
+            s.connect(('127.0.0.1', g.port))
+            socks.append(s)
+        # Attacker keeps every socket open. Within FIRST_BYTE_TIMEOUT plus the
+        # time to drain the backlog, the API must answer again.
+        deadline = time.time() + 20
+        ok = None
+        while time.time() < deadline:
+            try:
+                ok = http_get(g.port, '/', timeout=3)
+                break
+            except Exception:
+                time.sleep(0.5)
+        self.assertIsNotNone(ok, '/health never recovered while idle conns were held')
+        held = time.time()
+        # The reaped sockets were closed by the server.
+        closed = sum(1 for x in socks[:1500] if wait_closed_by_server(x, 0.01))
+        self.assertGreater(closed, 1000, 'server did not close idle conns (%d)' % closed)
+        for x in socks:
+            x.close()
+        socks.clear()
+        time.sleep(1)
+        for _ in range(5):
+            self.assertTrue(http_get(g.port, '/', timeout=3).startswith('pid='))
+        self.assertLess(held, time.time())
+
+    def test_f2_drip_connections_cut_and_health_responsive_throughout(self):
+        # 8 connections (= every thread at production shape) each drip one
+        # header byte per second -- far under the 20s per-recv timeout, so only
+        # the total HEADER_DEADLINE can cut them.
+        g = self.start({'HAPROXY_MGR_HEADER_DEADLINE': '3'})   # CLIENT_TIMEOUT stays 20
+        stop = threading.Event()
+        cut_after = []
+
+        def drip():
+            s = socket.create_connection(('127.0.0.1', g.port))
+            t0 = time.time()
+            req = b'GET / HTTP/1.1\r\nX-a: ' + b'a' * 1000
+            try:
+                for i in range(len(req)):
+                    if stop.is_set():
+                        return
+                    s.send(req[i:i + 1])
+                    time.sleep(1.0)
+                    s.settimeout(0.01)
+                    try:
+                        if s.recv(1) == b'':
+                            raise ConnectionResetError
+                    except socket.timeout:
+                        pass
+            except OSError:
+                cut_after.append(time.time() - t0)
+            finally:
+                s.close()
+
+        drippers = [threading.Thread(target=drip, daemon=True) for _ in range(8)]
+        for t in drippers:
+            t.start()
+        self.addCleanup(stop.set)
+        time.sleep(0.5)
+        worst = 0.0
+        t_end = time.time() + 12
+        while time.time() < t_end:
+            t0 = time.time()
+            self.assertTrue(http_get(g.port, '/', timeout=6).startswith('pid='))
+            worst = max(worst, time.time() - t0)
+            time.sleep(0.5)
+        stop.set()
+        self.assertEqual(len(cut_after), 8, 'not every drip connection was cut: %r' % cut_after)
+        # The deadline is armed when a THREAD picks the connection up, not at
+        # accept: a request queued behind busy threads (e.g. legit certbot
+        # runs) must not be cut for waiting. So a drip conn that was queued
+        # (the 2 workers rarely split 8 conns 4/4) is cut at up to about
+        # 2 x deadline; one that got a thread at once within ~deadline + 1s.
+        self.assertLessEqual(min(cut_after), 3 + 2, cut_after)
+        self.assertTrue(all(c < 2 * 3 + 2 for c in cut_after), cut_after)
+        self.assertLess(worst, 5.0)
+        self.assertIn('HAPROXY_MGR_HEADER_DEADLINE', g.output())
+
+    def test_f2_slow_but_complete_headers_within_deadline_are_served(self):
+        g = self.start({'HAPROXY_MGR_HEADER_DEADLINE': '4'})
+        s = socket.create_connection(('127.0.0.1', g.port))
+        self.addCleanup(s.close)
+        for part in (b'GET / HTTP/1.1\r\n', b'Host: x\r\n', b'\r\n'):
+            s.sendall(part)
+            time.sleep(1)
+        s.settimeout(5)
+        self.assertIn(b'200 OK', s.recv(4096))
 
 
 class StalledUpstreamDefaultTimeout(unittest.TestCase):

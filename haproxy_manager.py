@@ -7,6 +7,7 @@ import jinja2
 import socket
 import psutil
 import functools
+import hmac
 import logging
 from datetime import datetime, timedelta
 import json
@@ -165,7 +166,12 @@ def require_api_key(f):
     def decorated_function(*args, **kwargs):
         if API_KEY:
             auth_header = request.headers.get('Authorization')
-            if not auth_header or auth_header != f'Bearer {API_KEY}':
+            # Constant-time comparison so response timing doesn't leak how
+            # much of a guessed key matched. Compared as bytes because
+            # compare_digest rejects non-ASCII str.
+            if not auth_header or not hmac.compare_digest(
+                    auth_header.encode('utf-8', 'surrogateescape'),
+                    f'Bearer {API_KEY}'.encode('utf-8', 'surrogateescape')):
                 return jsonify({'error': 'Unauthorized - Invalid or missing API key'}), 401
         return f(*args, **kwargs)
     return decorated_function

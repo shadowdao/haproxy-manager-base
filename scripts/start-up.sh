@@ -94,11 +94,15 @@ MAX_REQ_JITTER="${HAPROXY_MGR_MAX_REQUESTS_JITTER:-100}"
 # Worker class (incident 2026-10-09): stock gthread makes every client socket
 # fully blocking with NO timeout, so any peer that sends a few bytes and goes
 # quiet (TLS hello on this plain-HTTP port, scanners -- :8000 is published on
-# 0.0.0.0) pins a pool thread forever; 4 of them wedge a worker. This subclass
-# sets a per-connection socket timeout (HAPROXY_MGR_CLIENT_TIMEOUT, default
-# 20s) and runs a watchdog that exits a worker whose threads have ALL been
-# stuck for HAPROXY_MGR_WEDGE_SECONDS (default 1200) so the master respawns it.
-# See haproxy_gunicorn_worker.py. --timeout below does NOT cover either case:
+# 0.0.0.0) pins a pool thread forever; 4 of them wedge a worker. Stock gthread
+# also never reaps connections that send nothing (2x1000 of them wedge it
+# permanently) and has no total header-read bound (slowloris). This subclass
+# adds: a per-connection socket timeout (HAPROXY_MGR_CLIENT_TIMEOUT, 20s), a
+# first-byte deadline (HAPROXY_MGR_FIRST_BYTE_TIMEOUT, 10s), a total
+# request-line+headers deadline (HAPROXY_MGR_HEADER_DEADLINE, 10s), and a
+# watchdog that exits a worker whose threads have ALL been stuck for
+# HAPROXY_MGR_WEDGE_SECONDS (3600) so the master respawns it.
+# See haproxy_gunicorn_worker.py. --timeout below does NOT cover any of these:
 # for gthread it only watches the main thread's heartbeat.
 WORKER_CLASS="haproxy_gunicorn_worker.TimeoutThreadWorker"
 
