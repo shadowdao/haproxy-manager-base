@@ -10,6 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Stick-table contract**: `python3 scripts/test-stick-table-contract.py` - offline; holds the templates' `store` clauses, `STICK_TABLE_FIELD_CONTRACT`, and every consumer to each other. Run it after touching any `stick-table` line.
 - **Runtime-map contract**: `python3 scripts/test-runtime-map-contract.py` - offline; asserts the runtime map commands are `@1`-prefixed, reference the map by FILE PATH (never `#<id>`), carry the value `1`, and that every captured rejection is classified as a failure. Run it after touching any `add map`/`del map`/`clear map` path.
 - **Certificate destruction safety**: `python3 scripts/test-cert-write-safety.py` - offline; asserts a live `.pem` is never truncated, removed, or its certbot lineage deleted while any configured domain still references it (one bundle serves many names, so `ssl_cert_path` is routinely shared). Run it after touching any `os.remove`/`certbot delete`/PEM-write path.
+- **API thread-pool safety**: `python3 scripts/test-gunicorn-socket-timeouts.py` - runs REAL gunicorn (~30s); asserts a silent/half-written client cannot pin a gthread pool thread (per-connection socket timeout, `HAPROXY_MGR_CLIENT_TIMEOUT`), slow legit requests are not cut off, the wedge watchdog (`HAPROXY_MGR_WEDGE_SECONDS`) replaces a fully stuck worker, and an in-process call to a stalled upstream times out. Run it after touching `haproxy_gunicorn_worker.py`, start-up.sh's gunicorn lines, or upgrading gunicorn (the worker overrides `ThreadWorker.enqueue_req`).
 - **Manual Testing**: Run `curl` commands against `http://localhost:8000` endpoints as shown in README.md
 
 ### Reading stick tables (and why it is easy to get silently wrong)
@@ -166,6 +167,7 @@ re-reads it on reload, so a failed runtime command must degrade to
 - Exposes ports 80 (HTTP), 443 (HTTPS), and 8000 (management API/UI)
 - Stats page on port 8404 (localhost only inside container)
 - Management interface on port 8000 should be firewall-protected in production
-- Dockerfile HEALTHCHECK verifies both port 8000 (Flask API) and port 80 (HAProxy), with `start-period=60s` and `timeout=10s`
+- Dockerfile HEALTHCHECK runs `scripts/healthcheck.sh`: port 8000 `/health` (4s max) AND port 80 (HAProxy). WHP's `lib-edge-container.sh` passes its own `--health-cmd`, which REPLACES the image's; it must call `/haproxy/scripts/healthcheck.sh` or the fleet never probes :8000
+- gunicorn uses `haproxy_gunicorn_worker.TimeoutThreadWorker` (gthread + client socket timeout + wedge watchdog). Stock gthread leaves client sockets blocking with NO timeout; `--timeout` only watches the main thread's heartbeat
 - Supports deployment on servers with git directory at `/root/whp` and web file sync via rsync to `/docker/whp/web/`
 - HAProxy is version 3.0.11

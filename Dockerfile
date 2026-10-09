@@ -44,6 +44,7 @@ WORKDIR /haproxy
 COPY ./templates /haproxy/templates
 COPY requirements.txt /haproxy/
 COPY haproxy_manager.py /haproxy/
+COPY haproxy_gunicorn_worker.py /haproxy/
 COPY scripts /haproxy/scripts
 COPY trusted_ips.list /etc/haproxy/trusted_ips.list
 COPY trusted_ips.map /etc/haproxy/trusted_ips.map
@@ -92,7 +93,8 @@ RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
  && python3 /haproxy/scripts/test-config-rollback.py \
  && python3 /haproxy/scripts/test-cert-write-safety.py \
  && python3 /haproxy/scripts/test-cert-scripts.py \
- && python3 /haproxy/scripts/validate-rendered-config.py
+ && python3 /haproxy/scripts/validate-rendered-config.py \
+ && python3 /haproxy/scripts/test-gunicorn-socket-timeouts.py
 # Create log directories
 RUN mkdir -p /var/log && touch /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
 RUN chmod 755 /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
@@ -105,7 +107,10 @@ RUN mkdir -p /var/spool/cron/crontabs && \
 # 443/udp carries HTTP/3 (QUIC). EXPOSE is documentation only — the container
 # must still be run with `-p 443:443/udp` for the UDP listener to be reachable.
 EXPOSE 80 443 443/udp 8000
-# Add health check
+# Health check: management API (:8000, short timeout) AND HAProxy (:80).
+# See scripts/healthcheck.sh. NOTE: WHP's lib-edge-container.sh passes its own
+# --health-cmd, which REPLACES this one on deployed hosts; it must be pointed
+# at /haproxy/scripts/healthcheck.sh for the fleet to get the :8000 probe.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -sf --max-time 5 http://localhost:8000/health && curl -s --max-time 5 -o /dev/null http://localhost/ || exit 1
+    CMD /haproxy/scripts/healthcheck.sh
 CMD ["/haproxy/scripts/start-up.sh"]

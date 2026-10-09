@@ -51,6 +51,28 @@ def _bounded_subprocess_run(*args, **kwargs):
 
 subprocess.run = _bounded_subprocess_run
 
+# ---------------------------------------------------------------------------
+# Default socket timeout (incident 2026-10-09) -- defence in depth only
+# ---------------------------------------------------------------------------
+# This module makes no outbound network calls today (ACME, HAProxy's admin
+# socket etc. all go through bounded subprocesses above). This default makes
+# sure any socket created in-process later -- a urllib/http.client call added
+# to some handler -- cannot block a worker thread forever by omission.
+#
+# It does NOT protect the API's CLIENT connections: gunicorn's gthread worker
+# calls sock.setblocking(True) on each one, which resets the timeout to None
+# and overrides this default. That is what actually wedged the pool on
+# 2026-10-09; it is fixed by haproxy_gunicorn_worker.TimeoutThreadWorker.
+DEFAULT_SOCKET_TIMEOUT = float(os.environ.get('HAPROXY_MGR_SOCKET_DEFAULT_TIMEOUT', '60'))
+if DEFAULT_SOCKET_TIMEOUT > 0:
+    socket.setdefaulttimeout(DEFAULT_SOCKET_TIMEOUT)
+
+try:
+    from haproxy_gunicorn_worker import pool_status as _gunicorn_pool_status
+except Exception:  # dev server / tests without gunicorn
+    def _gunicorn_pool_status():
+        return None
+
 app = Flask(__name__)
 
 # Default page server (port 8080) — served to HAProxy clients whose request hit
@@ -741,11 +763,19 @@ def health_check():
             cursor.execute('SELECT 1')
             cursor.fetchone()
 
-        return jsonify({
+        body = {
             'status': 'healthy',
             'haproxy_status': 'running' if haproxy_running else 'stopped',
             'database': 'connected'
-        }), 200
+        }
+        # Pool saturation of the worker that answered ('busy' includes this
+        # probe). Leaking threads show as busy/oldest_busy_seconds climbing;
+        # a fully wedged worker cannot answer at all, which is what the
+        # healthcheck's short --max-time catches.
+        pool = _gunicorn_pool_status()
+        if pool is not None:
+            body['worker'] = pool
+        return jsonify(body), 200
     except Exception as e:
         return jsonify({
             'status': 'unhealthy',

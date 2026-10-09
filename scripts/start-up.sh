@@ -77,7 +77,7 @@ HAPROXY_SUPERVISOR_INTERVAL="${HAPROXY_SUPERVISOR_INTERVAL:-15}"
 ) &
 
 # Phase 2: WSGI servers
-# Tunable via env: HAPROXY_MGR_API_WORKERS (default 1), HAPROXY_MGR_API_TIMEOUT
+# Tunable via env: HAPROXY_MGR_API_WORKERS (default 2), HAPROXY_MGR_API_TIMEOUT
 # (default 120 — API can do slow ACME calls), HAPROXY_MGR_MAX_REQUESTS (default
 # 1000 — worker recycle frequency).
 #
@@ -91,12 +91,23 @@ API_TIMEOUT="${HAPROXY_MGR_API_TIMEOUT:-120}"
 MAX_REQ="${HAPROXY_MGR_MAX_REQUESTS:-1000}"
 MAX_REQ_JITTER="${HAPROXY_MGR_MAX_REQUESTS_JITTER:-100}"
 
+# Worker class (incident 2026-10-09): stock gthread makes every client socket
+# fully blocking with NO timeout, so any peer that sends a few bytes and goes
+# quiet (TLS hello on this plain-HTTP port, scanners -- :8000 is published on
+# 0.0.0.0) pins a pool thread forever; 4 of them wedge a worker. This subclass
+# sets a per-connection socket timeout (HAPROXY_MGR_CLIENT_TIMEOUT, default
+# 20s) and runs a watchdog that exits a worker whose threads have ALL been
+# stuck for HAPROXY_MGR_WEDGE_SECONDS (default 1200) so the master respawns it.
+# See haproxy_gunicorn_worker.py. --timeout below does NOT cover either case:
+# for gthread it only watches the main thread's heartbeat.
+WORKER_CLASS="haproxy_gunicorn_worker.TimeoutThreadWorker"
+
 # Default page server on :8080. Stays in the background.
 # --threads 4 lets one worker handle bursts of blocked-IP/default-page hits
 # without forking. --max-requests recycles the worker to bound memory drift.
 gunicorn \
     --bind 0.0.0.0:8080 \
-    --workers 1 --threads 4 --worker-class gthread \
+    --workers 1 --threads 4 --worker-class "${WORKER_CLASS}" \
     --max-requests "${MAX_REQ}" --max-requests-jitter "${MAX_REQ_JITTER}" \
     --timeout 30 \
     --access-logfile - --error-logfile - --log-level info \
@@ -108,7 +119,7 @@ gunicorn \
 # up). Longer --timeout because cert issuance hits ACME and can take a while.
 exec gunicorn \
     --bind 0.0.0.0:8000 \
-    --workers "${API_WORKERS}" --threads 4 --worker-class gthread \
+    --workers "${API_WORKERS}" --threads 4 --worker-class "${WORKER_CLASS}" \
     --max-requests "${MAX_REQ}" --max-requests-jitter "${MAX_REQ_JITTER}" \
     --timeout "${API_TIMEOUT}" \
     --access-logfile - --error-logfile - --log-level info \
