@@ -106,6 +106,41 @@ global
 
     # Stats persistence for zero-downtime reloads
     stats-file /var/lib/haproxy/stats.dat
+{%- if coraza_spoe_backend %}
+
+    # WAF BODY INSPECTION LIMIT. Only emitted when Coraza is wired in, so a
+    # WAF-off / standalone config is unchanged byte-for-byte. 16384 is also
+    # HAProxy's default: this line changes no behaviour or memory, it pins
+    # the value so nobody raises it without reading this.
+    #
+    # The request body Coraza sees is whatever `req.body` holds when
+    # send-spoe-group fires, and with `option http-buffer-request`
+    # (hap_listener.tpl) that is "the whole body, or as much as fits in ONE
+    # buffer". So bufsize IS the inspection limit: a body up to roughly
+    # bufsize - maxrewrite (1024) - the request headers (~15 KB) is inspected
+    # whole and stamped `complete`; anything larger is forwarded intact, its
+    # first ~15 KB inspected, and stamped `partial`. Large uploads are never
+    # rejected or held for it.
+    #
+    # DO NOT RAISE THIS WITHOUT RE-MEASURING -- three ceilings, all measured:
+    #   * TIME. Coraza+CRS 4.25 costs ~3.3 ms per KB of body (linear; 31 KB
+    #     base64 = 104 ms, 15 KB = ~50 ms on a 32-core box). The SPOE
+    #     `timeout processing` is 100 ms (hap_coraza_spoe_engine.tpl) and a
+    #     timeout FAILS OPEN: with tune.bufsize 32768 a payload at byte 0 of a
+    #     30 KB base64 multipart body passed 933180 uninspected. A larger
+    #     buffer is a bypass, not more coverage, unless the timeout (and CPU
+    #     budget) grows with it.
+    #   * FRAME. coraza-spoa's SPOP library (dropmorepackets/haproxy-go
+    #     v0.0.8) refuses a HELLO whose max-frame-size exceeds 65535; HAProxy
+    #     derives its offer from bufsize. bufsize >= 64 KB = every SPOE
+    #     handshake fails = WAF silently off for all traffic.
+    #   * MEMORY. maxconn 4000 x 2 buffers x bufsize, inside the 1 GB edge
+    #     container.
+    # Coraza's SecRequestBodyLimit (coraza-spoa/config.yaml, 131072) must stay
+    # above anything this can deliver. Pinned by
+    # scripts/test-waf-body-inspection.py.
+    tune.bufsize 16384
+{%- endif %}
 
 #---------------------------------------------------------------------
 # DNS resolver for Docker container name resolution
