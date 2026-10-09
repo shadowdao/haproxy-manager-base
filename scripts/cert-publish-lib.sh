@@ -203,6 +203,31 @@ cert_bundle_valid() {
     return 0
 }
 
+# cert_is_expired CERT_FILE
+#
+# Returns 0 only when openssl positively reports that the first certificate in
+# CERT_FILE has expired. Anything else (not expired, unreadable, no openssl)
+# returns 1; unreadable material is rejected with a better message by
+# cert_bundle_valid().
+#
+# Why: HAProxy loads the crt directory wholesale and serves the FIRST file that
+# claims an SNI name. An expired bundle in there is never useful and can only
+# shadow a valid one - on 2026-10-07 renew-certificates.sh kept re-publishing
+# the expired brain-jar.com lineage every 12 hours, and HAProxy served it for
+# brainjar.net instead of the valid brainjar.net bundle next to it.
+cert_is_expired() {
+    local file="$1" out
+    [ -f "$file" ] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    out="$(openssl x509 -checkend 0 -noout -in "$file" 2>/dev/null </dev/null)"
+    [ $? -eq 1 ] && [[ "$out" == *"will expire"* ]]
+}
+
+# cert_not_after CERT_FILE - the notAfter date string, or empty.
+cert_not_after() {
+    openssl x509 -enddate -noout -in "$1" 2>/dev/null </dev/null | sed 's/^notAfter=//'
+}
+
 # cert_publish CERT_FILE KEY_FILE DEST_FILE
 #
 # Assemble CERT_FILE + KEY_FILE into DEST_FILE without ever exposing a
@@ -225,6 +250,11 @@ cert_publish() {
     fi
     if [ ! -s "$key_file" ]; then
         log_error "cert_publish: private key $key_file is missing or empty"
+        return 1
+    fi
+    # (a2) never publish an expired certificate (see cert_is_expired).
+    if cert_is_expired "$cert_file"; then
+        log_error "cert_publish: certificate $cert_file expired ($(cert_not_after "$cert_file")) - refusing to publish $dest_file"
         return 1
     fi
 

@@ -8,7 +8,7 @@ import socket
 import psutil
 import functools
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import ipaddress
 import shutil
@@ -570,6 +570,19 @@ def backup_existing_pem(dest_path):
         return None
 
 
+def leaf_is_expired(path):
+    """True only when openssl positively says the first certificate in `path`
+    has expired. Unreadable/missing openssl returns False: those cases are
+    rejected, with a better message, by validate_pem_bundle()."""
+    try:
+        proc = subprocess.run(
+            ['openssl', 'x509', '-checkend', '0', '-noout', '-in', path],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except Exception:
+        return False
+    return proc.returncode == 1 and 'will expire' in (proc.stdout or '')
+
+
 def publish_pem_bundle(dest_path, source_paths):
     """Publish cert+key as a combined PEM at dest_path, atomically.
 
@@ -610,6 +623,15 @@ def publish_pem_bundle(dest_path, source_paths):
     if not ok:
         raise CertificatePublishError(
             f'assembled bundle for {dest_path} is not usable: {msg}')
+
+    # Never publish an expired certificate. HAProxy loads the crt directory
+    # wholesale and serves the first file that claims an SNI name, so an
+    # expired file in there can only ever shadow a valid one (brain-jar.com.pem
+    # did exactly that to brainjar.net on 2026-10-07).
+    if leaf_is_expired(source_paths[0]):
+        raise CertificatePublishError(
+            f'refusing to publish {dest_path}: the certificate in '
+            f'{source_paths[0]} has expired')
 
     dest_dir = os.path.dirname(dest_path) or '.'
     try:
@@ -972,131 +994,335 @@ def request_ssl():
         log_operation('request_ssl', False, str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def _quarantine_superseded_certs(keep_path, keep_lineage, bundle_names):
-    """Move aside cert files that the just-issued bundle supersedes.
+# ---------------------------------------------------------------------------
+# Superseded-certificate retirement (incident 2026-10-07, brainjar.net)
+# ---------------------------------------------------------------------------
+# HAProxy loads /etc/haproxy/certs as a DIRECTORY and, when two files claim the
+# same SNI name, serves whichever it loaded first. So a new bundle has no effect
+# while an older file that also lists one of its names is still in there.
+#
+# brainjar.net served an EXPIRED certificate for two days for exactly that
+# reason. The orchestrator re-bundled brainjar.net and its seven siblings
+# without the dead brain-jar.com, but the cleanup that was meant to move the old
+# file aside matched on the old certificate's CN only. Its CN was brain-jar.com,
+# which was not in the new bundle, so brain-jar.com.pem (which also listed all
+# eight brainjar names) stayed put and kept winning the SNI match. On top of
+# that, renew-certificates.sh re-published the old lineage from live/ every 12
+# hours, so moving the file alone would not have stuck.
+#
+# What retirement does now:
+#   * any OTHER pem/lineage that shares ANY name with the new bundle (CN or
+#     SAN) is a candidate, not only one whose CN is in the bundle;
+#   * a candidate is moved aside only if no name that this edge still serves
+#     would lose its last valid certificate (the shared-PEM hazard: one bundle
+#     routinely serves several sites' names, see domains_referencing_cert_path);
+#   * nothing is deleted. The pem goes to the cert-retired sibling directory and
+#     the lineage's live/<name> and renewal/<name>.conf go to live-retired/ and
+#     renewal-retired/, so certbot stops renewing it and renew-certificates.sh
+#     stops re-publishing it. Every move is logged and can be reversed with mv.
+#     (This used to `certbot delete` the lineage, which is irreversible.)
 
-    A `.pem` in /etc/haproxy/certs/ is "superseded" iff its certificate's CN
-    is one of the bundle's names AND the file isn't the bundle's own combined
-    file. We don't look at SANs of the OLD certs — being the CN is enough,
-    since that's what HAProxy SNI-matches against and what the file
-    convention names it after.
+# Where certbot keeps its lineages. A module global so the tests can repoint
+# it; find_certbot_live_dir() predates it and still hardcodes the live path.
+LETSENCRYPT_DIR = '/etc/letsencrypt'
 
-    This used to os.remove() the file and immediately `certbot delete` the
-    lineage, both BEFORE anything had checked that the replacement bundle was
-    usable — destroying the only two copies of a working certificate on the
-    strength of a `cat` whose exit status nobody read. Now:
 
-      * the superseded file is MOVED to the cert backup directory instead of
-        unlinked, so an operator can put it back by hand;
-      * the certbot lineage is left alone here. Deleting it is irreversible
-        (archive, live and renewal config all go) and recovering means fresh,
-        rate-limited ACME orders, so it happens only in
-        _delete_superseded_lineages(), after HAProxy has actually loaded the
-        replacement.
+def cert_retired_dir():
+    """Where retired .pem files are moved. Sibling of the crt dir, never inside."""
+    return _cert_sibling_dir('cert-retired')
 
-    Moving still solves the problem the removal existed for: the old file no
-    longer sits in the crt directory shadowing the new bundle's SNI match.
 
-    Returns a summary dict for logging / API response. Entries in 'removed'
-    carry the lineage name for the deletion phase.
+def parse_cert_text(text):
+    """Parse `openssl x509 -noout -subject -nameopt multiline -enddate
+    -fingerprint -sha256 -ext subjectAltName` output.
+
+    Returns {'cn', 'names', 'not_after', 'fingerprint'}; names is the lower-cased
+    set of the CN plus every DNS SAN. not_after is a UTC epoch or None.
     """
-    summary = {'removed': [], 'errors': [], 'skipped': []}
+    cn = None
+    names = set()
+    not_after = None
+    fingerprint = None
+    in_san = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith('commonName') and '=' in line and cn is None:
+            cn = line.split('=', 1)[1].strip().lower()
+            continue
+        if line.startswith('notAfter='):
+            try:
+                not_after = int(datetime.strptime(
+                    ' '.join(line.split('=', 1)[1].split()),
+                    '%b %d %H:%M:%S %Y %Z').replace(
+                        tzinfo=timezone.utc).timestamp())
+            except ValueError:
+                not_after = None
+            continue
+        if '=' in line and line.lower().split('=', 1)[0].endswith('fingerprint'):
+            fingerprint = line.split('=', 1)[1].strip().upper()
+            continue
+        if line.startswith('X509v3 Subject Alternative Name'):
+            in_san = True
+            continue
+        if in_san:
+            for part in line.split(','):
+                part = part.strip()
+                if part.startswith('DNS:'):
+                    names.add(part[4:].strip().lower())
+            in_san = False
+    if cn:
+        names.add(cn)
+    return {'cn': cn, 'names': names, 'not_after': not_after,
+            'fingerprint': fingerprint}
 
+
+def read_cert_info(path):
+    """parse_cert_text() for the first certificate in `path`, or None."""
+    try:
+        proc = subprocess.run(
+            ['openssl', 'x509', '-in', path, '-noout', '-subject',
+             '-nameopt', 'multiline', '-enddate', '-fingerprint', '-sha256',
+             '-ext', 'subjectAltName'],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    info = parse_cert_text(proc.stdout)
+    return info if info['names'] else None
+
+
+def cert_name_covers(cert_name, host):
+    """Does certificate name `cert_name` (maybe `*.x`) cover hostname `host`?"""
+    cert_name = (cert_name or '').lower()
+    host = (host or '').lower()
+    if cert_name == host:
+        return True
+    if cert_name.startswith('*.') and not host.startswith('*.'):
+        suffix = cert_name[1:]  # ".example.com"
+        head = host[:-len(suffix)] if host.endswith(suffix) else ''
+        return bool(head) and '.' not in head
+    return False
+
+
+def _cert_covers(names, host):
+    return any(cert_name_covers(n, host) for n in names)
+
+
+def _served_names():
+    """Every hostname this edge has a route for (the SQLite domains table)."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return {row[0].lower() for row in
+                    conn.execute('SELECT domain FROM domains').fetchall()
+                    if row[0]}
+    except Exception as e:
+        # Unknown served set -> treat every name as served, i.e. never retire a
+        # still-valid certificate on the strength of a failed query.
+        logger.error("Could not read the domains table for retirement checks: %s", e)
+        return None
+
+
+def retirement_blockers(candidate, others, bundle_names, served_names,
+                        unreachable_names, now=None):
+    """Names that would lose their LAST valid certificate if `candidate` went.
+
+    candidate/others are read_cert_info() dicts. `others` are the certificates
+    that would remain in the crt directory. Pure, so it is unit-testable.
+
+    * An expired candidate blocks nothing: it is not a valid certificate for
+      anyone, and while it sits in the crt dir it can only shadow a good one.
+    * A name the caller asserts is not served here (unreachable_names - DNS
+      points elsewhere or nowhere) blocks nothing.
+    * A name with no route on this edge blocks nothing.
+    * served_names=None (could not read the DB) means "assume everything is
+      served", so a valid candidate is kept unless the bundle covers it all.
+    """
+    now = time.time() if now is None else now
+    if candidate.get('not_after') is None:
+        return ['<unreadable expiry>']
+    if candidate['not_after'] <= now:
+        return []
+    unreachable = {n.lower() for n in (unreachable_names or ())}
+    bundle = {n.lower() for n in bundle_names}
+    if served_names is None:
+        candidates_to_check = set(candidate['names'])
+    else:
+        candidates_to_check = {s for s in served_names
+                               if _cert_covers(candidate['names'], s)}
+    blockers = []
+    for name in sorted(candidates_to_check):
+        if name in unreachable or _cert_covers(bundle, name):
+            continue
+        covered_elsewhere = any(
+            o is not candidate
+            and o.get('fingerprint') != candidate.get('fingerprint')
+            and o.get('not_after') is not None and o['not_after'] > now
+            and _cert_covers(o['names'], name)
+            for o in others)
+        if not covered_elsewhere:
+            blockers.append(name)
+    return blockers
+
+
+def _overlaps_bundle(info, bundle_names):
+    return any(_cert_covers(info['names'], b) for b in bundle_names) or \
+        any(n in {b.lower() for b in bundle_names} for n in info['names'])
+
+
+def _unique_dest(directory, name):
+    dest = os.path.join(directory, name)
+    if not os.path.exists(dest):
+        return dest
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    dest = os.path.join(directory, f'{name}.{stamp}')
+    n = 1
+    while os.path.exists(dest):
+        dest = os.path.join(directory, f'{name}.{stamp}.{n}')
+        n += 1
+    return dest
+
+
+def _quarantine_superseded_certs(keep_path, keep_lineage, bundle_names,
+                                 unreachable_names=()):
+    """Move aside .pem files in the crt dir that overlap the new bundle.
+
+    Runs after the new bundle is published and before HAProxy reloads, so the
+    replacement is never the only thing we have. See the block comment above
+    for the rules. Returns {'removed', 'kept', 'skipped', 'errors'}.
+    """
+    summary = {'removed': [], 'kept': [], 'skipped': [], 'errors': []}
     if not os.path.isdir(SSL_CERTS_DIR):
         return summary
 
     keep_basename = os.path.basename(keep_path)
+    served = _served_names()
 
+    # Inventory once; `remaining` shrinks as files are retired so the coverage
+    # check for the next candidate sees what will actually be left.
+    inventory = {}
     for fname in sorted(os.listdir(SSL_CERTS_DIR)):
         if not fname.endswith('.pem'):
             continue
+        info = read_cert_info(os.path.join(SSL_CERTS_DIR, fname))
+        if info is None:
+            summary['skipped'].append({'file': fname, 'reason': 'openssl could not read it'})
+            continue
+        inventory[fname] = info
+
+    remaining = dict(inventory)
+    for fname, info in inventory.items():
         if fname == keep_basename:
             continue
-        fpath = os.path.join(SSL_CERTS_DIR, fname)
-        try:
-            cn_proc = subprocess.run(
-                ['openssl', 'x509', '-in', fpath, '-noout', '-subject', '-nameopt', 'multiline'],
-                capture_output=True, text=True
-            )
-            if cn_proc.returncode != 0:
-                summary['skipped'].append({'file': fname, 'reason': 'openssl read failed'})
-                continue
-            # `-nameopt multiline` lays out the subject one RDN per line; CN is
-            # the row matching `commonName`. Robust against unusual subject orderings.
-            cn = None
-            for line in cn_proc.stdout.splitlines():
-                line = line.strip()
-                if line.startswith('commonName'):
-                    # format: "commonName                = example.com"
-                    parts = line.split('=', 1)
-                    if len(parts) == 2:
-                        cn = parts[1].strip()
-                    break
-            if not cn:
-                summary['skipped'].append({'file': fname, 'reason': 'no CN found'})
-                continue
-        except Exception as e:
-            summary['skipped'].append({'file': fname, 'reason': f'inspect failed: {e}'})
+        if not _overlaps_bundle(info, bundle_names):
             continue
-
-        if cn not in bundle_names:
-            continue  # not superseded — different domain group
-
-        # This file's CN is now part of our new bundle — supersede it.
-        lineage_name = fname[:-len('.pem')]
-        if lineage_name == keep_lineage:
-            # Defensive: shouldn't happen because of keep_basename check, but
-            # don't accidentally drop the lineage we just wrote.
+        others = [i for f, i in remaining.items() if f != fname]
+        blockers = retirement_blockers(info, others, bundle_names, served,
+                                       unreachable_names)
+        if blockers:
+            logger.warning(
+                "Not retiring %s although it overlaps the new %s bundle: it is "
+                "still the only valid certificate for %s", fname, keep_lineage,
+                ', '.join(blockers))
+            summary['kept'].append({'file': fname, 'blockers': blockers})
             continue
-
         try:
-            os.makedirs(cert_backup_dir(), exist_ok=True)
-            quarantine_path = os.path.join(cert_backup_dir(), fname)
-            # Move, not unlink: out of the crt directory (so it stops shadowing
-            # the new bundle) but still on disk for manual recovery.
-            shutil.move(fpath, quarantine_path)
+            os.makedirs(cert_retired_dir(), exist_ok=True)
+            dest = _unique_dest(cert_retired_dir(), fname)
+            shutil.move(os.path.join(SSL_CERTS_DIR, fname), dest)
+            remaining.pop(fname, None)
+            logger.warning(
+                "Retired superseded certificate %s (names: %s; expires %s) -> %s "
+                "because it overlaps the new %s bundle",
+                fname, ', '.join(sorted(info['names'])),
+                datetime.fromtimestamp(info['not_after'], timezone.utc).isoformat()
+                if info['not_after'] else 'unknown', dest, keep_lineage)
             summary['removed'].append({
                 'file': fname,
-                'cn': cn,
-                'lineage': lineage_name,
-                'moved_to': quarantine_path,
-                'lineage_deleted': False,
+                'cn': info['cn'],
+                'names': sorted(info['names']),
+                'expired': bool(info['not_after'] and info['not_after'] <= time.time()),
+                'moved_to': dest,
             })
         except Exception as e:
             summary['errors'].append({'file': fname, 'error': str(e)})
-
     return summary
 
 
-def _delete_superseded_lineages(summary):
-    """`certbot delete` the lineages quarantined by _quarantine_superseded_certs().
+def _retire_superseded_lineages(keep_lineage, bundle_names, unreachable_names=(),
+                                keep_fingerprint=None):
+    """Move overlapping certbot lineages out of live/ and renewal/.
 
-    IRREVERSIBLE: certbot removes the lineage's archive, live symlinks and
-    renewal config. If it turns out we needed that certificate, the only way
-    back is a fresh ACME order, which Let's Encrypt rate-limits — an outage
-    measured in hours. So this is gated hardest of anything in this module: it
-    runs only after the replacement bundle has been assembled, validated,
-    published, AND loaded by a HAProxy that reloaded successfully.
-
-    Mutates `summary` in place. Best-effort: some files have no corresponding
-    lineage (e.g. self-signed dev certs) and a failure here is harmless — a
-    dead lineage merely wastes a renewal attempt on the next 12h cron tick.
+    Same overlap and safety rules as _quarantine_superseded_certs(), evaluated
+    against the pem files that are left in the crt dir. Runs only after HAProxy
+    has loaded the new bundle. Moving live/<x> to live-retired/<x> (same depth)
+    keeps its relative ../../archive symlinks valid, so `mv` back restores it.
     """
-    for entry in summary.get('removed', []):
-        lineage_name = entry.get('lineage')
-        if not lineage_name:
+    summary = {'retired': [], 'kept': [], 'errors': []}
+    live_root = os.path.join(LETSENCRYPT_DIR, 'live')
+    if not os.path.isdir(live_root):
+        return summary
+    served = _served_names()
+
+    remaining_pems = []
+    if os.path.isdir(SSL_CERTS_DIR):
+        for fname in sorted(os.listdir(SSL_CERTS_DIR)):
+            if fname.endswith('.pem'):
+                info = read_cert_info(os.path.join(SSL_CERTS_DIR, fname))
+                if info is not None:
+                    info['_file'] = fname
+                    remaining_pems.append(info)
+
+    for lineage in sorted(os.listdir(live_root)):
+        lineage_dir = os.path.join(live_root, lineage)
+        if lineage == keep_lineage or not os.path.isdir(lineage_dir):
             continue
+        cert_file = os.path.join(lineage_dir, 'cert.pem')
+        if not os.path.exists(cert_file):
+            cert_file = os.path.join(lineage_dir, 'fullchain.pem')
+        info = read_cert_info(cert_file)
+        if info is None or not _overlaps_bundle(info, bundle_names):
+            continue
+        if keep_fingerprint and info.get('fingerprint') == keep_fingerprint:
+            continue
+        # The lineage's own published pem is not "another" certificate, even if
+        # its fingerprint drifted from the lineage (renewed, not republished).
+        others = [p for p in remaining_pems if p['_file'] != f'{lineage}.pem']
+        blockers = retirement_blockers(info, others, bundle_names, served,
+                                       unreachable_names)
+        if blockers:
+            logger.warning(
+                "Not retiring certbot lineage %s although it overlaps the new %s "
+                "bundle: it is still the only valid certificate for %s",
+                lineage, keep_lineage, ', '.join(blockers))
+            summary['kept'].append({'lineage': lineage, 'blockers': blockers})
+            continue
+        entry = {'lineage': lineage, 'names': sorted(info['names'])}
         try:
-            cb_proc = subprocess.run(
-                ['certbot', 'delete', '--cert-name', lineage_name, '-n'],
-                capture_output=True, text=True
-            )
-            entry['lineage_deleted'] = (cb_proc.returncode == 0)
-            if cb_proc.returncode != 0:
-                entry['certbot_stderr'] = (cb_proc.stderr or '').strip()[:200]
+            live_dest_root = os.path.join(LETSENCRYPT_DIR, 'live-retired')
+            os.makedirs(live_dest_root, exist_ok=True)
+            live_dest = _unique_dest(live_dest_root, lineage)
+            shutil.move(lineage_dir, live_dest)
+            entry['live_moved_to'] = live_dest
+            conf = os.path.join(LETSENCRYPT_DIR, 'renewal', f'{lineage}.conf')
+            if os.path.exists(conf):
+                conf_dest_root = os.path.join(LETSENCRYPT_DIR, 'renewal-retired')
+                os.makedirs(conf_dest_root, exist_ok=True)
+                conf_dest = _unique_dest(conf_dest_root, f'{lineage}.conf')
+                shutil.move(conf, conf_dest)
+                entry['renewal_moved_to'] = conf_dest
+            logger.warning(
+                "Retired certbot lineage %s (names: %s) because it overlaps the "
+                "new %s bundle: live -> %s, renewal conf -> %s. Archive left in "
+                "place; reverse with mv to restore.", lineage,
+                ', '.join(entry['names']), keep_lineage, entry['live_moved_to'],
+                entry.get('renewal_moved_to', '(none)'))
+            summary['retired'].append(entry)
         except Exception as e:
-            entry['certbot_error'] = str(e)
+            entry['error'] = str(e)
+            summary['errors'].append(entry)
     return summary
+
 
 @app.route('/api/ssl/bundle', methods=['POST'])
 @require_api_key
@@ -1108,7 +1334,18 @@ def request_ssl_bundle():
     /api/ssl calls when a site has multiple domains.
 
     Body:
-      {"primary": "example.com", "sans": ["www.example.com", ...]}
+      {"primary": "example.com", "sans": ["www.example.com", ...],
+       "unreachable_names": ["dead.example.com", ...]}   # optional
+
+    unreachable_names: names the caller (WHP's orchestrator) has established do
+    not resolve to this host. They are left out of the bundle by the caller;
+    here they only tell superseded-certificate retirement that an older cert's
+    coverage of them is not worth keeping (see retirement_blockers()).
+
+    The response says whether certbot actually issued ("renewed") or found the
+    existing lineage not yet due and did nothing, and carries the published
+    certificate's not_after, so the caller can schedule from the real expiry
+    instead of recording a no-op as a renewal.
 
     The cert lineage uses --cert-name <primary>, so renewal under the same
     name doesn't proliferate -0001/-0002 dirs (the issue we hit with the
@@ -1146,6 +1383,13 @@ def request_ssl_bundle():
             return jsonify({'status': 'error', 'message': f'invalid SAN: {s!r}'}), 400
         cleaned_sans.append(s)
 
+    unreachable_names = data.get('unreachable_names') or []
+    if not isinstance(unreachable_names, list) or not all(
+            isinstance(n, str) for n in unreachable_names):
+        return jsonify({'status': 'error',
+                        'message': '"unreachable_names" must be a list of strings'}), 400
+    unreachable_names = [n.strip().lower() for n in unreachable_names if n.strip()]
+
     seen = {primary}
     names = [primary]
     for s in cleaned_sans:
@@ -1160,8 +1404,11 @@ def request_ssl_bundle():
             'message': f'Too many SANs ({len(names)}); Let\'s Encrypt limit is 100',
         }), 400
 
+    # --keep-until-expiring is what -n does anyway when the lineage exists with
+    # the same names; it is spelled out so the no-op case is deliberate, and it
+    # is detected below rather than reported as an issuance.
     cmd = [
-        'certbot', 'certonly', '-n', '--standalone',
+        'certbot', 'certonly', '-n', '--standalone', '--keep-until-expiring',
         '--preferred-challenges', 'http', '--http-01-port=8688',
         '--cert-name', primary,
     ]
@@ -1171,6 +1418,11 @@ def request_ssl_bundle():
     try:
         # Defensive: clear any stale lock left by a SIGKILLed prior run.
         clear_stale_certbot_locks()
+
+        # fullchain.pem starts with the leaf, so it identifies the certificate.
+        before_dir = find_certbot_live_dir(primary)
+        before_info = read_cert_info(os.path.join(before_dir, 'fullchain.pem')) \
+            if before_dir else None
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -1195,6 +1447,20 @@ def request_ssl_bundle():
         cert_path = os.path.join(live_dir, 'fullchain.pem')
         key_path = os.path.join(live_dir, 'privkey.pem')
         combined_path = f'{SSL_CERTS_DIR}/{primary}.pem'
+
+        # Did certbot issue, or did it find the lineage not yet due? Measured by
+        # the certificate itself (fingerprint before vs after), with certbot's
+        # own wording as a second signal.
+        new_info = read_cert_info(cert_path)
+        output = (result.stdout or '') + (result.stderr or '')
+        certbot_not_due = ('not yet due for renewal' in output.lower()
+                           or 'no action taken' in output.lower())
+        if before_info is None:
+            renewed = new_info is not None
+        elif new_info is None:
+            renewed = not certbot_not_due
+        else:
+            renewed = new_info.get('fingerprint') != before_info.get('fingerprint')
 
         os.makedirs(SSL_CERTS_DIR, exist_ok=True)
         try:
@@ -1235,8 +1501,9 @@ def request_ssl_bundle():
         # only copy we have.
         cleanup_summary = _quarantine_superseded_certs(
             keep_path=combined_path,
-            keep_lineage=primary,
+            keep_lineage=os.path.basename(live_dir),
             bundle_names=set(names),
+            unreachable_names=unreachable_names,
         )
 
         # Raises if the config does not validate or HAProxy does not reload;
@@ -1249,26 +1516,46 @@ def request_ssl_bundle():
                 logger.critical(
                     "HAProxy did not reload after publishing the bundle for "
                     "%s. The superseded certificate files were moved to %s and "
-                    "their certbot lineages were NOT deleted, so they can be "
+                    "their certbot lineages were NOT retired, so they can be "
                     "restored by hand: %s",
-                    primary, cert_backup_dir(),
+                    primary, cert_retired_dir(),
                     [e['file'] for e in cleanup_summary['removed']])
             raise
 
-        _delete_superseded_lineages(cleanup_summary)
+        # Only now that HAProxy has loaded the new bundle: stop certbot renewing
+        # (and renew-certificates.sh re-publishing) overlapping old lineages.
+        lineage_summary = _retire_superseded_lineages(
+            keep_lineage=os.path.basename(live_dir),
+            bundle_names=set(names),
+            unreachable_names=unreachable_names,
+            keep_fingerprint=new_info.get('fingerprint') if new_info else None,
+        )
+        cleanup_summary['lineages'] = lineage_summary
 
+        not_after = new_info.get('not_after') if new_info else None
         log_operation(
             'request_ssl_bundle', True,
-            f'SSL bundle issued for {primary} covering {len(names)} names; '
-            f'cleaned up {len(cleanup_summary["removed"])} superseded lineage(s)'
+            f'SSL bundle {"issued" if renewed else "not yet due (existing certificate kept)"} '
+            f'for {primary} covering {len(names)} names; retired '
+            f'{len(cleanup_summary["removed"])} superseded pem(s) and '
+            f'{len(lineage_summary["retired"])} lineage(s)'
         )
         return jsonify({
             'status': 'success',
             'primary': primary,
             'names': names,
             'cert_path': combined_path,
+            'renewed': bool(renewed),
+            'certbot_not_due': bool(certbot_not_due),
+            'not_after': not_after,
+            'not_after_iso': datetime.fromtimestamp(not_after, timezone.utc).isoformat()
+            if not_after else None,
+            'fingerprint': new_info.get('fingerprint') if new_info else None,
             'cleanup': cleanup_summary,
-            'message': f'Bundled certificate obtained for {len(names)} names',
+            'message': (f'Bundled certificate obtained for {len(names)} names'
+                        if renewed else
+                        f'Existing certificate for {len(names)} names is not yet '
+                        'due for renewal; nothing was issued'),
         })
     except Exception as e:
         log_operation('request_ssl_bundle', False, str(e))

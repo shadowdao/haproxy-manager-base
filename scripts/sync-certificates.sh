@@ -47,13 +47,22 @@ fi
 # Copy certificates for each domain
 UPDATED=0
 FAILED=0
+SKIPPED_EXPIRED=0
 
 while read -r domain; do
     CERT_FILE="${LETSENCRYPT_LIVE_DIR}/${domain}/fullchain.pem"
     KEY_FILE="${LETSENCRYPT_LIVE_DIR}/${domain}/privkey.pem"
     COMBINED_FILE="${SSL_CERTS_DIR}/${domain}.pem"
 
-    if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+    if [ -f "$CERT_FILE" ] && cert_is_expired "$CERT_FILE"; then
+        # Never publish an expired lineage. It cannot help any client and,
+        # because HAProxy serves the first file claiming an SNI name, it can
+        # shadow a valid bundle for a name it shares (brainjar.net, 2026-10-07).
+        # Counted separately from FAILED: a dead lineage that keeps expiring is
+        # reported on every run (ERROR log) without making every run "fail".
+        log_error "Skipping EXPIRED certificate lineage $domain (notAfter $(cert_not_after "$CERT_FILE")) - not publishing it"
+        SKIPPED_EXPIRED=$((SKIPPED_EXPIRED + 1))
+    elif [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
         # Assemble in a staging dir and rename into place. NEVER redirect into
         # $COMBINED_FILE: the shell truncates the live pem before cat runs, and
         # HAProxy loads $SSL_CERTS_DIR as a directory, so one bad file there
@@ -71,7 +80,7 @@ while read -r domain; do
     fi
 done <<< "$DOMAINS"
 
-log_info "Certificate sync completed: $UPDATED updated, $FAILED failed"
+log_info "Certificate sync completed: $UPDATED updated, $FAILED failed, $SKIPPED_EXPIRED expired lineage(s) skipped"
 
 # Reload HAProxy if any certificates were updated
 if [ $UPDATED -gt 0 ]; then

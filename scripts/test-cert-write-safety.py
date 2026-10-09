@@ -254,6 +254,9 @@ FAKE_HAPROXY = textwrap.dedent(f"""\
 
 # certbot stub: succeeds, announces a renewal, and records every invocation so
 # tests can assert that `certbot delete` did or did not run.
+#   TEST_CERTBOT_INSTALL_SRC/_DIR: on certonly, copy fullchain.pem + privkey.pem
+#       from SRC into DIR (a real issuance changes the lineage's certificate).
+#   TEST_CERTBOT_NOT_DUE: on certonly, print certbot's "not yet due" wording.
 FAKE_CERTBOT = textwrap.dedent("""\
     #!/bin/sh
     if [ -n "$TEST_CERTBOT_LOG" ]; then
@@ -262,6 +265,14 @@ FAKE_CERTBOT = textwrap.dedent("""\
     case "$1" in
       renew) echo "Congratulations, all renewals succeeded" ;;
       delete) [ -n "$TEST_CERTBOT_DELETE_FAILS" ] && exit 1 ;;
+      certonly)
+        if [ -n "$TEST_CERTBOT_INSTALL_SRC" ]; then
+          mkdir -p "$TEST_CERTBOT_INSTALL_DIR"
+          cp "$TEST_CERTBOT_INSTALL_SRC/fullchain.pem" "$TEST_CERTBOT_INSTALL_SRC/privkey.pem" "$TEST_CERTBOT_INSTALL_DIR/"
+        fi
+        if [ -n "$TEST_CERTBOT_NOT_DUE" ]; then
+          echo "Certificate not yet due for renewal; no action taken."
+        fi ;;
     esac
     exit 0
 """)
@@ -331,6 +342,7 @@ class CertPublishTestCase(unittest.TestCase):
             'CORAZA_SPOE_BACKUP_PATH': os.path.join(self.etc, 'coraza-spoe.cfg.backup'),
             'CLUSTER_SECRET_PATH': os.path.join(self.etc, 'cluster-secret'),
             'SSL_CERTS_DIR': self.certs,
+            'LETSENCRYPT_DIR': os.path.join(self.tmp, 'letsencrypt'),
             'HAPROXY_SOCKET_PATH': os.path.join(self.etc, 'haproxy.sock'),
             'API_KEY': None,
         }
@@ -574,7 +586,7 @@ class TestOldCertificateIsNotDestroyedFirst(CertPublishTestCase):
 
     @FIX_ONLY
     @NEEDS_OPENSSL
-    def test_lineage_is_deleted_only_after_haproxy_loads_the_bundle(self):
+    def test_lineage_is_untouched_when_haproxy_does_not_load_the_bundle(self):
         """A reload failure must leave the lineage intact and the file recoverable."""
         old_path = self._setup_supersede(broken=False)
         # Make generate_config() produce a config the validator rejects, so the
@@ -591,7 +603,7 @@ class TestOldCertificateIsNotDestroyedFirst(CertPublishTestCase):
             [], self.certbot_deletes(),
             'the lineage must not be deleted when HAProxy did not reload')
         self.assertFalse(os.path.exists(old_path))
-        quarantined = os.path.join(hm.cert_backup_dir(),
+        quarantined = os.path.join(hm.cert_retired_dir(),
                                    os.path.basename(old_path))
         self.assertTrue(os.path.exists(quarantined),
                         'the superseded file must be recoverable by hand')
@@ -599,8 +611,9 @@ class TestOldCertificateIsNotDestroyedFirst(CertPublishTestCase):
 
     @FIX_ONLY
     @NEEDS_OPENSSL
-    def test_successful_bundle_still_supersedes_and_deletes(self):
-        """The cleanup must still do its job on the happy path."""
+    def test_successful_bundle_still_supersedes_without_deleting(self):
+        """The cleanup must still do its job on the happy path - by moving, never
+        by `certbot delete` (irreversible; recovery is a rate-limited ACME order)."""
         old_path = self._setup_supersede(broken=False)
 
         resp = self.client.post('/api/ssl/bundle', json={
@@ -612,10 +625,251 @@ class TestOldCertificateIsNotDestroyedFirst(CertPublishTestCase):
         self.assertFalse(os.path.exists(old_path),
                          'the superseded file must leave the crt directory or '
                          'it keeps shadowing the new bundle')
-        self.assertEqual(['delete --cert-name www.test.example.com -n'],
-                         self.certbot_deletes())
+        self.assertTrue(os.path.exists(os.path.join(
+            hm.cert_retired_dir(), os.path.basename(old_path))),
+            'the superseded file must be moved aside, not destroyed')
+        self.assertEqual([], self.certbot_deletes(),
+                         'retirement must never `certbot delete` anything')
         self.assertTrue(self.edge_would_start())
         self.assert_only_final_pems_in_certs_dir()
+
+
+
+# --- SAN-overlap retirement (brainjar.net, 2026-10-07) -----------------------
+SAN_FIXTURES = os.path.join(MODULE_DIR, 'scripts', 'test-fixtures', 'san-certs')
+
+
+def san(name):
+    with open(os.path.join(SAN_FIXTURES, name)) as fh:
+        return fh.read()
+
+
+FIX_ONLY_RETIRE = unittest.skipIf(
+    TESTING_FOREIGN_TREE and not hasattr(hm, 'retirement_blockers'),
+    'HAPROXY_MANAGER_DIR points at a tree without SAN-overlap retirement')
+
+
+class TestRetirementRules(unittest.TestCase):
+    """retirement_blockers() is the shared-PEM safety rule, tested directly."""
+
+    NOW = 2_000_000_000
+
+    def cert(self, names, days_left, fp):
+        return {'names': set(names), 'fingerprint': fp,
+                'not_after': self.NOW + days_left * 86400, 'cn': sorted(names)[0]}
+
+    @FIX_ONLY_RETIRE
+    def test_expired_candidate_never_blocks(self):
+        old = self.cert(['brain-jar.com', 'brainjar.net'], -2, 'A')
+        self.assertEqual([], hm.retirement_blockers(
+            old, [], {'brainjar.net'}, {'brain-jar.com', 'brainjar.net'}, [], now=self.NOW))
+
+    @FIX_ONLY_RETIRE
+    def test_valid_candidate_that_is_last_cert_for_a_served_name_is_kept(self):
+        old = self.cert(['shared.example', 'brainjar.net', 'other.example'], 40, 'A')
+        self.assertEqual(['other.example'], hm.retirement_blockers(
+            old, [], {'brainjar.net'}, {'brainjar.net', 'other.example'}, [], now=self.NOW))
+
+    @FIX_ONLY_RETIRE
+    def test_unreachable_names_do_not_block(self):
+        old = self.cert(['dead.example', 'brainjar.net'], 40, 'A')
+        self.assertEqual([], hm.retirement_blockers(
+            old, [], {'brainjar.net'}, {'brainjar.net', 'dead.example'},
+            ['dead.example'], now=self.NOW))
+
+    @FIX_ONLY_RETIRE
+    def test_name_covered_by_another_valid_cert_does_not_block(self):
+        old = self.cert(['brainjar.net', 'other.example'], 40, 'A')
+        other = self.cert(['other.example'], 60, 'B')
+        self.assertEqual([], hm.retirement_blockers(
+            old, [other], {'brainjar.net'}, {'other.example'}, [], now=self.NOW))
+
+    @FIX_ONLY_RETIRE
+    def test_cover_by_an_expired_or_identical_cert_does_not_count(self):
+        old = self.cert(['brainjar.net', 'other.example'], 40, 'A')
+        expired = self.cert(['other.example'], -1, 'B')
+        same = self.cert(['other.example'], 60, 'A')
+        self.assertEqual(['other.example'], hm.retirement_blockers(
+            old, [expired, same], {'brainjar.net'}, {'other.example'}, [], now=self.NOW))
+
+    @FIX_ONLY_RETIRE
+    def test_unknown_served_set_keeps_every_valid_name(self):
+        old = self.cert(['brainjar.net', 'other.example'], 40, 'A')
+        self.assertEqual(['other.example'], hm.retirement_blockers(
+            old, [], {'brainjar.net'}, None, [], now=self.NOW))
+
+    @FIX_ONLY_RETIRE
+    def test_wildcard_coverage(self):
+        self.assertTrue(hm.cert_name_covers('*.example.com', 'a.example.com'))
+        self.assertFalse(hm.cert_name_covers('*.example.com', 'a.b.example.com'))
+        self.assertFalse(hm.cert_name_covers('*.example.com', 'example.com'))
+        old = self.cert(['*.example.com', 'brainjar.net'], 40, 'A')
+        self.assertEqual(['shop.example.com'], hm.retirement_blockers(
+            old, [], {'brainjar.net'}, {'shop.example.com'}, [], now=self.NOW))
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_read_cert_info_reads_sans_and_expiry(self):
+        tmp = tempfile.mkdtemp(prefix='cert-info-')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, 'c.pem')
+        with open(path, 'w') as fh:
+            fh.write(san('expired_old.crt'))
+        info = hm.read_cert_info(path)
+        self.assertEqual({'brain-jar.com', 'www.brain-jar.com', 'brainjar.net',
+                          'www.brainjar.net'}, info['names'])
+        self.assertEqual('brain-jar.com', info['cn'])
+        self.assertEqual(1585699200, info['not_after'])  # 2020-04-01T00:00:00Z
+        self.assertTrue(info['fingerprint'])
+
+
+class TestSanOverlapRetirement(CertPublishTestCase):
+    """The new bundle must not stay shadowed by an older cert sharing a SAN."""
+
+    def setUp(self):
+        super().setUp()
+        self.le = os.path.join(self.tmp, 'letsencrypt')
+        self.new_src = os.path.join(self.tmp, 'issued', 'brainjar.net')
+        self.write(os.path.join(self.new_src, 'fullchain.pem'), san('new_bundle.crt'))
+        self.write(os.path.join(self.new_src, 'privkey.pem'), san('new_bundle.key'))
+        # certbot "issues" brainjar.net into live/ when called.
+        os.environ['TEST_CERTBOT_INSTALL_SRC'] = self.new_src
+        os.environ['TEST_CERTBOT_INSTALL_DIR'] = os.path.join(self.le_live, 'brainjar.net')
+        for name in ('brainjar.net', 'www.brainjar.net'):
+            self.add_domain(name, name.replace('.', '_'))
+
+    def old_lineage(self, lineage, fixture):
+        live = os.path.join(self.le_live, lineage)
+        self.write(os.path.join(live, 'fullchain.pem'), san(f'{fixture}.crt'))
+        self.write(os.path.join(live, 'cert.pem'), san(f'{fixture}.crt'))
+        self.write(os.path.join(live, 'privkey.pem'), san(f'{fixture}.key'))
+        conf = self.write(os.path.join(self.le, 'renewal', f'{lineage}.conf'),
+                          f'# renewal conf for {lineage}\n')
+        pem = self.write(os.path.join(self.certs, f'{lineage}.pem'),
+                         san(f'{fixture}.crt') + san(f'{fixture}.key'))
+        return live, conf, pem
+
+    def bundle(self, **extra):
+        body = {'primary': 'brainjar.net', 'sans': ['www.brainjar.net']}
+        body.update(extra)
+        resp = self.client.post('/api/ssl/bundle', json=body)
+        self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
+        return resp.get_json()
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_expired_overlapping_cert_with_a_different_cn_is_retired(self):
+        """The incident: CN brain-jar.com, SANs include brainjar.net."""
+        self.add_domain('brain-jar.com', 'bjc')
+        self.add_domain('www.brain-jar.com', 'wbjc')
+        live, conf, pem = self.old_lineage('brain-jar.com', 'expired_old')
+
+        data = self.bundle(unreachable_names=['brain-jar.com', 'www.brain-jar.com'])
+
+        self.assertFalse(os.path.exists(pem),
+                         'the expired SAN-overlapping pem is still shadowing the bundle')
+        retired = [e['file'] for e in data['cleanup']['removed']]
+        self.assertEqual(['brain-jar.com.pem'], retired)
+        self.assertTrue(os.path.exists(os.path.join(hm.cert_retired_dir(), 'brain-jar.com.pem')))
+        # Lineage retired, not deleted: renew-certificates.sh can no longer
+        # re-publish it and certbot can no longer try to renew it.
+        self.assertFalse(os.path.exists(live))
+        self.assertFalse(os.path.exists(conf))
+        self.assertTrue(os.path.isdir(os.path.join(self.le, 'live-retired', 'brain-jar.com')))
+        self.assertTrue(os.path.exists(os.path.join(self.le, 'renewal-retired', 'brain-jar.com.conf')))
+        self.assertEqual([], self.certbot_deletes())
+        self.assertTrue(os.path.exists(os.path.join(self.certs, 'brainjar.net.pem')))
+        self.assertTrue(self.edge_would_start())
+        self.assert_only_final_pems_in_certs_dir()
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_expired_overlap_is_retired_even_without_the_unreachable_hint(self):
+        self.add_domain('brain-jar.com', 'bjc')
+        live, conf, pem = self.old_lineage('brain-jar.com', 'expired_old')
+        self.bundle()
+        self.assertFalse(os.path.exists(pem))
+        self.assertFalse(os.path.exists(live))
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_shared_pem_still_serving_another_site_is_kept(self):
+        """The shared-PEM hazard: never retire the only valid cert for a served name."""
+        self.add_domain('other-site.example', 'other_site')
+        live, conf, pem = self.old_lineage('shared-old.example', 'shared_old')
+
+        data = self.bundle()
+
+        self.assertTrue(os.path.exists(pem),
+                        'retired the only valid certificate for other-site.example')
+        self.assertTrue(os.path.exists(live))
+        self.assertTrue(os.path.exists(conf))
+        kept = {e['file']: e['blockers'] for e in data['cleanup']['kept']}
+        self.assertEqual({'shared-old.example.pem': ['other-site.example']}, kept)
+        self.assertEqual(['other-site.example'],
+                         data['cleanup']['lineages']['kept'][0]['blockers'])
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_valid_overlap_whose_other_names_are_unreachable_is_retired(self):
+        self.add_domain('dead.example', 'dead')
+        live, conf, pem = self.old_lineage('dead.example', 'dead_old')
+
+        self.bundle(unreachable_names=['dead.example'])
+
+        self.assertFalse(os.path.exists(pem))
+        self.assertFalse(os.path.exists(live))
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_valid_overlap_still_served_without_the_hint_is_kept(self):
+        """Same files as above, but nobody said dead.example is gone: keep it."""
+        self.add_domain('dead.example', 'dead')
+        live, conf, pem = self.old_lineage('dead.example', 'dead_old')
+
+        self.bundle()
+
+        self.assertTrue(os.path.exists(pem))
+        self.assertTrue(os.path.exists(live))
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_non_overlapping_certificates_are_untouched(self):
+        live, conf, pem = self.old_lineage('unrelated.example', 'unrelated')
+        self.bundle()
+        self.assertTrue(os.path.exists(pem), 'retired a cert sharing no name with the bundle')
+        self.assertTrue(os.path.exists(live))
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_response_distinguishes_issuance_from_not_yet_due(self):
+        issued = self.bundle()
+        self.assertTrue(issued['renewed'], 'a fresh issuance was not reported as one')
+        self.assertEqual(4922899200, issued['not_after'])  # 2126-01-01T00:00:00Z
+
+        # Lineage now exists with the same names; certbot keeps it.
+        del os.environ['TEST_CERTBOT_INSTALL_SRC']
+        os.environ['TEST_CERTBOT_NOT_DUE'] = '1'
+        noop = self.bundle()
+        self.assertFalse(noop['renewed'], 'a certbot no-op was reported as a renewal')
+        self.assertTrue(noop['certbot_not_due'])
+        self.assertEqual(4922899200, noop['not_after'])
+        self.assertIn('--keep-until-expiring', self.certbot_invocations()[-1])
+
+
+class TestExpiredCertificateIsNeverPublished(CertPublishTestCase):
+
+    @FIX_ONLY_RETIRE
+    @NEEDS_OPENSSL
+    def test_publisher_refuses_an_expired_leaf(self):
+        src = os.path.join(self.tmp, 'expired')
+        cert = self.write(os.path.join(src, 'fullchain.pem'), san('expired_old.crt'))
+        key = self.write(os.path.join(src, 'privkey.pem'), san('expired_old.key'))
+        live = self.publish_live_bundle('brain-jar.com')
+        with self.assertRaises(hm.CertificatePublishError) as ctx:
+            hm.publish_pem_bundle(live, [cert, key])
+        self.assertIn('expired', str(ctx.exception))
+        self.assertEqual(PREVIOUS_BUNDLE, self.read(live))
 
 
 class TestBundleValidation(CertPublishTestCase):
