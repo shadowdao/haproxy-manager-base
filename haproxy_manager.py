@@ -2763,6 +2763,7 @@ def generate_config():
         default_headers = template_env.get_template('hap_header.tpl').render(
             cluster_secret = get_or_create_cluster_secret(),
             syslog_target = syslog_target,
+            coraza_spoe_backend = coraza_spoe_backend,
         )
         config_parts.append(default_headers)
 

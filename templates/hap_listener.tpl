@@ -63,7 +63,12 @@ frontend web
     #   host=/ua= identify the vhost and client; %ST/%B/%tsc give status,
     #        bytes and the termination state that distinguishes a rate-limit
     #        deny (PR--) from a tarpit (PT--) from a normal close.
-    log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r cip=%[var(txn.real_ip)] id=%ID host=%[capture.req.hdr(0)] ua=%[capture.req.hdr(1)] sni=%[ssl_fc_sni] hv=%[fc_http_major]"
+    #   wafb=/wafe= WAF body coverage: wafb is complete|partial|- (did Coraza
+    #        get the whole request body, see the Coraza block below);
+    #        wafe is var(txn.coraza.error), set when the SPOE call failed or
+    #        timed out and the request went through UNINSPECTED (fail-open).
+    #        Both are "-" when the WAF is off or the request had no body.
+    log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r cip=%[var(txn.real_ip)] id=%ID host=%[capture.req.hdr(0)] ua=%[capture.req.hdr(1)] sni=%[ssl_fc_sni] hv=%[fc_http_major] wafb=%[var(txn.waf_body)] wafe=%[var(txn.coraza.error)]"
 
     # --- URI normalisation (MUST be the first path-touching block here) ---
     # Every path-based control in this frontend (the ACME health-check bypass,
@@ -611,7 +616,61 @@ frontend web
     # guards (no point asking the WAF about requests we're already dropping)
     # and AFTER the real-client-IP resolution (so Coraza sees the right src).
     filter spoe engine coraza config /etc/haproxy/coraza-spoe.cfg
+
+    # --- Make Coraza actually see the request body -------------------------
+    # send-spoe-group sends `req.body` = whatever body bytes are in the buffer
+    # AT THAT MOMENT. Without buffering that is usually NOTHING: measured on
+    # haproxy 3.0.11 + coraza-spoa v0.7.1, a 14-byte `content=$a($b)` POST
+    # whose body was written in a second send() right after the headers
+    # passed 933180 (an enforced rule) uninspected, while the identical bytes
+    # in one send() were blocked. A body sent 2s late, or after an
+    # `Expect: 100-continue`, was never inspected at all.
+    #
+    # `option http-buffer-request` makes HAProxy wait, before evaluating the
+    # http-request rules, until the WHOLE body is in or the buffer is full,
+    # bounded by `timeout http-request` (30s, hap_header.tpl). It answers
+    # `Expect: 100-continue` itself so the client actually sends the body.
+    # It does NOT hold uploads: once one buffer (tune.bufsize, 16 KB) is full
+    # the request is forwarded and the rest streams through as before -- a
+    # 50 MB upload is not stored at the edge.
+    option http-buffer-request
+
+    # Tell Coraza whether it got the whole body. Coraza cannot tell on its
+    # own (REQUEST_BODY_LENGTH is only filled by the urlencoded/raw
+    # processors), and the difference matters: a TRUNCATED JSON body, or a
+    # multipart body cut inside a boundary/part header, fails to parse by
+    # construction, so the body-parse-error rules (200002/200003) may only
+    # deny a COMPLETE body. WHP's generated Coraza rules
+    # (regenerate-coraza-overrides.sh) key on this header:
+    #   complete -> 200002/200003 deny on multipart/JSON (enforce mode)
+    #   partial  -> 200002/200003 removed for this request (every mode)
+    #
+    # With a Content-Length: complete iff req.body_len (buffered) equals
+    # req.body_size (= Content-Length).
+    # Without one (HTTP/1.1 chunked, HTTP/2-3 without content-length) HAProxy
+    # 3.0 has no "end of message" fetch and req.body_size is just what is
+    # buffered. But http-buffer-request only releases the request early when
+    # the body ENDED or the buffer FILLED (a stalled body gets a 408 instead),
+    # and body + headers well below one buffer (12 KB of the ~15 KB usable)
+    # cannot have filled it. So that is complete, anything else partial.
+    # Without this branch an attacker only had to add
+    # `Transfer-Encoding: chunked` to escape enforcement (measured).
+    #
+    # Client-supplied copies are deleted FIRST so it cannot be forged, and it
+    # is deleted again after the SPOE call so backends never see it.
+    # txn.waf_body is also logged (`wafb=` in the log-format above) so the
+    # complete/partial mix is measurable per host.
+    http-request del-header X-WHP-WAF-Body
+    http-request set-var(txn.waf_body_size) req.body_size if { req.hdr_cnt(content-length) eq 1 }
+    http-request set-var(txn.waf_body) str(complete) if { var(txn.waf_body_size) -m found } { req.body_len,sub(txn.waf_body_size) eq 0 }
+    http-request set-var(txn.waf_body) str(partial) if { var(txn.waf_body_size) -m found } !{ req.body_len,sub(txn.waf_body_size) eq 0 }
+    http-request set-var(txn.waf_hdrs_len) req.hdrs,length if !{ var(txn.waf_body_size) -m found } { req.body_len gt 0 }
+    http-request set-var(txn.waf_body) str(complete) if { var(txn.waf_hdrs_len) -m found } { req.body_len,add(txn.waf_hdrs_len) lt 12288 }
+    http-request set-var(txn.waf_body) str(partial) if !{ var(txn.waf_body_size) -m found } { req.body_len gt 0 } !{ var(txn.waf_body) -m found }
+    http-request set-header X-WHP-WAF-Body %[var(txn.waf_body)] if { var(txn.waf_body) -m found }
+
     http-request send-spoe-group coraza coraza-req
+    http-request del-header X-WHP-WAF-Body
 
     # Enforce Coraza's verdict. The SPOA sets var(txn.coraza.action) to
     # "deny" / "drop" / "redirect" when a rule with the corresponding

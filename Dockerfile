@@ -92,6 +92,7 @@ RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
  && python3 /haproxy/scripts/test-config-rollback.py \
  && python3 /haproxy/scripts/test-cert-write-safety.py \
  && python3 /haproxy/scripts/test-cert-scripts.py \
+ && python3 /haproxy/scripts/test-waf-body-inspection.py \
  && python3 /haproxy/scripts/validate-rendered-config.py
 # Create log directories
 RUN mkdir -p /var/log && touch /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
