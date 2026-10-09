@@ -957,24 +957,31 @@ class TestRetiredLineageCanBeReissued(CertPublishTestCase):
     def test_certbot_can_issue_the_name_again_after_retirement(self):
         """Against certbot's own storage code (skipped where certbot is not
         importable, e.g. the image's app python)."""
+        # Import AND initialisation are both guarded: a half-installed or
+        # version-skewed certbot can fail with far more than ImportError (a
+        # missing transitive dependency, a pkg_resources/entry-point error, a
+        # moved internal). Any of those means "cannot run this check here",
+        # not "retirement is broken". new_lineage() itself is NOT inside the
+        # guard - that is the assertion.
         try:
+            import types
             from certbot._internal import storage
-        except ImportError:
-            self.skipTest('certbot not importable from this python')
-        import types
-        cfg = types.SimpleNamespace(
-            config_dir=self.le, renewal_configs_dir=os.path.join(self.le, 'renewal'),
-            default_archive_dir=os.path.join(self.le, 'archive'),
-            live_dir=os.path.join(self.le, 'live'))
-        real_rv = storage.relevant_values
+            real_rv = storage.relevant_values
+            new_lineage = storage.RenewableCert.new_lineage
+            cfg = types.SimpleNamespace(
+                config_dir=self.le, renewal_configs_dir=os.path.join(self.le, 'renewal'),
+                default_archive_dir=os.path.join(self.le, 'archive'),
+                live_dir=os.path.join(self.le, 'live'))
+        except Exception as e:  # noqa: BLE001 - deliberately broad, see above
+            self.skipTest(f'certbot unusable from this python ({type(e).__name__}: {e})')
         storage.relevant_values = lambda c: {'server': 'https://acme.invalid/directory'}
         self.addCleanup(setattr, storage, 'relevant_values', real_rv)
         cert, key = san('new_bundle.crt').encode(), san('new_bundle.key').encode()
 
-        first = storage.RenewableCert.new_lineage('brain-jar.com', cert, key, cert, cfg)
+        first = new_lineage('brain-jar.com', cert, key, cert, cfg)
         self.assertEqual('brain-jar.com', first.lineagename)
         hm.retire_lineage_tree('brain-jar.com')
-        again = storage.RenewableCert.new_lineage('brain-jar.com', cert, key, cert, cfg)
+        again = new_lineage('brain-jar.com', cert, key, cert, cfg)
         self.assertEqual('brain-jar.com', again.lineagename,
                          'certbot could not re-create the lineage under the same name')
         self.assertTrue(os.path.getsize(os.path.join(self.le, 'renewal', 'brain-jar.com.conf')) > 0)
