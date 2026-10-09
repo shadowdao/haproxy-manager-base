@@ -56,17 +56,20 @@ What this worker changes
    the main loop, freeing its slot (review F1).
 
 3. HEADER_DEADLINE (HAPROXY_MGR_HEADER_DEADLINE, default 10s): total time a
-   pool thread may spend reading the request line + headers. Armed when the
-   thread picks the connection up, disarmed in handle_request() (which gunicorn
-   calls only once the parser has returned a complete request). A 1s monitor
-   loop shuts down (SHUT_RDWR, not close -- no fd-reuse race with the blocked
-   recv) the socket of any connection past it; the blocked recv returns EOF and
-   the thread is freed (review F2). Armed in handle(), NOT at accept/enqueue,
-   on purpose: a legit request queued behind busy threads (certbot runs) must
-   not be cut for waiting. A slow client queued behind other slow clients is
-   therefore bounded by (wait for a thread) + HEADER_DEADLINE. Bodies are
-   only read by routes behind require_api_key, so the unauthenticated surface
-   is exactly this phase.
+   client may take to deliver the request line + headers, counted from when
+   the connection was ENQUEUED for a thread, with a floor of
+   HAPROXY_MGR_HEADER_PICKUP_GRACE (1s) after a thread picks it up:
+   deadline = max(enqueue + 10s, pickup + 1s). Disarmed in handle_request()
+   (which gunicorn calls only once the parser has returned a complete
+   request). A 1s monitor loop shuts down (SHUT_RDWR, not close -- no fd-reuse
+   race with the blocked recv) the socket of any connection past it; the
+   blocked recv returns EOF and the thread is freed (review F2). A legit
+   request queued behind busy threads (certbot runs) already has its headers
+   in the kernel buffer and parses in milliseconds inside the 1s grace; a
+   slow client that sat in the queue gets only the grace, so reconnecting
+   drippers cannot starve the pool by queueing (re-review). Bodies are only
+   read by routes behind require_api_key, so the unauthenticated surface is
+   exactly this phase.
 
 4. Wedge watchdog (HAPROXY_MGR_WEDGE_SECONDS, default 3600s; 0 disables). If
    EVERY pool thread has been inside the same request for longer than that the
@@ -76,7 +79,20 @@ What this worker changes
    certbot (up to 180s) per domain; with (1)-(3) closing the known client-side
    sources, this is only a backstop for blocking sources not yet found.
 
-5. pool_status() exposes busy/total threads and the oldest in-flight age so
+5. Peer filter (re-review R1). haproxy-manager shares the client-net bridge
+   with every tenant container, so tenant PHP could reach haproxy-manager:8000
+   directly; the 127.0.0.1 publish only removes the internet path. On the
+   ports in HAPROXY_MGR_PEER_FILTER_PORTS (default "8000" -- NOT the :8080
+   default-page server, which HAProxy feeds over loopback) accept() closes
+   any connection whose peer is not in HAPROXY_MGR_API_ALLOWED_PEERS (default
+   "127.0.0.1,::1,gateway"; IPs/CIDRs; "gateway" = this container's default
+   gateway, which is where host callers arrive from through docker-proxy).
+   Refused before a thread or connection slot is used; logged at most once a
+   minute as a per-peer summary. Effective only once the edge publishes
+   127.0.0.1:8000 -- with a 0.0.0.0 publish a tenant can hairpin through the
+   host and arrive from the gateway too.
+
+6. pool_status() exposes busy/total threads and the oldest in-flight age so
    /health can report saturation.
 
 This overrides gthread internals (enqueue_req, accept,
@@ -87,6 +103,7 @@ real gunicorn in the Docker build gate and fails on behavioural drift.
 """
 
 import errno
+import ipaddress
 import logging
 import os
 import selectors
@@ -115,6 +132,65 @@ HEADER_DEADLINE = _env_float('HAPROXY_MGR_HEADER_DEADLINE', 10)
 WEDGE_SECONDS = _env_float('HAPROXY_MGR_WEDGE_SECONDS', 3600)
 WATCHDOG_INTERVAL = _env_float('HAPROXY_MGR_WATCHDOG_INTERVAL', 15)
 MONITOR_TICK = 1.0
+# Once a thread picks a queued connection up it gets at least this long to
+# finish its headers, even if its enqueue-based deadline has already passed.
+HEADER_PICKUP_GRACE = _env_float('HAPROXY_MGR_HEADER_PICKUP_GRACE', 1)
+
+# Peer filter (review R1). Listener ports it applies to (comma-separated;
+# empty disables) and the peers allowed through. "gateway" means this
+# container's default gateway on its bridge network -- the address host-side
+# callers arrive from via the 127.0.0.1:8000 publish (docker-proxy) and via a
+# direct host->container-IP connect. Tenant containers on the same bridge
+# (client-net) arrive from their OWN addresses and are refused.
+PEER_FILTER_PORTS = os.environ.get('HAPROXY_MGR_PEER_FILTER_PORTS', '8000')
+ALLOWED_PEERS_SPEC = os.environ.get('HAPROXY_MGR_API_ALLOWED_PEERS', '127.0.0.1,::1,gateway')
+PEER_REJECT_LOG_INTERVAL = 60.0
+
+
+def _default_gateways(route_file='/proc/net/route'):
+    """IPv4 default gateway(s) from the kernel routing table."""
+    gws = []
+    try:
+        with open(route_file) as fh:
+            next(fh, None)
+            for line in fh:
+                f = line.split()
+                if len(f) >= 4 and f[1] == '00000000' and int(f[3], 16) & 0x2:
+                    gws.append(str(ipaddress.IPv4Address(int(f[2], 16).to_bytes(4, 'little'))))
+    except (OSError, ValueError):
+        pass
+    return gws
+
+
+def parse_allowed_peers(spec, gateways=None):
+    """Return (networks, problems). Tokens: IPs, CIDRs, or the word
+    'gateway'. Unparseable tokens are reported, never silently widened."""
+    nets, problems = [], []
+    for tok in (t.strip() for t in (spec or '').split(',')):
+        if not tok:
+            continue
+        if tok.lower() == 'gateway':
+            gws = _default_gateways() if gateways is None else gateways
+            if not gws:
+                problems.append('gateway: no IPv4 default route found')
+            for g in gws:
+                nets.append(ipaddress.ip_network(g + '/32'))
+            continue
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            problems.append('unparseable entry %r' % tok)
+    return nets, problems
+
+
+def peer_allowed(addr, nets):
+    try:
+        ip = ipaddress.ip_address(addr.split('%', 1)[0])
+    except (ValueError, AttributeError):
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return any(ip.version == n.version and ip in n for n in nets)
 
 TESTED_GUNICORN_VERSION = '23.0.0'
 
@@ -173,6 +249,15 @@ class TimeoutThreadWorker(ThreadWorker):
         self._inflight = {}          # thread ident -> _InFlight
         self._inflight_lock = threading.Lock()
         self._pending = deque()      # accepted, not yet readable (FIFO by deadline)
+        self._filter_ports = set()
+        for tok in PEER_FILTER_PORTS.split(','):
+            tok = tok.strip()
+            if tok.isdigit():
+                self._filter_ports.add(int(tok))
+        self._allowed_nets = []
+        self._rejected = {}          # peer ip -> count since last log line
+        self._rejected_lock = threading.Lock()
+        self._last_reject_log = 0.0
 
     # -- (1) client socket timeout ------------------------------------------
     def enqueue_req(self, conn):
@@ -183,6 +268,7 @@ class TimeoutThreadWorker(ThreadWorker):
         conn.init()
         if CLIENT_TIMEOUT > 0:
             conn.sock.settimeout(CLIENT_TIMEOUT)
+        conn.whp_enqueued = time.monotonic()   # header deadline counts from here
         fs = self.tpool.submit(self.handle, conn)
         self._wrap_future(fs, conn)
 
@@ -192,6 +278,14 @@ class TimeoutThreadWorker(ThreadWorker):
         # tracked in self._pending so murder_keepalived() can reap it.
         try:
             sock, client = listener.accept()
+            if self._filter_ports and self._server_port(server) in self._filter_ports \
+                    and not peer_allowed(client[0] if isinstance(client, tuple) else '',
+                                         self._allowed_nets):
+                # Refused before it costs a TConn, a connection slot, a poller
+                # registration or a thread.
+                sock.close()
+                self._note_rejected(client[0] if isinstance(client, tuple) else str(client))
+                return
             conn = TConn(self.cfg, sock, client, server)
             conn.timeout = time.time() + FIRST_BYTE_TIMEOUT
 
@@ -204,6 +298,32 @@ class TimeoutThreadWorker(ThreadWorker):
             if e.errno not in (errno.EAGAIN, errno.ECONNABORTED,
                                errno.EWOULDBLOCK):
                 raise
+
+    @staticmethod
+    def _server_port(server):
+        try:
+            return int(server[1])
+        except (TypeError, IndexError, ValueError):
+            return None
+
+    def _note_rejected(self, peer):
+        with self._rejected_lock:
+            self._rejected[peer] = self._rejected.get(peer, 0) + 1
+        if time.monotonic() - self._last_reject_log >= PEER_REJECT_LOG_INTERVAL:
+            self._flush_rejected()
+
+    def _flush_rejected(self):
+        with self._rejected_lock:
+            if not self._rejected:
+                return
+            items, self._rejected = self._rejected, {}
+            self._last_reject_log = time.monotonic()
+        total = sum(items.values())
+        top = sorted(items.items(), key=lambda kv: -kv[1])[:5]
+        self.log.warning(
+            'Refused %d connection(s) to the management API from %d non-allowed peer(s) '
+            '(HAPROXY_MGR_API_ALLOWED_PEERS=%s): %s%s', total, len(items), ALLOWED_PEERS_SPEC,
+            ', '.join('%s x%d' % kv for kv in top), ' ...' if len(items) > 5 else '')
 
     def on_client_socket_readable(self, conn, client):
         # ThreadWorker version only knows about self._keep; a first request
@@ -242,7 +362,16 @@ class TimeoutThreadWorker(ThreadWorker):
     def handle(self, conn):
         ident = threading.get_ident()
         now = time.monotonic()
-        entry = _InFlight(conn, now, now + HEADER_DEADLINE if HEADER_DEADLINE > 0 else None)
+        deadline = None
+        if HEADER_DEADLINE > 0:
+            # max(enqueue + D, pickup + grace): a legit request that waited in
+            # the queue behind busy threads already has its headers in the
+            # kernel buffer and parses in milliseconds; a slow client that
+            # waited gets only the grace, not a fresh full deadline (review:
+            # 40 reconnecting drippers otherwise starved legit requests).
+            enq = getattr(conn, 'whp_enqueued', now)
+            deadline = max(enq + HEADER_DEADLINE, now + HEADER_PICKUP_GRACE)
+        entry = _InFlight(conn, now, deadline)
         with self._inflight_lock:
             self._inflight[ident] = entry
         try:
@@ -337,6 +466,8 @@ class TimeoutThreadWorker(ThreadWorker):
             try:
                 if HEADER_DEADLINE > 0:
                     self._sweep_header_deadlines()
+                if time.monotonic() - self._last_reject_log >= PEER_REJECT_LOG_INTERVAL:
+                    self._flush_rejected()
                 if time.monotonic() - last_wedge_check >= WATCHDOG_INTERVAL:
                     last_wedge_check = time.monotonic()
                     self._check_wedged()
@@ -358,6 +489,14 @@ class TimeoutThreadWorker(ThreadWorker):
                 'haproxy_gunicorn_worker overrides gthread internals as of gunicorn %s; '
                 'running %s -- re-run scripts/test-gunicorn-socket-timeouts.py',
                 TESTED_GUNICORN_VERSION, gunicorn.__version__)
+        if self._filter_ports:
+            self._allowed_nets, problems = parse_allowed_peers(ALLOWED_PEERS_SPEC)
+            for prob in problems:
+                self.log.error('HAPROXY_MGR_API_ALLOWED_PEERS: %s -- that entry allows nothing '
+                               '(fail closed)', prob)
+            self.log.info('Management API peer filter on port(s) %s: allowing %s',
+                          ','.join(str(p) for p in sorted(self._filter_ports)),
+                          ', '.join(str(n) for n in self._allowed_nets) or 'NOTHING')
         threading.Thread(target=self._monitor, name='worker-monitor',
                          daemon=True).start()
         super().init_process()   # runs the event loop; does not return

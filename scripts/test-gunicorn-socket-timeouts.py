@@ -93,7 +93,7 @@ def http_get(port, path='/', timeout=5):
 class Gunicorn:
     """A real gunicorn master on a free port, with its output captured."""
 
-    def __init__(self, worker_class, threads=1, env=None, workers=1):
+    def __init__(self, worker_class, threads=1, env=None, workers=1, extra_ports=()):
         self.tmp = tempfile.mkdtemp(prefix='gunicorn-timeout-test-')
         with open(os.path.join(self.tmp, 'tapp.py'), 'w') as fh:
             fh.write(WSGI_APP)
@@ -105,6 +105,7 @@ class Gunicorn:
         self.proc = subprocess.Popen(
             [sys.executable, '-m', 'gunicorn',
              '--bind', '127.0.0.1:%d' % self.port,
+             *sum((['--bind', '127.0.0.1:%d' % p] for p in extra_ports), []),
              '--workers', str(workers), '--threads', str(threads),
              '--worker-class', worker_class,
              '--timeout', '120', '--graceful-timeout', '2',
@@ -414,6 +415,149 @@ class ProductionShapeExhaustion(unittest.TestCase):
             time.sleep(1)
         s.settimeout(5)
         self.assertIn(b'200 OK', s.recv(4096))
+
+
+def refused(port, wait=2.0):
+    """True if the server closes a fresh connection without answering a
+    complete request (peer filter)."""
+    s = socket.create_connection(('127.0.0.1', port), timeout=wait)
+    try:
+        try:
+            s.sendall(b'GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+        except OSError:
+            return True
+        s.settimeout(wait)
+        try:
+            return s.recv(4096) == b''
+        except (ConnectionResetError, BrokenPipeError):
+            return True
+        except socket.timeout:
+            return False
+    finally:
+        s.close()
+
+
+class PeerFilter(unittest.TestCase):
+    """Re-review R1: tenant containers share client-net with haproxy-manager,
+    so the API port must refuse peers that are not loopback / the host path."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, REPO_DIR)
+        import haproxy_gunicorn_worker as w
+        cls.w = w
+
+    def test_allowlist_parsing_and_matching(self):
+        nets, problems = self.w.parse_allowed_peers('127.0.0.1,::1,gateway', gateways=['172.18.0.1'])
+        self.assertEqual(problems, [])
+        ok = self.w.peer_allowed
+        self.assertTrue(ok('127.0.0.1', nets))
+        self.assertTrue(ok('::1', nets))
+        self.assertTrue(ok('::ffff:127.0.0.1', nets))
+        self.assertTrue(ok('172.18.0.1', nets))           # docker-proxy / host
+        self.assertFalse(ok('172.18.0.7', nets))          # a tenant container
+        self.assertFalse(ok('127.0.0.2', nets))
+        self.assertFalse(ok('', nets))
+        self.assertFalse(ok('garbage', nets))
+
+    def test_bad_entries_fail_closed_and_are_reported(self):
+        nets, problems = self.w.parse_allowed_peers('nonsense,gateway', gateways=[])
+        self.assertEqual(nets, [])
+        self.assertEqual(len(problems), 2, problems)
+        nets, _ = self.w.parse_allowed_peers('10.0.0.0/8')
+        self.assertTrue(self.w.peer_allowed('10.1.2.3', nets))
+
+    def test_default_gateway_parsed_from_route_table(self):
+        fn = os.path.join(tempfile.mkdtemp(), 'route')
+        with open(fn, 'w') as fh:
+            fh.write('Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n'
+                     'eth0\t00000000\t010012AC\t0003\t0\t0\t0\t00000000\n'
+                     'eth0\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\n')
+        self.assertEqual(self.w._default_gateways(fn), ['172.18.0.1'])
+
+    def test_filtered_port_refuses_unlisted_peer_other_port_unaffected(self):
+        other = free_port()
+        g = Gunicorn(FIXED, threads=1, extra_ports=(other,), env={
+            'HAPROXY_MGR_PEER_FILTER_PORTS': str(other),
+            'HAPROXY_MGR_API_ALLOWED_PEERS': '10.255.255.1'})
+        self.addCleanup(g.stop)
+        # g.port (unfiltered) works; `other` refuses 127.0.0.1 (not listed).
+        self.assertTrue(http_get(g.port, '/').startswith('pid='))
+        for _ in range(5):
+            self.assertTrue(refused(other), 'filtered port answered an unlisted peer')
+        self.assertTrue(http_get(g.port, '/').startswith('pid='))
+        out = g.output()
+        self.assertIn('Refused 1 connection(s) to the management API', out)  # first one, immediately
+        self.assertEqual(out.count('Refused '), 1, 'reject logging is not rate-limited')
+
+    def test_filtered_port_serves_listed_peer(self):
+        port = free_port()
+        g = Gunicorn(FIXED, threads=1, extra_ports=(port,), env={
+            'HAPROXY_MGR_PEER_FILTER_PORTS': str(port),
+            'HAPROXY_MGR_API_ALLOWED_PEERS': '127.0.0.1,::1'})
+        self.addCleanup(g.stop)
+        self.assertTrue(http_get(port, '/').startswith('pid='))
+        self.assertNotIn('Refused', g.output())
+
+
+class QueuedDripStarvation(unittest.TestCase):
+    """Re-review: with the deadline armed at thread pickup, 40 reconnecting
+    drippers queued behind each other starved legit requests (every probe
+    >30s). Armed as max(enqueue + D, pickup + 1s) they must not."""
+
+    def test_40_reconnecting_drippers_do_not_starve_legit_requests(self):
+        g = Gunicorn(FIXED, threads=4, workers=2, env={})   # production defaults
+        self.addCleanup(g.stop)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def drip():
+            while not stop.is_set():
+                try:
+                    s = socket.create_connection(('127.0.0.1', g.port))
+                except OSError:
+                    time.sleep(0.2)
+                    continue
+                try:
+                    req = b'GET / HTTP/1.1\r\nX-a: ' + b'a' * 5000
+                    for i in range(len(req)):
+                        if stop.is_set():
+                            break
+                        s.send(req[i:i + 1])
+                        time.sleep(1.0)
+                except OSError:
+                    pass
+                finally:
+                    s.close()
+
+        for _ in range(40):
+            threading.Thread(target=drip, daemon=True).start()
+        time.sleep(2)
+        lat = []
+        t_end = time.time() + 25
+        while time.time() < t_end:
+            t0 = time.time()
+            try:
+                http_get(g.port, '/', timeout=30)
+                lat.append(time.time() - t0)
+            except Exception:
+                lat.append(99.0)
+            time.sleep(1)
+        stop.set()
+        lat.sort()
+        median = lat[len(lat) // 2]
+        sys.stderr.write('\n  40 drippers: probes=%d median=%.2fs worst=%.2fs\n'
+                         % (len(lat), median, lat[-1]))
+        # Armed at pickup, every probe here exceeded 30s (total starvation).
+        # With max(enqueue + D, pickup + 1s) queued drippers get ~1s of thread
+        # time, so legit requests keep getting through. They still queue: the
+        # equilibrium wait is ~(drippers/threads) x hold time, about 9s at 40
+        # drippers on 8 threads -- measured, see the round-2 report. The
+        # remaining fix for that is not admitting partial requests to a thread
+        # at all; the peer filter makes it a local-only scenario.
+        self.assertNotIn(99.0, lat, 'a legit request was starved for 30s+')
+        self.assertLess(median, 12.0, lat)
+        self.assertLess(lat[-1], 20.0, lat)
 
 
 class StalledUpstreamDefaultTimeout(unittest.TestCase):
