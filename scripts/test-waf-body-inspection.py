@@ -217,6 +217,35 @@ class BufsizeCeilings(unittest.TestCase):
         self.assertTrue(args[0].endswith(' body=req.body'))
 
 
+CORAZA_OVERRIDES = os.path.join(MODULE_DIR, 'coraza-spoa', 'overrides.conf')
+
+
+@unittest.skipUnless(os.path.exists(CORAZA_OVERRIDES),
+                     'coraza-spoa/overrides.conf is not shipped in this image; '
+                     'this class runs from a repo checkout')
+class BakedPromotions(unittest.TestCase):
+    """920440 is a CHAIN whose first link matches every URL with a file
+    extension. `SecRuleUpdateActionById 920440 "ctl:ruleEngine=On"` ran on that
+    first link, so every *.php / *.css request was evaluated with the engine
+    On (full CRS anomaly enforcement, in detect_only mode too). Measured
+    in-process and live, 2026-10-09; fixed by keying the flip on the chain's
+    real condition."""
+
+    def setUp(self):
+        with open(CORAZA_OVERRIDES) as fh:
+            self.lines = active_lines(fh.read())
+
+    def test_920440_is_not_promoted_on_its_chain_starter(self):
+        self.assertFalse([l for l in self.lines
+                          if re.match(r'SecRuleUpdateActionById\s+(\S*-)?920440\b', l)],
+                         '920440 promoted via SecRuleUpdateActionById again')
+
+    def test_920440_flip_keys_on_the_restricted_extension(self):
+        i = self.lines.index('SecRule TX:EXTENSION "@within %{tx.restricted_extensions}" \\')
+        self.assertEqual(self.lines[i + 1],
+                         '"id:992920440,phase:1,pass,nolog,t:none,t:lowercase,ctl:ruleEngine=On"')
+
+
 @unittest.skipUnless(os.path.exists(CORAZA_CONFIG),
                      'coraza-spoa/config.yaml is not shipped in this image; '
                      'this class runs from a repo checkout')
