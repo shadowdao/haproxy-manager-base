@@ -45,6 +45,8 @@ COPY ./templates /haproxy/templates
 COPY requirements.txt /haproxy/
 COPY haproxy_manager.py /haproxy/
 COPY haproxy_gunicorn_worker.py /haproxy/
+# Read by GET /api/capabilities (WHP gates whole-site re-bundling on it).
+COPY VERSION /haproxy/VERSION
 COPY scripts /haproxy/scripts
 COPY trusted_ips.list /etc/haproxy/trusted_ips.list
 COPY trusted_ips.map /etc/haproxy/trusted_ips.map
