@@ -101,6 +101,9 @@ class ListenerWithCoraza(unittest.TestCase):
         stamp = index_of(self.lines, r'^http-request set-header X-WHP-WAF-Body %\[var\(txn\.waf_body\)\] if \{ var\(txn\.waf_body\) -m found \}$')
         spoe = index_of(self.lines, r'^http-request send-spoe-group coraza coraza-req$')
         deny = index_of(self.lines, r'^http-request return status 403 .*var\(txn\.coraza\.action\) -m str deny')
+        dup_ct = index_of(self.lines, r'^http-request deny deny_status 400 if \{ req\.fhdr_cnt\(content-type\) gt 1 \}$')
+        self.assertGreaterEqual(dup_ct, 0, 'duplicate Content-Type must be rejected at the edge')
+        self.assertLess(dup_ct, spoe, 'and before Coraza is asked')
         for name, idx in (('client-copy strip', strip1), ('size var', size), ('complete', complete),
                           ('partial', partial), ('no-CL header length', hdrs_len),
                           ('no-CL complete', nocl_complete),
@@ -243,10 +246,18 @@ class CorazaBodyLimits(unittest.TestCase):
         self.assertGreaterEqual(int(self.directive('SecRequestBodyInMemoryLimit')),
                                 int(self.directive('SecRequestBodyLimit')))
 
+    def test_json_depth_limit_pinned(self):
+        """Quadratic JSON flattening: depth 300 = 297 ms, past the fail-open
+        timeout. Legitimate WordPress JSON measured at depth <= 9."""
+        depth = int(self.directive('SecRequestBodyJsonDepthLimit'))
+        self.assertGreaterEqual(depth, 32, 'too tight for real block/theme payloads')
+        self.assertLessEqual(depth, 64, 'depth 100 already costs ~40 ms')
+
     def test_limits_are_set_after_the_recommended_file(self):
         inc = self.cfg.index('Include @coraza.conf-recommended')
-        lim = [i for i, l in enumerate(self.cfg) if l.startswith('SecRequestBodyLimit ')][0]
-        self.assertLess(inc, lim, 'the recommended file would override our limits')
+        for name in ('SecRequestBodyLimit ', 'SecRequestBodyJsonDepthLimit '):
+            lim = [i for i, l in enumerate(self.cfg) if l.startswith(name)][0]
+            self.assertLess(inc, lim, f'the recommended file would override {name.strip()}')
 
 
 if __name__ == '__main__':

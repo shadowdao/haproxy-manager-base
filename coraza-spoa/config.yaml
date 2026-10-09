@@ -44,6 +44,19 @@ applications:
       SecRequestBodyInMemoryLimit 131072
       SecRequestBodyLimitAction ProcessPartial
 
+      # JSON nesting limit (the recommended file sets 1024). Coraza's JSON
+      # flattener is quadratic in nesting: a 601-byte `[[[...]]]` of depth 300
+      # cost 297 ms and depth 1000 (2 KB) 3.1 s of CPU -- past the 100 ms SPOE
+      # timeout, so the request passed UNINSPECTED (fail-open) while the WAF
+      # burned CPU. Over the limit the body fails to parse (REQBODY_ERROR,
+      # 0.1 ms), which WHP's enforce-mode body-integrity rule denies on a
+      # complete body. Legitimate depth, measured on the JSON shipped in
+      # WordPress 6.x core, Gutenberg, WooCommerce and Elementor (theme.json,
+      # styles/*.json, block.json, checkout schemas): max 8, so a global-styles
+      # save is ~9; 64 leaves ~7x headroom for Divi/Elementor-style module
+      # trees that could not be sampled. Depth 64 itself costs ~21 ms.
+      SecRequestBodyJsonDepthLimit 64
+
       Include @crs-setup.conf.example
 
       # Runtime-managed PRE-CRS exclusions written by WHP UI. Empty by default.

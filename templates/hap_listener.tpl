@@ -635,6 +635,19 @@ frontend web
     # 50 MB upload is not stored at the edge.
     option http-buffer-request
 
+    # Exactly one Content-Type, or 400. With two Content-Type lines Coraza and
+    # the backend disagree about what the body IS: Coraza evaluates every value
+    # (`text/xml` on either line selects its XML processor, which accepts a
+    # form body without error), while Apache merges the lines with ", " and
+    # PHP cuts the media type at the first ',' / ';'. Measured (Coraza v3.7.0
+    # + PHP 8.3): `application/x-www-form-urlencoded` + `text/xml` puts the
+    # payload in $_POST with nothing inspected. req.fhdr_cnt counts header
+    # LINES, so a single comma-joined value (which browsers produce when a
+    # script calls setRequestHeader twice) is not affected here; that form is
+    # parsed consistently enough by both sides (see the report's matrix).
+    # Browsers, curl, PHP-curl and the common HTTP libraries send one line.
+    http-request deny deny_status 400 if { req.fhdr_cnt(content-type) gt 1 }
+
     # Tell Coraza whether it got the whole body. Coraza cannot tell on its
     # own (REQUEST_BODY_LENGTH is only filled by the urlencoded/raw
     # processors), and the difference matters: a TRUNCATED JSON body, or a
