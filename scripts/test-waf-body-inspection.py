@@ -240,6 +240,28 @@ class BakedPromotions(unittest.TestCase):
                           if re.match(r'SecRuleUpdateActionById\s+(\S*-)?920440\b', l)],
                          '920440 promoted via SecRuleUpdateActionById again')
 
+    def test_no_chain_starter_is_promoted(self):
+        """Chain-starter rules in the promoted ranges (CRS 4.25.0): 920440,
+        944110, 944120. None may be covered by a SecRuleUpdateActionById."""
+        chain_starters = (920440, 944110, 944120)
+        promoted = []
+        for l in self.lines:
+            m = re.match(r'SecRuleUpdateActionById\s+(\d+)(?:-(\d+))?\s', l)
+            if m:
+                lo = int(m.group(1))
+                promoted.append((lo, int(m.group(2) or lo)))
+        self.assertTrue(promoted, 'no promotions parsed -- the test is blind')
+        for rid in chain_starters:
+            self.assertFalse([r for r in promoted if r[0] <= rid <= r[1]],
+                             f'{rid} is a CRS chain starter and must not be promoted')
+
+    def test_log4shell_range_still_promoted(self):
+        for rid in (944100, 944130, 944150, 944151, 944152, 944300):
+            self.assertTrue([1 for l in self.lines
+                             if (m := re.match(r'SecRuleUpdateActionById\s+(\d+)(?:-(\d+))?\s', l))
+                             and int(m.group(1)) <= rid <= int(m.group(2) or m.group(1))],
+                            f'{rid} lost its promotion')
+
     def test_920440_flip_keys_on_the_restricted_extension(self):
         i = self.lines.index('SecRule TX:EXTENSION "@within %{tx.restricted_extensions}" \\')
         self.assertEqual(self.lines[i + 1],
