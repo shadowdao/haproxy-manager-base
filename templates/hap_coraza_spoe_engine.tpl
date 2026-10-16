@@ -78,6 +78,15 @@ spoe-agent coraza
 # fetch ever came back empty the agent falls back to that random ID, so this
 # cannot break inspection.
 #
+# exportRuleIDs=bool(true) makes coraza-spoa (application.go exportWAFMetrics)
+# set var(txn.coraza.rule_ids) = comma list of every matched CRS attack rule
+# (910000-959999 + 190000-199999; control rules such as our 99xxxxxxx host
+# exceptions and 2000xx body rules are NOT listed), alongside rules_hit and
+# anomaly_score which it sets regardless. var(txn.coraza.ruleid) is set on
+# every interruption (agent.go) -- for anomaly blocks that is 949110, so
+# rule_ids is what actually says WHY. All three are logged in the access
+# log (hap_listener.tpl log-format: wrule= wrules= wscore=).
+#
 # Response inspection (a `coraza-res` message) is NOT configured:
 # config.yaml has response_check: false. If it is ever enabled, coraza-res
 # MUST also send `id=unique-id` -- HandleResponse
@@ -89,7 +98,7 @@ spoe-agent coraza
 # when no proxy headers are present. This is what shows up as `client_ip`
 # in /var/log/coraza/audit.log and the rule manager's view-matches panel.
 spoe-message coraza-req
-    args app=str(haproxy) id=unique-id src-ip=var(txn.real_ip) src-port=src_port dst-ip=dst dst-port=dst_port method=method path=path query=query version=req.ver headers=req.hdrs body=req.body
+    args app=str(haproxy) id=unique-id exportRuleIDs=bool(true) src-ip=var(txn.real_ip) src-port=src_port dst-ip=dst dst-port=dst_port method=method path=path query=query version=req.ver headers=req.hdrs body=req.body
 
 # Group binding for send-spoe-group invocation in the frontend. One group,
 # one message; could add more in the future (e.g. coraza-res for response

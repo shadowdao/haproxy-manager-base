@@ -68,7 +68,13 @@ frontend web
     #        wafe is var(txn.coraza.error), set when the SPOE call failed or
     #        timed out and the request went through UNINSPECTED (fail-open).
     #        Both are "-" when the WAF is off or the request had no body.
-    log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r cip=%[var(txn.real_ip)] id=%ID host=%[capture.req.hdr(0)] ua=%[capture.req.hdr(1)] sni=%[ssl_fc_sni] hv=%[fc_http_major] wafb=%[var(txn.waf_body)] wafe=%[var(txn.coraza.error)]"
+    #   wrule=/wrules=/wscore= WHY Coraza acted, without opening audit.log:
+    #        wrule is the interrupting rule (949110 for anomaly blocks),
+    #        wrules every matched CRS attack rule (e.g. 920440,949110),
+    #        wscore the inbound anomaly score. Set by coraza-spoa via the
+    #        exportRuleIDs SPOE arg (hap_coraza_spoe_engine.tpl). All "-"
+    #        when the WAF is off; wrule is "-" unless Coraza interrupted.
+    log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r cip=%[var(txn.real_ip)] id=%ID host=%[capture.req.hdr(0)] ua=%[capture.req.hdr(1)] sni=%[ssl_fc_sni] hv=%[fc_http_major] wafb=%[var(txn.waf_body)] wafe=%[var(txn.coraza.error)] wrule=%[var(txn.coraza.ruleid)] wrules=%[var(txn.coraza.rule_ids)] wscore=%[var(txn.coraza.anomaly_score)]"
 
     # --- URI normalisation (MUST be the first path-touching block here) ---
     # Every path-based control in this frontend (the ACME health-check bypass,

@@ -160,7 +160,16 @@ class ListenerWithCoraza(unittest.TestCase):
     def test_access_log_carries_coverage_fields(self):
         lf = [l for l in self.lines if l.startswith('log-format ')]
         self.assertEqual(len(lf), 1)
-        self.assertTrue(lf[0].endswith('wafb=%[var(txn.waf_body)] wafe=%[var(txn.coraza.error)]"'))
+        self.assertIn('wafb=%[var(txn.waf_body)] wafe=%[var(txn.coraza.error)]', lf[0])
+
+    def test_access_log_carries_waf_verdict_fields(self):
+        """wrule/wrules/wscore are appended LAST so any consumer anchored on
+        the earlier fields keeps working."""
+        lf = [l for l in self.lines if l.startswith('log-format ')]
+        self.assertEqual(len(lf), 1)
+        self.assertTrue(lf[0].endswith(
+            'wrule=%[var(txn.coraza.ruleid)] wrules=%[var(txn.coraza.rule_ids)] '
+            'wscore=%[var(txn.coraza.anomaly_score)]"'))
 
     def test_fail_open_preserved(self):
         """Nothing may deny on var(txn.coraza.error): an SPOA outage must not
@@ -246,6 +255,11 @@ class CorazaTransactionIdIsTheRequestReference(unittest.TestCase):
     def test_request_message_sends_unique_id(self):
         self.assertIn('coraza-req', self.messages)
         self.assertEqual(self.args_of('coraza-req').get('id'), 'unique-id')
+
+    def test_request_message_exports_rule_ids(self):
+        """Without exportRuleIDs coraza-spoa never sets txn.coraza.rule_ids
+        and the access log's wrules= is always '-'."""
+        self.assertEqual(self.args_of('coraza-req').get('exportRuleIDs'), 'bool(true)')
 
     def test_app_is_still_the_first_arg(self):
         """agent.go HandleSPOE Panics unless the FIRST kv entry is `app`."""
