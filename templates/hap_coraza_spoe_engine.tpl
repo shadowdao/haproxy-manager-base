@@ -10,9 +10,9 @@
 # config.yaml.
 #
 # Reference: this config follows the shape from coraza-spoa's upstream
-# example/haproxy/coraza.cfg (v0.7.1). Arg names + ordering are required by
-# Coraza-SPOA exactly as specified — DO NOT reorder or rename without
-# coordinating with the agent.
+# example/haproxy/coraza.cfg (v0.7.1). Arg NAMES are a contract with
+# coraza-spoa — DO NOT rename without coordinating with the agent. Ordering:
+# only `app` is positional (it must be FIRST); the rest are matched by name.
 
 [coraza]
 
@@ -56,9 +56,32 @@ spoe-agent coraza
 
 # Per-request inspection message. No `event` directive — fires only when
 # explicitly invoked from haproxy.cfg via `http-request send-spoe-group`.
-# Arg order/names are mandatory: Coraza-SPOA parses positionally and renames
-# break the agent. `app=str(haproxy)` is the literal application name from
-# coraza-spoa's config.yaml `applications:` block.
+#
+# How coraza-spoa v0.7.1 reads these args (measured from source, not inferred):
+#   * `app` MUST be the first arg. internal/agent.go HandleSPOE reads exactly
+#     one KV entry and Panics if its name is not "app".
+#   * Every other arg is matched BY NAME in a switch (internal/application.go
+#     HandleRequest); order is irrelevant and unknown names are ignored with a
+#     debug log. So a typo'd name silently drops that input — renames still
+#     break inspection, they just don't error.
+# `app=str(haproxy)` is the literal application name from coraza-spoa's
+# config.yaml `applications:` block.
+#
+# id=unique-id makes Coraza's transaction ID the SAME UUID HAProxy generates
+# via `unique-id-format %[uuid()]` (hap_header.tpl) — the value shown on the
+# 403-waf.html page, sent as X-Request-Reference, and logged as `id=` in
+# /var/log/haproxy.log. coraza-spoa passes it to waf.NewTransactionWithID(),
+# so it becomes `transaction.id` in /var/log/coraza/audit.log and
+# `match.unique_id` in /var/log/coraza/spoa.log: a customer-quoted reference
+# greps straight to the rule that fired. Without it coraza-spoa invents a
+# random 16-letter A-Z ID that appears nowhere on the HAProxy side. If the
+# fetch ever came back empty the agent falls back to that random ID, so this
+# cannot break inspection.
+#
+# Response inspection (a `coraza-res` message) is NOT configured:
+# config.yaml has response_check: false. If it is ever enabled, coraza-res
+# MUST also send `id=unique-id` -- HandleResponse
+# looks the request transaction up by that ID and errors without it.
 #
 # src-ip uses var(txn.real_ip) — HAProxy resolves the real client IP at the
 # top of the frontend (CF-Connecting-IP > X-Real-IP > X-Forwarded-For > src,
@@ -66,7 +89,7 @@ spoe-agent coraza
 # when no proxy headers are present. This is what shows up as `client_ip`
 # in /var/log/coraza/audit.log and the rule manager's view-matches panel.
 spoe-message coraza-req
-    args app=str(haproxy) src-ip=var(txn.real_ip) src-port=src_port dst-ip=dst dst-port=dst_port method=method path=path query=query version=req.ver headers=req.hdrs body=req.body
+    args app=str(haproxy) id=unique-id src-ip=var(txn.real_ip) src-port=src_port dst-ip=dst dst-port=dst_port method=method path=path query=query version=req.ver headers=req.hdrs body=req.body
 
 # Group binding for send-spoe-group invocation in the frontend. One group,
 # one message; could add more in the future (e.g. coraza-res for response

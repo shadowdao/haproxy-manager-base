@@ -217,6 +217,59 @@ class BufsizeCeilings(unittest.TestCase):
         self.assertTrue(args[0].endswith(' body=req.body'))
 
 
+class CorazaTransactionIdIsTheRequestReference(unittest.TestCase):
+    """Coraza's transaction ID must be HAProxy's unique-id, so the reference a
+    blocked customer quotes (403-waf.html / X-Request-Reference / `id=` in
+    haproxy.log) is the `unique_id` in /var/log/coraza/audit.log and
+    spoa.log. Without `id=` coraza-spoa v0.7.1 invents a random 16-letter ID
+    (internal/application.go HandleRequest) that joins to nothing."""
+
+    def setUp(self):
+        spoe = haproxy_manager.template_env.get_template(
+            'hap_coraza_spoe_engine.tpl').render()
+        lines = active_lines(spoe)
+        self.messages = {}
+        current = None
+        for line in lines:
+            m = re.match(r'^spoe-message\s+(\S+)$', line)
+            if m:
+                current = m.group(1)
+                continue
+            if line.startswith('spoe-') or line.startswith('['):
+                current = None
+            elif current and line.startswith('args '):
+                self.messages[current] = line.split()[1:]
+
+    def args_of(self, message):
+        return dict(a.split('=', 1) for a in self.messages[message])
+
+    def test_request_message_sends_unique_id(self):
+        self.assertIn('coraza-req', self.messages)
+        self.assertEqual(self.args_of('coraza-req').get('id'), 'unique-id')
+
+    def test_app_is_still_the_first_arg(self):
+        """agent.go HandleSPOE Panics unless the FIRST kv entry is `app`."""
+        for name, args in self.messages.items():
+            self.assertTrue(args[0].startswith('app='),
+                            f'{name}: first arg must be app=, got {args[0]}')
+
+    def test_every_response_message_carries_the_same_id(self):
+        """HandleResponse finds the request transaction by `id`; a coraza-res
+        without it errors ("response id is empty") on every response."""
+        for name in self.messages:
+            if name != 'coraza-req':
+                self.assertEqual(self.args_of(name).get('id'), 'unique-id', name)
+
+    def test_unique_id_is_the_header_reference(self):
+        """The fetch is only meaningful while unique-id-format is the UUID that
+        is also emitted as X-Request-Reference and on the 403 page."""
+        header = active_lines(render('hap_header.tpl', coraza=True))
+        self.assertIn('unique-id-format %[uuid()]', [re.sub(r'\s+', ' ', l) for l in header])
+        self.assertIn('unique-id-header X-Request-Reference', [re.sub(r'\s+', ' ', l) for l in header])
+        listener = render('hap_listener.tpl', coraza=True)
+        self.assertIn('x-request-reference "%[unique-id]"', listener)
+
+
 CORAZA_OVERRIDES = os.path.join(MODULE_DIR, 'coraza-spoa', 'overrides.conf')
 
 
