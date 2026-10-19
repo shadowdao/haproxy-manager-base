@@ -92,7 +92,7 @@ class ListenerWithCoraza(unittest.TestCase):
 
     def test_stamp_order_strip_set_inspect_strip(self):
         strip1 = index_of(self.lines, r'^http-request del-header X-WHP-WAF-Body$')
-        size = index_of(self.lines, r'^http-request set-var\(txn\.waf_body_size\) req\.body_size if \{ req\.hdr_cnt\(content-length\) eq 1 \}$')
+        size = index_of(self.lines, r'^http-request set-var\(txn\.waf_body_size\) req\.hdr_val\(content-length\) if \{ req\.hdr_cnt\(content-length\) eq 1 \}$')
         complete = index_of(self.lines, r'^http-request set-var\(txn\.waf_body\) str\(complete\) if \{ var\(txn\.waf_body_size\) -m found \} \{ req\.body_len,sub\(txn\.waf_body_size\) eq 0 \}$')
         partial = index_of(self.lines, r'^http-request set-var\(txn\.waf_body\) str\(partial\) if \{ var\(txn\.waf_body_size\) -m found \} !\{ req\.body_len,sub\(txn\.waf_body_size\) eq 0 \}$')
         hdrs_len = index_of(self.lines, r'^http-request set-var\(txn\.waf_hdrs_len\) req\.hdrs,length if !\{ var\(txn\.waf_body_size\) -m found \} \{ req\.body_len gt 0 \}$')
@@ -136,6 +136,19 @@ class ListenerWithCoraza(unittest.TestCase):
         header = active_lines(render('hap_header.tpl', coraza=True))
         bufsize = int([l for l in header if l.startswith('tune.bufsize')][0].split()[1])
         self.assertLessEqual(total_lt, (bufsize - 1024) * 0.85)
+
+    def test_stamp_never_derived_from_req_body_size(self):
+        """req.body_size is "buffered + htx->extra" and HAProxy 3.0's H3 mux
+        never sets htx->extra, so over HTTP/3 it equals req.body_len and a
+        body truncated at one buffer reads as `complete` (measured on whp01
+        2026-10-17: six Divi sync-to-server saves of 252-417 KB 403'd by
+        WHP 991900020; lab-reproduced on haproxy 3.0.11 +QUIC). The
+        advertised length must come from the Content-Length header."""
+        uses = [l for l in self.lines if 'req.body_size' in l]
+        self.assertEqual(uses, [], 'req.body_size must not feed the X-WHP-WAF-Body stamp')
+        size = [l for l in self.lines if l.startswith('http-request set-var(txn.waf_body_size) ')]
+        self.assertEqual(len(size), 1)
+        self.assertIn('req.hdr_val(content-length)', size[0])
 
     def test_complete_and_partial_are_mutually_exclusive_conditions(self):
         """With a Content-Length, `complete` and `partial` must be the same

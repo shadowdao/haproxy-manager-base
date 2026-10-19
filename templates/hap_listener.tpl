@@ -664,8 +664,17 @@ frontend web
     #   complete -> 200002/200003 deny on multipart/JSON (enforce mode)
     #   partial  -> 200002/200003 removed for this request (every mode)
     #
-    # With a Content-Length: complete iff req.body_len (buffered) equals
-    # req.body_size (= Content-Length).
+    # With a Content-Length: complete iff req.body_len (buffered) equals the
+    # Content-Length HEADER value (req.hdr_val). NOT req.body_size: that is
+    # "buffered + htx->extra", and in HAProxy 3.0 only the H1 and H2 muxes
+    # set htx->extra from Content-Length -- the H3 mux never does (h3.c), so
+    # over HTTP/3 req.body_size == req.body_len and every body cut at one
+    # buffer was stamped `complete`. Measured: whp01 logged 73,795 H3
+    # `complete` and 0 `partial` (Oct 6-19 2026); a 265,778-byte Divi save
+    # over H3 reached Coraza as its first ~15 KB, failed to parse and was
+    # 403'd by WHP's 991900020. H1/H2/H3 all validate Content-Length against
+    # the DATA actually received (h3.c rejects a mismatch), so the header is
+    # a protocol-independent "how long the body really is".
     # Without one (HTTP/1.1 chunked, HTTP/2-3 without content-length) HAProxy
     # 3.0 has no "end of message" fetch and req.body_size is just what is
     # buffered. But http-buffer-request only releases the request early when
@@ -680,7 +689,7 @@ frontend web
     # txn.waf_body is also logged (`wafb=` in the log-format above) so the
     # complete/partial mix is measurable per host.
     http-request del-header X-WHP-WAF-Body
-    http-request set-var(txn.waf_body_size) req.body_size if { req.hdr_cnt(content-length) eq 1 }
+    http-request set-var(txn.waf_body_size) req.hdr_val(content-length) if { req.hdr_cnt(content-length) eq 1 }
     http-request set-var(txn.waf_body) str(complete) if { var(txn.waf_body_size) -m found } { req.body_len,sub(txn.waf_body_size) eq 0 }
     http-request set-var(txn.waf_body) str(partial) if { var(txn.waf_body_size) -m found } !{ req.body_len,sub(txn.waf_body_size) eq 0 }
     http-request set-var(txn.waf_hdrs_len) req.hdrs,length if !{ var(txn.waf_body_size) -m found } { req.body_len gt 0 }
