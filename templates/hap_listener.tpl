@@ -616,6 +616,34 @@ frontend web
     http-request set-path /suspended if is_suspended_domain
     use_backend default-backend if is_suspended_domain
 {%- endif %}
+
+    # CVE-2026-109618 (GHSA-w8hw-w9fx-j79w, PHP "RCE via OOM corruption"),
+    # vector (a): a multipart/form-data body with no declared length is not
+    # bounded by post_max_size -- PHP's multipart parser keeps reading it. A
+    # body WITH a Content-Length is checked against post_max_size before it is
+    # parsed. So a multipart request must carry exactly what every browser and
+    # HTTP library already sends for a form: a Content-Length.
+    #
+    # req.hdr_cnt(content-length) is the header as the client sent it, on
+    # every protocol: HTTP/1.1 chunked has none (and the H1 mux DROPS a
+    # Content-Length sent alongside Transfer-Encoding, so smuggling one in
+    # beside chunked does not pass either); HTTP/2 and HTTP/3 have none when
+    # the client streams the body. H1/H2/H3 all check a declared
+    # content-length against the DATA received, so it cannot lie about the
+    # length (same reasoning as the WAF body stamp below).
+    # Browsers send content-length for form posts and FormData uploads on
+    # h1/h2/h3; the only body a browser sends without one is a fetch() with a
+    # ReadableStream body (Chrome, h2/h3 only, `duplex: 'half'`), which is not
+    # what form uploads use.
+    #
+    # Not WAF-gated and not exempt for trusted IPs: this is a protocol
+    # guarantee the vulnerable parser needs, independent of Coraza and its
+    # mode. req.fhdr (not req.hdr) so a comma inside the value cannot split it.
+    # The rest of the advisory (part-header floods, empty file controls, deep
+    # field names) needs the body and lives in coraza-spoa/overrides.conf
+    # (209610-209616). Remove once patched PHP is on every customer image.
+    acl is_multipart_form req.fhdr(content-type) -m sub -i multipart/form-data
+    http-request deny deny_status 400 hdr x-whp-edge-block "multipart-without-content-length" if is_multipart_form !{ req.hdr_cnt(content-length) gt 0 }
 {%- if coraza_spoe_backend %}
 
     # Coraza WAF inspection via SPOE. Runs AFTER rate-limit and IP-block
