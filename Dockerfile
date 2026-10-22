@@ -39,7 +39,20 @@ LABEL org.opencontainers.image.title="haproxy-manager-base" \
 # updated — that failure is the point, not a bug. Check availability with:
 #   apt-cache policy haproxy
 ARG HAPROXY_VERSION=3.0.11-1+deb13u3
-RUN apt update -y && apt dist-upgrade -y && apt install socat "haproxy=${HAPROXY_VERSION}" cron certbot curl jq net-tools -y && apt-mark hold haproxy && apt clean && rm -rf /var/lib/apt/lists/*
+# OPTIONAL internal package cache, e.g. --build-arg PKG_CACHE=https://192.168.1.40
+# (CT130 pkg-cache, https only; CI sets it only after probing the cache with the
+# pinned CA). Unset = the upstream Debian repositories, exactly as before. The
+# apt sources are restored before this RUN ends (restore FAILS the build if any
+# reference to the cache is left), so no shipped layer carries the cache address.
+# Canonical script + docs: cloud-apache-container (scripts/pkg-cache-repos.sh,
+# docs/pkg-cache.md there); this repo carries byte-identical copies.
+ARG PKG_CACHE=
+COPY ./scripts/pkg-cache-repos.sh /usr/local/sbin/pkg-cache-repos.sh
+COPY ./keys/pkg-cache/ /usr/local/share/pkg-cache/
+RUN /usr/local/sbin/pkg-cache-repos.sh apt && \
+    apt update -y && apt dist-upgrade -y && apt install socat "haproxy=${HAPROXY_VERSION}" cron certbot curl jq net-tools -y && apt-mark hold haproxy && \
+    /usr/local/sbin/pkg-cache-repos.sh restore && \
+    apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
 COPY ./templates /haproxy/templates
 COPY requirements.txt /haproxy/

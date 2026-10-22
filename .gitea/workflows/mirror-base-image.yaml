@@ -26,11 +26,35 @@ jobs:
       # others from refreshing.
       fail-fast: false
       matrix:
+        # hub: the Docker Hub IMAGE:TAG whose digest is resolved DIRECTLY at
+        # registry-1.docker.io (resolve-base-image.sh expects no docker.io/
+        # prefix; official images resolve as library/<image>).
         image:
-          - { src: 'docker.io/library/python:3.12-slim', dst_path: 'cloud-hosting-platform/python', tag: '3.12-slim' }
-          - { src: 'docker.io/library/golang:1.25',      dst_path: 'cloud-hosting-platform/golang', tag: '1.25' }
+          - { hub: 'python:3.12-slim', dst_path: 'cloud-hosting-platform/python', tag: '3.12-slim' }
+          - { hub: 'golang:1.25',      dst_path: 'cloud-hosting-platform/golang', tag: '1.25' }
 
     steps:
+      # Only for .gitea/scripts/resolve-base-image.sh.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Supply chain: ask Docker Hub itself (over HTTPS, never via a mirror) which
+      # digest the tag points at right now, then pull exactly that digest. What
+      # lands in the in-house registry is therefore content-addressed to the
+      # digest Docker Hub reported - not whatever a `docker pull TAG` on the
+      # runner happened to resolve through any configured registry mirror.
+      # If the lookup fails the job FAILS and last week's mirror stays in place.
+      - name: Resolve ${{ matrix.image.hub }} digest (Docker Hub, direct)
+        id: base
+        env:
+          HUB_TAG: ${{ matrix.image.hub }}
+        run: |
+          set -euo pipefail
+          ref=$(.gitea/scripts/resolve-base-image.sh "$HUB_TAG")
+          [[ "$ref" =~ ^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest reference for ${HUB_TAG}"; exit 1; }
+          echo "base-image: ${HUB_TAG} -> ${ref} (digest from registry-1.docker.io)"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
       - name: Login to in-house registry
         uses: docker/login-action@v3
         with:
@@ -38,21 +62,31 @@ jobs:
           username: ${{ secrets.CI_USER }}
           password: ${{ secrets.CI_TOKEN }}
 
-      - name: Pull, retag, push ${{ matrix.image.src }}
+      - name: Pull by digest, retag, push ${{ matrix.image.hub }}
+        # Values reach the script via env, never via ${{ }} inside run:.
+        env:
+          REF: ${{ steps.base.outputs.ref }}
+          DST_PATH: ${{ matrix.image.dst_path }}
+          DST_TAG: ${{ matrix.image.tag }}
         run: |
           set -euo pipefail
-          SRC="${{ matrix.image.src }}"
-          DST="repo.anhonesthost.net/${{ matrix.image.dst_path }}:${{ matrix.image.tag }}"
+          [[ "$REF" =~ ^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest reference '${REF}'"; exit 1; }
+          [[ "$DST_PATH" =~ ^[a-z0-9][a-z0-9._/-]*$ && "$DST_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "::error::bad destination"; exit 1; }
+          name="${REF%@*}"; digest="${REF#*@}"
+          [[ "$name" == */* ]] || name="library/${name}"   # official images
+          SRC="docker.io/${name}@${digest}"
+          DST="repo.anhonesthost.net/${DST_PATH}:${DST_TAG}"
 
           echo "::group::Pulling ${SRC}"
           docker pull "${SRC}"
           echo "::endgroup::"
 
-          # Capture the upstream digest so the workflow log shows what we
-          # actually pushed. Helps diagnose "did the mirror really update"
-          # questions later.
-          SRC_DIGEST=$(docker image inspect "${SRC}" -f '{{index .RepoDigests 0}}')
-          echo "upstream digest: ${SRC_DIGEST}"
+          # The pulled image must be recorded under exactly the digest Docker
+          # Hub reported (docker refuses content that does not match it anyway).
+          repo_digests=$(docker image inspect "${SRC}" -f '{{range .RepoDigests}}{{println .}}{{end}}')
+          grep -qxF -e "docker.io/${name}@${digest}" -e "${name#library/}@${digest}" -e "${name}@${digest}" <<<"$repo_digests" \
+            || { echo "::error::pulled image is not recorded under ${digest}"; exit 1; }
+          echo "upstream digest: ${SRC}"
 
           docker tag "${SRC}" "${DST}"
 
@@ -60,6 +94,8 @@ jobs:
           docker push "${DST}"
           echo "::endgroup::"
 
-          # Sanity: the in-house tag should now resolve to the same content.
-          DST_DIGEST=$(docker image inspect "${DST}" -f '{{index .RepoDigests 0}}')
-          echo "mirror digest:   ${DST_DIGEST}"
+          # The mirror tag's manifest digest (single-platform image as pushed);
+          # differs from the multi-arch index digest above by design.
+          dst_digests=$(docker image inspect "${DST}" -f '{{range .RepoDigests}}{{println .}}{{end}}')
+          DST_DIGEST=$(grep -m1 -F "repo.anhonesthost.net/${DST_PATH}@" <<<"$dst_digests" || true)
+          echo "mirror digest:   ${DST_DIGEST:-<unknown>}"
