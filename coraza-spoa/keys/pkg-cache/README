@@ -1,0 +1,32 @@
+Trust material for the OPT-IN internal package cache (scripts/pkg-cache-repos.sh,
+docs/pkg-cache.md). Copied into images at /usr/local/share/pkg-cache/; nothing
+here is added to the system trust store.
+
+ca.crt                 "pkg-cache internal CA (CT130)", EC P-256, valid to 2036-10-18.
+                       NAME-CONSTRAINED to IP 192.168.1.40 and DNS
+                       pkg-cache.internal.cloud-hosting.io / pkg-cache.geekhome.local.
+                       SHA-256 fingerprint BB:5B:9A:08:05:ED:2F:58:83:92:D0:99:9D:11:0A:30:14:88:68:F0:F0:88:65:5E:94:0B:75:EB:C2:A2:BD:F3
+                       (private key lives only on CT130: /etc/pkgcache-ca/ca.key)
+RPM-GPG-KEY-EPEL-10    Fedora (epel10) 7D8D 15CB FC4E 6268 8591 FB26 33D9 8517 E37E D158
+                       fetched 2026-10-21 over HTTPS from dl.fedoraproject.org and
+                       mirror.math.princeton.edu (identical); fingerprint matches
+                       https://fedoraproject.org/security/
+RPM-GPG-KEY-remi2024   Remi's RPM repository 2024 CF1D F005 7CE8 5DFF 5B2F 2A37 C2FD 3B2C 2A09 48E4
+                       fetched 2026-10-21 over HTTPS from rpms.remirepo.net; byte-identical
+                       to the key shipped in remi-release-10.2-1.el10.remi. Not found on
+                       keys.openpgp.org / keyserver.ubuntu.com - confirm out of band.
+                       Remi rotates keys (remi2025, ...): when remi-release starts being
+                       signed by a new key, `release-install remi` fails loudly - add the
+                       new key here (and to pkg-cache-repos.sh).
+RPM-GPG-KEY-EPEL-9     Fedora (epel9) FF8A D134 4597 106E CE81 3B91 8A38 72BF 3228 467C
+                       fetched 2026-10-22 over HTTPS from dl.fedoraproject.org and
+                       mirror.math.princeton.edu (identical); used by `release-install epel`
+                       on EL9 images (cloud-memcached-container, cloud-haproxy-container).
+RPM-GPG-KEY-nodesource Nodesource Operations <operations@nodesource.com>
+                       242B 8138 31AF 0956 2B6C 46F7 6B88 DA4E 3AF2 8A14 (rsa4096, 2023-12-22)
+                       fetched 2026-10-22 over HTTPS from
+                       https://rpm.nodesource.com/gpgkey/ns-operations-public.key (the key
+                       NodeSource's own setup_N.x scripts reference); verified by dnf
+                       gpgcheck against the nodejs RPMs. Not on keys.openpgp.org /
+                       keyserver.ubuntu.com - confirm out of band. Used by
+                       `pkg-cache-repos.sh nodesource MAJOR` (cloud-node-container).

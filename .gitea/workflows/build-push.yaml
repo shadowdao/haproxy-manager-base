@@ -12,6 +12,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Internal package cache (CT130 pkg-cache; canonical docs: docs/pkg-cache.md
+      # in cloud-apache-container). Used ONLY if it answers over TLS with our
+      # pinned CA; otherwise (down, unreachable, bad/expired cert) this job builds
+      # from the upstream repositories exactly as before. The base image comes
+      # from the in-house registry (repo.anhonesthost.net, weekly digest-pinned
+      # mirror of Docker Hub - mirror-base-image.yaml), not docker.io, so the
+      # pkg-cache registry mirror is never used here: repos only.
+      - name: Probe package cache
+        id: pkgcache
+        run: |
+          url=""
+          if curl -fsS --max-time 5 --cacert keys/pkg-cache/ca.crt -o /dev/null https://192.168.1.40/; then url="https://192.168.1.40"; fi
+          echo "pkg-cache: repos=${url:-<unreachable: upstream>} registry-mirror=<not used: no docker.io base (base from repo.anhonesthost.net)>"
+          [ -n "$url" ] || echo "::warning::pkg-cache unreachable - building from upstream repositories"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -50,6 +66,7 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ steps.ver.outputs.version }}
+            PKG_CACHE=${{ steps.pkgcache.outputs.url }}
           # Three tags per registry: :latest (moving), :<version> (human-readable
           # release), :<sha> (immutable, guaranteed-unique rollback target).
           tags: |

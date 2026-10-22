@@ -21,6 +21,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Internal package cache (CT130 pkg-cache; canonical docs: docs/pkg-cache.md
+      # in cloud-apache-container). Used ONLY if it answers over TLS with our
+      # pinned CA; otherwise (down, unreachable, bad/expired cert) this job builds
+      # from the upstream repositories / default GOPROXY exactly as before. The
+      # build stages' base (golang:1.25) comes from the in-house registry
+      # (repo.anhonesthost.net, weekly digest-pinned mirror of Docker Hub -
+      # mirror-base-image.yaml) and the runtime base from gcr.io, not docker.io,
+      # so the pkg-cache registry mirror is never used here: repos + Go modules.
+      # The CA lives under coraza-spoa/ because that is this build's context.
+      - name: Probe package cache
+        id: pkgcache
+        run: |
+          url=""
+          if curl -fsS --max-time 5 --cacert coraza-spoa/keys/pkg-cache/ca.crt -o /dev/null https://192.168.1.40/; then url="https://192.168.1.40"; fi
+          echo "pkg-cache: repos=${url:-<unreachable: upstream>} registry-mirror=<not used: no docker.io base (base from repo.anhonesthost.net)>"
+          [ -n "$url" ] || echo "::warning::pkg-cache unreachable - building from upstream repositories"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -49,6 +67,8 @@ jobs:
           context: ./coraza-spoa
           platforms: linux/amd64
           push: true
+          build-args: |
+            PKG_CACHE=${{ steps.pkgcache.outputs.url }}
           tags: |
             repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa:latest
             ghcr.io/shadowdao/coraza-spoa:latest

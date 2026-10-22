@@ -18,23 +18,47 @@ ARG CORAZA_SPOA_VERSION=v0.7.1
 # weekly job.
 FROM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS build
 ARG CORAZA_SPOA_VERSION
+# OPTIONAL internal package cache, e.g. --build-arg PKG_CACHE=https://192.168.1.40
+# (CT130 pkg-cache, https only; CI sets it only after probing the cache with the
+# pinned CA). Unset = upstream Debian repositories and the default GOPROXY,
+# exactly as before. Go modules stay verified against go.sum / sum.golang.org
+# (GOSUMDB unchanged). Every RUN that rewrites ends with `restore`, which FAILS
+# the build if any reference to the cache is left. Only build stages use it;
+# nothing from here reaches the distroless runtime image except the binaries.
+# scripts/ + keys/pkg-cache/ in this directory are byte-identical copies of the
+# repo-root ones (this image's build context is ./coraza-spoa); canonical
+# source: cloud-apache-container (scripts/pkg-cache-repos.sh, docs/pkg-cache.md).
+ARG PKG_CACHE=
+COPY ./scripts/pkg-cache-repos.sh /usr/local/sbin/pkg-cache-repos.sh
+COPY ./keys/pkg-cache/ /usr/local/share/pkg-cache/
 WORKDIR /src
-RUN apt-get update \
+RUN /usr/local/sbin/pkg-cache-repos.sh apt \
+    && apt-get update \
     && apt-get install -y --no-install-recommends git \
+    && /usr/local/sbin/pkg-cache-repos.sh restore \
     && rm -rf /var/lib/apt/lists/*
+# The source itself is cloned from GitHub over HTTPS (not proxied).
 RUN git clone --depth 1 --branch "${CORAZA_SPOA_VERSION}" \
         https://github.com/corazawaf/coraza-spoa.git . \
+    && eval "$(/usr/local/sbin/pkg-cache-repos.sh go-env)" \
     && go mod download \
-    && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/coraza-spoa .
+    && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/coraza-spoa . \
+    && /usr/local/sbin/pkg-cache-repos.sh restore
 
 # Catalog extractor: walks the bundled CRS at build time and emits
 # rules-catalog.json so WHP's UI can render rule metadata without parsing
 # .conf files at runtime. Uses the SAME coraza-coreruleset version pin as
 # the coraza-spoa binary above (drift between the two would mislabel rules).
 FROM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS catalog
+# Same optional package cache as the build stage (module downloads only).
+ARG PKG_CACHE=
+COPY ./scripts/pkg-cache-repos.sh /usr/local/sbin/pkg-cache-repos.sh
+COPY ./keys/pkg-cache/ /usr/local/share/pkg-cache/
 WORKDIR /src
 COPY catalog-extractor/ .
-RUN go build -trimpath -o /out/catalog-extractor . \
+RUN eval "$(/usr/local/sbin/pkg-cache-repos.sh go-env)" \
+    && go build -trimpath -o /out/catalog-extractor . \
+    && /usr/local/sbin/pkg-cache-repos.sh restore \
     && /out/catalog-extractor > /out/rules-catalog.json
 
 # Distroless runtime: no shell, no package manager, no /tmp by default —
