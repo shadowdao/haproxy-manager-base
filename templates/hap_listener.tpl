@@ -616,6 +616,46 @@ frontend web
     http-request set-path /suspended if is_suspended_domain
     use_backend default-backend if is_suspended_domain
 {%- endif %}
+{%- if default_splash %}
+
+    # Default splash for traffic that is NOT routed to any site: the server's
+    # own hostname (registered cert-only, no backend), a bare IP, a stale or
+    # mistyped name. HAProxy answers it ITSELF with a static page and the
+    # request goes no further -- in particular it never reaches the Coraza
+    # SPOE call below.
+    #
+    # Why: `use_backend default-backend` does not short-circuit anything --
+    # HAProxy runs EVERY http-request rule (Coraza included) before it picks
+    # a backend. So the catch-all used to be WAF-inspected with the full
+    # server-wide rule set like customer traffic, and a browser visiting the
+    # server hostname also carries the control panel's cookies (cookies are
+    # not port-scoped: whp01:8443 cookies are sent to whp01:443). Anything
+    # Coraza matched there showed the WAF block page for a host that has no
+    # site behind it to protect. A fixed static reply has nothing to protect.
+    #
+    # "Routed" is decided from two lists generate_config() writes from the
+    # SAME domain rows it renders the routing ACLs from (exact names, and
+    # ".base" suffixes for wildcards), port stripped and lowercased. They
+    # are a SUPERSET of what routes -- the routing ACLs below compare the raw
+    # Host (port included) -- so a host that routes is never splashed; the
+    # worst a mismatch can do is send an unrouted request through the WAF to
+    # default-backend, which is the pre-splash behaviour. Both lists are part
+    # of the rollback set (_config_backup_pairs) so they cannot drift from
+    # the haproxy.cfg that is actually loaded.
+    #
+    # Kept OUT of the splash: ACME http-01 (the server hostname's own cert is
+    # issued through it), blocked IPs (blocked-ip page) and suspended hosts
+    # (suspended page). Rate limits, the IP block and the wp-* gates above
+    # still apply. "/" is 200 (monitors and humans), any other path 404 with
+    # the same page (what the old default page did for unknown paths).
+    # Disable with HAPROXY_DEFAULT_SPLASH=off (back to default-backend).
+    acl splash_routed_host req.hdr(host),field(1,:),lower -f /etc/haproxy/routed_hosts.list
+    acl splash_routed_host req.hdr(host),field(1,:),lower -m end -f /etc/haproxy/routed_wildcards.list
+    acl splash_acme path_beg /.well-known/acme-challenge/
+    acl splash_root path /
+    http-request return status 200 content-type "text/html; charset=utf-8" hdr cache-control "no-store" hdr x-content-type-options "nosniff" file /haproxy/errors/default-splash.html if !splash_routed_host !splash_acme !is_blocked_ip{% if suspension_enabled %} !is_suspended_domain{% endif %} splash_root
+    http-request return status 404 content-type "text/html; charset=utf-8" hdr cache-control "no-store" hdr x-content-type-options "nosniff" file /haproxy/errors/default-splash.html if !splash_routed_host !splash_acme !is_blocked_ip{% if suspension_enabled %} !is_suspended_domain{% endif %} !splash_root
+{%- endif %}
 
     # CVE-2026-109618 (GHSA-w8hw-w9fx-j79w, PHP "RCE via OOM corruption"),
     # vector (a): a multipart/form-data body with no declared length is not

@@ -135,6 +135,13 @@ BLOCKED_IPS_MAP_BACKUP_PATH = '/etc/haproxy/blocked_ips.map.backup'
 # while leaving a broken coraza-spoe.cfg behind still fails validation.
 CORAZA_SPOE_CONFIG_PATH = '/etc/haproxy/coraza-spoe.cfg'
 CORAZA_SPOE_BACKUP_PATH = '/etc/haproxy/coraza-spoe.cfg.backup'
+# Hosts the frontend routes to a site (default splash, hap_listener.tpl). The
+# paths are hardcoded in the template's `-f` ACLs, like blocked_ips.map, and
+# written by generate_config() from the same rows as the routing ACLs.
+ROUTED_HOSTS_PATH = '/etc/haproxy/routed_hosts.list'
+ROUTED_HOSTS_BACKUP_PATH = '/etc/haproxy/routed_hosts.list.backup'
+ROUTED_WILDCARDS_PATH = '/etc/haproxy/routed_wildcards.list'
+ROUTED_WILDCARDS_BACKUP_PATH = '/etc/haproxy/routed_wildcards.list.backup'
 HAPROXY_SOCKET_PATH = '/var/run/haproxy.sock'
 # HAProxy loads this path as a DIRECTORY (`bind ... ssl crt /etc/haproxy/certs`),
 # which means it tries to load EVERY file it finds in here. Nothing but final,
@@ -3148,6 +3155,14 @@ def generate_config():
         # handling.
         syslog_target = os.environ.get('HAPROXY_SYSLOG_TARGET', '172.18.0.1:514').strip()
 
+        # Default splash for unrouted hosts (server hostname, bare IP, unknown
+        # names) answered by HAProxy before the WAF -- see hap_listener.tpl.
+        # ON by default: it depends on no sidecar and only changes what an
+        # unrouted request sees. HAPROXY_DEFAULT_SPLASH=off restores the old
+        # default-backend page (WAF-inspected).
+        splash_raw = os.environ.get('HAPROXY_DEFAULT_SPLASH', '').strip().lower()
+        default_splash = splash_raw not in ('0', 'false', 'no', 'off')
+
         # Add Haproxy Default Headers
         default_headers = template_env.get_template('hap_header.tpl').render(
             cluster_secret = get_or_create_cluster_secret(),
@@ -3168,6 +3183,7 @@ def generate_config():
             crt_path = SSL_CERTS_DIR,
             coraza_spoe_backend = coraza_spoe_backend,
             suspension_enabled = suspension_enabled,
+            default_splash = default_splash,
         )
         config_parts.append(listener_block)
 
@@ -3176,7 +3192,10 @@ def generate_config():
         config_parts.append(letsencrypt_acl)
         config_acls = []
         config_backends = []
-        
+        # Every name a routing ACL is rendered for (default splash lists).
+        routed_hosts = []
+        routed_wildcards = []
+
         # Add default backend rule (will be used when no domain matches)
         default_rule = "    # Default backend for unmatched domains\n    default_backend default-backend\n"
         config_parts.append(default_rule)
@@ -3231,6 +3250,7 @@ def generate_config():
                     name=domain['backend_name']
                 )
                 config_acls.append(domain_acl)
+                routed_hosts.append(domain['domain'])
                 logger.info(f"Added ACL for domain: {domain['domain']}")
             except Exception as e:
                 logger.error(f"Error generating domain ACL for {domain['domain']}: {e}")
@@ -3257,6 +3277,7 @@ def generate_config():
                     base_domain=base_domain
                 )
                 config_acls.append(domain_acl)
+                routed_wildcards.append('.' + base_domain)
                 logger.info(f"Added wildcard ACL for domain: {domain['domain']}")
             except Exception as e:
                 logger.error(f"Error generating wildcard ACL for {domain['domain']}: {e}")
@@ -3317,6 +3338,14 @@ backend default-backend
             logger.info(f"Coraza SPOE engine config written to "
                         f"{CORAZA_SPOE_CONFIG_PATH} "
                         f"(SPOA target: {coraza_spoe_backend})")
+
+        # Routed-host lists for the default splash. Written on every render
+        # (also with the splash off, so turning it on later never meets a
+        # missing `-f` file, which is FATAL). Same render, same rows as the
+        # routing ACLs above, and in the rollback set, so the loaded
+        # haproxy.cfg and these lists always come from one generation.
+        write_config_atomically(ROUTED_HOSTS_PATH, render_routed_list(routed_hosts))
+        write_config_atomically(ROUTED_WILDCARDS_PATH, render_routed_list(routed_wildcards))
 
         config_content = '\n'.join(config_parts)
         logger.debug("Generated HAProxy configuration")
@@ -3401,6 +3430,28 @@ def _config_set_matches_backup():
     return True
 
 
+def render_routed_list(names):
+    """Pattern-file body for the default-splash routed-host ACLs.
+
+    One lowercased name per line, sorted and de-duplicated so an unchanged
+    fleet renders byte-identical files (create_backup() skips re-validation
+    when the live set equals the backup). A name containing whitespace cannot
+    be one pattern line (a newline would split it in two) and could not be a
+    working `hdr(host) -i` routing ACL either; it is dropped and logged at
+    ERROR, because a missing entry means the splash answers that host.
+    """
+    out = set()
+    for name in names:
+        clean = (name or '').strip().lower()
+        if not clean or any(c.isspace() for c in clean):
+            logger.error(f"default splash: cannot list routed host {name!r}; "
+                         "it will be answered by the splash page")
+            continue
+        out.add(clean)
+    body = ''.join(f'{n}\n' for n in sorted(out))
+    return '# Generated by haproxy_manager.generate_config() - do not edit\n' + body
+
+
 def _config_backup_pairs():
     """(live, backup) pairs forming one restorable config set.
 
@@ -3411,6 +3462,8 @@ def _config_backup_pairs():
         (HAPROXY_CONFIG_PATH, HAPROXY_BACKUP_PATH),
         (BLOCKED_IPS_MAP_PATH, BLOCKED_IPS_MAP_BACKUP_PATH),
         (CORAZA_SPOE_CONFIG_PATH, CORAZA_SPOE_BACKUP_PATH),
+        (ROUTED_HOSTS_PATH, ROUTED_HOSTS_BACKUP_PATH),
+        (ROUTED_WILDCARDS_PATH, ROUTED_WILDCARDS_BACKUP_PATH),
     )
 
 

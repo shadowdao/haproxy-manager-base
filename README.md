@@ -379,8 +379,75 @@ tail -f /var/log/haproxy-manager-errors.log
 | `HAPROXY_DEFAULT_PAGE_TITLE` | Title for the default page | Site Not Configured |
 | `HAPROXY_DEFAULT_MAIN_MESSAGE` | Main message on the default page | This domain has not been configured yet. Please contact your system administrator to set up this website. |
 | `HAPROXY_DEFAULT_SECONDARY_MESSAGE` | Secondary message on the default page | If you believe this is an error, please check the domain name and try again. |
+| `HAPROXY_DEFAULT_SPLASH` | `off` (or `0`/`false`/`no`) disables the default splash for unrouted hosts and restores the default-backend page below | on |
+
+## Default Splash (unrouted hosts)
+
+Since 2026.11.1, any request whose Host is **not routed to a site** -- the
+server's own hostname (registered cert-only, no backend), a bare IP, a stale
+or unknown name, a request with no Host at all -- is answered by HAProxy
+itself with the static page `errors/default-splash.html` (`http-request
+return ... file`): `200` for `/`, `404` with the same page for any other
+path, `cache-control: no-store`, `x-content-type-options: nosniff`. The page
+names no version, echoes nothing from the request (it is loaded with `file`,
+not `lf-file`), and links nowhere -- in particular not to the control panel.
+
+**Why.** `use_backend default-backend` does not short-circuit HAProxy's
+`http-request` rules, so the old catch-all was inspected by Coraza with the
+full server-wide rule set like customer traffic. A browser on
+`https://<server-hostname>/` also sends the control panel's cookies (cookies
+are not port-scoped, so `:8443` cookies go to `:443`), and anything Coraza
+matched there showed the WAF block page for a host with no site behind it.
+The splash rules sit before the SPOE call, so unrouted requests never reach
+the WAF; there is nothing behind them to protect.
+
+**What still applies / is kept out:** rate limits, the IP block (blocked IPs
+still get the blocked-ip page), the wp-* gates, and the multipart guard run
+first; `/.well-known/acme-challenge/` still reaches certbot (the server
+hostname's own certificate is issued through it); hosts in
+`suspended_domains.list` still get the suspended page. Configured sites,
+wildcards and their WAF inspection are unchanged. Plain HTTP on `:80` gets
+the splash too, not a redirect: an unknown name usually has no valid
+certificate, so a redirect would trade a clean page for a TLS warning.
+Over TLS the presented certificate is whatever SNI selects -- the
+hostname's own cert if one is issued, otherwise the default bundle.
+
+**How "routed" is decided.** `generate_config()` writes
+`/etc/haproxy/routed_hosts.list` (exact names) and
+`/etc/haproxy/routed_wildcards.list` (`.base` suffixes) from the same domain
+rows, in the same call, as the routing ACLs, and both are in the rollback set
+next to `haproxy.cfg`. The splash ACLs compare the Host port-stripped and
+lowercased, a superset of the routing ACLs (which compare the raw Host), so a
+host that routes is never splashed. Never hand-edit the lists; they are
+rewritten on every regeneration (also when the splash is off, so turning it
+on never meets a missing `-f` file).
+
+**Deploying to an existing host.** The page ships at
+`/haproxy/errors/default-splash.html` and the template under
+`/haproxy/templates/` -- both in the image, OUTSIDE the `/etc/haproxy` named
+volume, so the volume cannot shadow them. The lists live in the volume but are
+generated, not copied. So an image bump plus a recreate of the container is
+the whole deployment: on start `generate_config()` renders the new listener
+and writes both lists, then HAProxy loads them. Nothing to copy into the
+volume, no WHP-side change. Verify after the recreate:
+
+```bash
+docker exec haproxy-manager grep -c default-splash.html /etc/haproxy/haproxy.cfg   # 2
+docker exec haproxy-manager cat /etc/haproxy/routed_hosts.list                     # every site
+curl -sk -o /dev/null -w '%{http_code}\n' https://<server-hostname>/                # 200, splash
+curl -sk -o /dev/null -w '%{http_code}\n' https://<a-customer-site>/                 # unchanged
+```
+
+Rollback: recreate on the previous image tag, or set
+`HAPROXY_DEFAULT_SPLASH=off` and regenerate.
+
+Covered by `scripts/test-default-splash.py` (template order/conditions, the
+page, list generation) and the `splash-off` scenario of
+`scripts/validate-rendered-config.py`.
 
 ## Default Backend Configuration
+
+With the default splash on (above), unrouted hosts no longer reach this page; it still serves the blocked-IP and suspended pages, and serves unrouted hosts again when `HAPROXY_DEFAULT_SPLASH=off`.
 
 When a domain is accessed that hasn't been configured in HAProxy, the system will serve a default page instead of showing an error. This default page:
 
