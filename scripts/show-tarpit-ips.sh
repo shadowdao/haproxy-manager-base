@@ -12,9 +12,9 @@
 #
 # The stick table also keeps NO history, so nothing in it can identify who was
 # tarpitted. Real enforcement events live in the access log ON THE DOCKER HOST
-# at /var/log/haproxy.log (it does not exist inside this container):
-#   grep -aE ' (PT|PR)--' /var/log/haproxy.log | tail -20   # tarpit / deny
-#   grep -aE ' (429|403) ' /var/log/haproxy.log | tail -20  # rate-limit / block
+# at /var/log/haproxy/access.log (inside this container since 2026.11.2):
+#   grep -aE ' (PT|PR)--' /var/log/haproxy/access.log | tail -20   # tarpit / deny
+#   grep -aE ' (429|403) ' /var/log/haproxy/access.log | tail -20  # rate-limit / block
 #
 # What IS knowable from the stick table — the current per-IP rates — is printed
 # by show-edge-ip-rates.sh, which this shim now runs.
@@ -25,8 +25,8 @@ cat >&2 <<'NOTE'
 NOTE: show-tarpit-ips.sh is deprecated and cannot report tarpits.
       The HAProxy stick table stores no history and no gpc0/gpc1 counters, so
       the old "Scan Count"/"BLOCKED" columns were fabricated numbers.
-      Actual tarpit/deny events are in /var/log/haproxy.log ON THE HOST:
-        grep -aE ' (PT|PR)--' /var/log/haproxy.log | tail -20
+      Actual tarpit/deny events are in /var/log/haproxy/access.log (in this container since 2026.11.2):
+        grep -aE ' (PT|PR)--' /var/log/haproxy/access.log | tail -20
       Running show-edge-ip-rates.sh instead (current rates, real values):
 
 NOTE

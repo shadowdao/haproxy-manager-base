@@ -138,6 +138,9 @@ CORAZA_SPOE_BACKUP_PATH = '/etc/haproxy/coraza-spoe.cfg.backup'
 # Hosts the frontend routes to a site (default splash, hap_listener.tpl). The
 # paths are hardcoded in the template's `-f` ACLs, like blocked_ips.map, and
 # written by generate_config() from the same rows as the routing ACLs.
+# HAProxy's access-log target: the receiver's socket, CHROOT-RELATIVE
+# (hap_header.tpl `chroot /var/lib/haproxy`), i.e. /var/lib/haproxy/log.sock.
+DEFAULT_LOG_TARGET = '/log.sock'
 ROUTED_HOSTS_PATH = '/etc/haproxy/routed_hosts.list'
 ROUTED_HOSTS_BACKUP_PATH = '/etc/haproxy/routed_hosts.list.backup'
 ROUTED_WILDCARDS_PATH = '/etc/haproxy/routed_wildcards.list'
@@ -3145,15 +3148,14 @@ def generate_config():
                 except Exception as e:
                     logger.error(f"Failed to create {suspended_list_path}: {e}")
 
-        # Access-log destination for the `log` line in the global section.
-        # Default 172.18.0.1:514 is the docker bridge gateway for WHP's
-        # `client-net`, i.e. the host, where rsyslog's imudp listener is bound
-        # by setup-haproxy-logrotate.sh. Overridable so this image stays usable
-        # on standalone/home deployments with a different bridge subnet or a
-        # remote log collector -- set HAPROXY_SYSLOG_TARGET to `<ip>:<port>`.
-        # UDP, so an absent listener drops log lines and never affects request
-        # handling.
-        syslog_target = os.environ.get('HAPROXY_SYSLOG_TARGET', '172.18.0.1:514').strip()
+        # Access-log destination for the `log` line in the global section:
+        # the in-container receiver's UNIX socket (scripts/haproxy-log-receiver.py),
+        # given relative to haproxy's chroot (/var/lib/haproxy) -- see
+        # hap_header.tpl. HAPROXY_SYSLOG_TARGET overrides it (`<ip>:<port>` for
+        # a remote collector). The old default, 172.18.0.1:514 (host rsyslog on
+        # the docker bridge), had no listener on the fleet.
+        syslog_target = (os.environ.get('HAPROXY_SYSLOG_TARGET', '').strip()
+                         or DEFAULT_LOG_TARGET)
 
         # Default splash for unrouted hosts (server hostname, bare IP, unknown
         # names) answered by HAProxy before the WAF -- see hap_listener.tpl.

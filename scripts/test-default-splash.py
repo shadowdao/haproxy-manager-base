@@ -67,7 +67,7 @@ def render_listener(**kw):
 def return_rules(cfg):
     return [l.strip() for l in cfg.splitlines()
             if l.strip().startswith('http-request return')
-            and 'default-splash.html' in l]
+            and ('default-splash.html' in l or 'robots-unrouted.txt' in l)]
 
 
 class Template(unittest.TestCase):
@@ -77,19 +77,32 @@ class Template(unittest.TestCase):
         self.assertNotIn('default-splash', cfg)
         self.assertNotIn('splash_routed_host', cfg)
 
-    def test_two_return_rules_root_200_other_404(self):
+    def test_404_everywhere_robots_txt_200(self):
+        """Josh 2026-11-08: unrouted hosts are 404 on EVERY path (incl. "/")
+        so search engines never index the server IP/hostname; /robots.txt is
+        the one 200 and disallows everything."""
         rules = return_rules(render_listener())
         self.assertEqual(len(rules), 2, rules)
-        self.assertTrue(rules[0].startswith('http-request return status 200 '))
-        self.assertTrue(rules[0].endswith(' splash_root'))
-        self.assertTrue(rules[1].startswith('http-request return status 404 '))
-        self.assertTrue(rules[1].endswith(' !splash_root'))
+        robots, splash = rules
+        self.assertTrue(robots.startswith('http-request return status 200 content-type "text/plain'))
+        self.assertIn(' file /haproxy/errors/robots-unrouted.txt ', robots)
+        self.assertTrue(robots.endswith(' splash_robots'))
+        self.assertTrue(splash.startswith('http-request return status 404 content-type "text/html'))
+        self.assertTrue(splash.endswith(' !splash_robots'))
+        self.assertNotIn('splash_root', render_listener())
+        self.assertRegex(render_listener(), r'acl splash_robots path /robots\.txt\n')
+
+    def test_noindex_and_no_store_headers_on_both(self):
+        for rule in return_rules(render_listener()):
+            self.assertIn('hdr x-robots-tag "noindex, nofollow, noarchive"', rule)
+            self.assertIn('hdr cache-control "no-store"', rule)
+            self.assertIn('hdr x-content-type-options "nosniff"', rule)
 
     def test_static_file_not_lf_file(self):
         """`file` (verbatim), never `lf-file`: nothing from the request may be
         expanded into the page (Host echo, unique-id, ...)."""
         for rule in return_rules(render_listener()):
-            self.assertIn(' file /haproxy/errors/default-splash.html ', rule)
+            self.assertRegex(rule, r' file /haproxy/errors/(default-splash\.html|robots-unrouted\.txt) ')
             self.assertNotIn('lf-file', rule)
 
     def test_conditions_keep_acme_blocked_and_suspended_out(self):
@@ -118,7 +131,7 @@ class Template(unittest.TestCase):
     def test_splash_runs_before_waf_and_after_ip_block_and_suspension(self):
         for susp in (False, True):
             cfg = render_listener(suspension_enabled=susp)
-            first_return = cfg.index('file /haproxy/errors/default-splash.html')
+            first_return = cfg.index('file /haproxy/errors/robots-unrouted.txt')
             self.assertLess(first_return, cfg.index('http-request send-spoe-group coraza'))
             self.assertLess(first_return, cfg.index('filter spoe engine coraza'))
             self.assertGreater(first_return, cfg.index('acl is_blocked_ip'))
@@ -148,6 +161,13 @@ class Page(unittest.TestCase):
         self.assertNotRegex(self.text, r'20\d\d\.\d+\.\d+')
         self.assertNotIn('{{', self.text)
         self.assertNotIn('%[', self.text)
+
+
+class Robots(unittest.TestCase):
+
+    def test_robots_disallows_everything(self):
+        with open(os.path.join(MODULE_DIR, 'errors', 'robots-unrouted.txt')) as fh:
+            self.assertEqual(fh.read(), 'User-agent: *\nDisallow: /\n')
 
 
 class RoutedLists(unittest.TestCase):
@@ -247,6 +267,29 @@ class GenerateConfigWritesLists(unittest.TestCase):
         for base in re.findall(r'acl \S+-acl hdr_end\(host\) -i (\S+)', cfg):
             self.assertIn(base.lower(), self._lines(hm.ROUTED_WILDCARDS_PATH))
         self.assertIn('default-splash.html', cfg)
+
+    def test_default_log_target_is_the_in_container_socket(self):
+        """Access log goes to the receiver's UNIX socket (chroot-relative),
+        never the old host bridge target 172.18.0.1:514."""
+        os.environ.pop('HAPROXY_SYSLOG_TARGET', None)
+        hm.generate_config()
+        with open(hm.HAPROXY_CONFIG_PATH) as fh:
+            cfg = fh.read()
+        self.assertRegex(cfg, r'\n    log         /log\.sock len 2048 format rfc5424 local2 info\n')
+        self.assertIn('chroot      /var/lib/haproxy', cfg)
+        log_lines = [l for l in cfg.splitlines() if l.strip().startswith('log ')
+                     and 'global' not in l]
+        self.assertEqual(len(log_lines), 1, log_lines)
+        self.assertNotIn('172.18.0.1', log_lines[0])
+
+    def test_log_target_env_override(self):
+        os.environ['HAPROXY_SYSLOG_TARGET'] = '192.0.2.5:514'
+        try:
+            hm.generate_config()
+        finally:
+            os.environ.pop('HAPROXY_SYSLOG_TARGET', None)
+        with open(hm.HAPROXY_CONFIG_PATH) as fh:
+            self.assertIn('log         192.0.2.5:514 len 2048', fh.read())
 
     def test_lists_written_even_with_splash_off(self):
         os.environ['HAPROXY_DEFAULT_SPLASH'] = 'off'

@@ -646,15 +646,16 @@ frontend web
     # Kept OUT of the splash: ACME http-01 (the server hostname's own cert is
     # issued through it), blocked IPs (blocked-ip page) and suspended hosts
     # (suspended page). Rate limits, the IP block and the wp-* gates above
-    # still apply. "/" is 200 (monitors and humans), any other path 404 with
-    # the same page (what the old default page did for unknown paths).
+    # still apply. EVERY path is 404 with the same page, plus
+    # X-Robots-Tag noindex and /robots.txt "Disallow: /", so search engines
+    # never index the server's IP or hostname as a site.
     # Disable with HAPROXY_DEFAULT_SPLASH=off (back to default-backend).
     acl splash_routed_host req.hdr(host),field(1,:),lower -f /etc/haproxy/routed_hosts.list
     acl splash_routed_host req.hdr(host),field(1,:),lower -m end -f /etc/haproxy/routed_wildcards.list
     acl splash_acme path_beg /.well-known/acme-challenge/
-    acl splash_root path /
-    http-request return status 200 content-type "text/html; charset=utf-8" hdr cache-control "no-store" hdr x-content-type-options "nosniff" file /haproxy/errors/default-splash.html if !splash_routed_host !splash_acme !is_blocked_ip{% if suspension_enabled %} !is_suspended_domain{% endif %} splash_root
-    http-request return status 404 content-type "text/html; charset=utf-8" hdr cache-control "no-store" hdr x-content-type-options "nosniff" file /haproxy/errors/default-splash.html if !splash_routed_host !splash_acme !is_blocked_ip{% if suspension_enabled %} !is_suspended_domain{% endif %} !splash_root
+    acl splash_robots path /robots.txt
+    http-request return status 200 content-type "text/plain; charset=utf-8" hdr cache-control "no-store" hdr x-robots-tag "noindex, nofollow, noarchive" hdr x-content-type-options "nosniff" file /haproxy/errors/robots-unrouted.txt if !splash_routed_host !splash_acme !is_blocked_ip{% if suspension_enabled %} !is_suspended_domain{% endif %} splash_robots
+    http-request return status 404 content-type "text/html; charset=utf-8" hdr cache-control "no-store" hdr x-robots-tag "noindex, nofollow, noarchive" hdr x-content-type-options "nosniff" file /haproxy/errors/default-splash.html if !splash_routed_host !splash_acme !is_blocked_ip{% if suspension_enabled %} !is_suspended_domain{% endif %} !splash_robots
 {%- endif %}
 
     # CVE-2026-109618 (GHSA-w8hw-w9fx-j79w, PHP "RCE via OOM corruption"),

@@ -106,6 +106,7 @@ RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
  && python3 /haproxy/scripts/test-trusted-proxy-gate.py \
  && python3 /haproxy/scripts/test-xmlrpc-rate-limit.py \
  && python3 /haproxy/scripts/test-default-splash.py \
+ && python3 /haproxy/scripts/test-access-log-receiver.py \
  && python3 /haproxy/scripts/test-config-rollback.py \
  && python3 /haproxy/scripts/test-cert-write-safety.py \
  && python3 /haproxy/scripts/test-cert-scripts.py \
@@ -113,7 +114,7 @@ RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
  && python3 /haproxy/scripts/test-gunicorn-socket-timeouts.py \
  && python3 /haproxy/scripts/validate-rendered-config.py
 # Create log directories
-RUN mkdir -p /var/log && touch /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
+RUN mkdir -p /var/log/haproxy && touch /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
 RUN chmod 755 /var/log/haproxy-manager.log /var/log/haproxy-manager-errors.log
 # Set up cron for certificate renewal with proper permissions and environment
 RUN mkdir -p /var/spool/cron/crontabs && \

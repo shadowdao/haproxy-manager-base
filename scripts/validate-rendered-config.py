@@ -130,6 +130,7 @@ STUB_FILES = {
     '/haproxy/errors/403-waf.html': '<html><body>blocked %[unique-id]</body></html>\n',
     # `file` on the default-splash return rules; loaded at parse time too.
     '/haproxy/errors/default-splash.html': '<html><body>splash</body></html>\n',
+    '/haproxy/errors/robots-unrouted.txt': 'User-agent: *\nDisallow: /\n',
 }
 
 # (suspension_enabled, coraza_spoe_backend) combinations to render + validate.

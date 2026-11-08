@@ -383,12 +383,17 @@ tail -f /var/log/haproxy-manager-errors.log
 
 ## Default Splash (unrouted hosts)
 
-Since 2026.11.1, any request whose Host is **not routed to a site** -- the
+Since 2026.11.1 (404-everywhere + robots since 2026.11.2), any request whose Host is **not routed to a site** -- the
 server's own hostname (registered cert-only, no backend), a bare IP, a stale
 or unknown name, a request with no Host at all -- is answered by HAProxy
 itself with the static page `errors/default-splash.html` (`http-request
-return ... file`): `200` for `/`, `404` with the same page for any other
-path, `cache-control: no-store`, `x-content-type-options: nosniff`. The page
+return ... file`): `404` on EVERY path (including `/`) so search engines never
+index the server's IP or hostname as a site, with `cache-control: no-store`,
+`x-robots-tag: noindex, nofollow, noarchive` and `x-content-type-options:
+nosniff`; `/robots.txt` is `200 text/plain` `User-agent: *` / `Disallow: /`
+(`errors/robots-unrouted.txt`). Monitors pointed at the bare server hostname
+on 80/443 must accept 404 (WHP's own probes -- healthcheck.sh, the watchdog --
+accept any status). The page
 names no version, echoes nothing from the request (it is loaded with `file`,
 not `lf-file`), and links nowhere -- in particular not to the control panel.
 
@@ -434,7 +439,8 @@ volume, no WHP-side change. Verify after the recreate:
 ```bash
 docker exec haproxy-manager grep -c default-splash.html /etc/haproxy/haproxy.cfg   # 2
 docker exec haproxy-manager cat /etc/haproxy/routed_hosts.list                     # every site
-curl -sk -o /dev/null -w '%{http_code}\n' https://<server-hostname>/                # 200, splash
+curl -skI https://<server-hostname>/                       # 404 + x-robots-tag noindex
+curl -sk https://<server-hostname>/robots.txt              # User-agent: * / Disallow: /
 curl -sk -o /dev/null -w '%{http_code}\n' https://<a-customer-site>/                 # unchanged
 ```
 
@@ -444,6 +450,47 @@ Rollback: recreate on the previous image tag, or set
 Covered by `scripts/test-default-splash.py` (template order/conditions, the
 page, list generation) and the `splash-off` scenario of
 `scripts/validate-rendered-config.py`.
+
+## Access Log (in-container, since 2026.11.2)
+
+HAProxy logs (`log /log.sock ... format rfc5424`, `hap_header.tpl`) to a UNIX
+datagram socket inside its chroot (`/var/lib/haproxy/log.sock`).
+`scripts/haproxy-log-receiver.py`, started and supervised by `start-up.sh` (a
+restart loop: back within ~2 s), writes one line per request to
+`/var/log/haproxy/access.log`, rotated at 40 MB with 4 gzip generations
+(worst case 200 MB; `HAPROXY_ACCESS_LOG_MAX_BYTES`, `HAPROXY_ACCESS_LOG_BACKUPS`).
+No network listener anywhere. Fields: client/real IP (`cip=`), Host, status,
+termination state, request id, UA, SNI, HTTP version, WAF body stamp and the
+Coraza `wrule=/wrules=/wscore=` fields (unchanged `log-format`).
+
+* **Never blocks HAProxy.** Sends are non-blocking: a dead or stalled receiver,
+  or a full disk, only drops log lines (counted as `DroppedLogs` in
+  `echo "@1 show info" | socat stdio /tmp/haproxy-cli`). Lab: with the
+  receiver SIGSTOPped, 2500/2500 requests still answered 200 in ~1 s;
+  1025 lines queued, 1475 dropped and counted.
+* **Not in `docker logs`.** The receiver prints no log lines (WHP's AI log
+  monitor reads `docker logs haproxy-manager`; a per-request firehose there
+  would storm it). Only its start line and rate-limited errors go to stderr.
+* **Persistence.** Mount a named volume at `/var/log/haproxy` (WHP:
+  `-v haproxy-logs:/var/log/haproxy`) or the log resets on every recreate.
+  Give the container `--sysctl net.unix.max_dgram_qlen=1024` (a netns starts
+  at 10) for burst headroom.
+* `HAPROXY_SYSLOG_TARGET=<ip>:<port>` still overrides the target for a remote
+  collector. The old default `172.18.0.1:514` (host rsyslog) is gone.
+
+Reading it:
+
+```bash
+docker exec haproxy-manager tail -f /var/log/haproxy/access.log
+docker exec haproxy-manager grep ' 403 ' /var/log/haproxy/access.log | tail
+docker exec haproxy-manager sh -c 'zcat /var/log/haproxy/access.log.*.gz' | grep <request-id>
+docker cp haproxy-manager:/var/log/haproxy/ ./edge-logs/    # or the volume's _data dir on the host
+```
+
+Rollout: image bump + recreate with the volume and sysctl (WHP's
+`lib-edge-container.sh` adds both). The receiver, its script and the template
+are in the image, outside the `/etc/haproxy` named volume, so nothing can be
+shadowed; `haproxy.cfg` is regenerated on start with the new `log` line.
 
 ## Default Backend Configuration
 

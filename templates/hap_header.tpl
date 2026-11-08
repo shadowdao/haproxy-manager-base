@@ -2,42 +2,33 @@
 # Global settings
 #---------------------------------------------------------------------
 global
-    # ACCESS LOG DESTINATION.
+    # ACCESS LOG DESTINATION: a UNIX datagram socket INSIDE this container.
     #
-    # This used to be `log 127.0.0.1 local2`, which was a silent black hole:
-    # 127.0.0.1 is the CONTAINER's own loopback, nothing has ever listened on
-    # udp/514 in the container netns, and there is no /dev/log in the image.
-    # Every access log line -- ~1.5M/day across the whole edge -- was written
-    # to a socket with no receiver and dropped. Nothing errored, nothing
-    # warned, and `haproxy -c` was perfectly happy. The cost only shows up
-    # during an incident: per-IP 429s, tarpits, wp-admin gate redirects,
-    # WAF 403s and `silent-drop`s left no record anywhere, so the edge could
-    # not be asked what it had rejected. Only aggregate stick-table counters
-    # survived.
+    # scripts/haproxy-log-receiver.py (supervised by start-up.sh) reads it and
+    # writes a size-capped, rotating /var/log/haproxy/access.log in the
+    # haproxy-logs volume. No network listener anywhere.
     #
-    # Now points at the DOCKER BRIDGE GATEWAY, where the host's rsyslog has an
-    # imudp listener bound (installed idempotently by WHP's
-    # setup-haproxy-logrotate.sh, which also writes the logrotate stanza).
-    # The host writes local2 to /var/log/haproxy.log and stops it there, so it
-    # does not also flood /var/log/messages or the Graylog forwarder.
+    # History: `log 127.0.0.1 local2` was a black hole (nothing listened in
+    # the container netns); its successor, the docker bridge gateway
+    # 172.18.0.1:514 with a host rsyslog imudp listener, had no listener on
+    # the fleet either (probable cause, not measured: rsyslog binds that
+    # address once at boot, before docker has created the bridge, and does
+    # not retry). Either way per-IP
+    # 429s, tarpits, gate redirects and WAF 403s left no record.
     #
-    # WHY NOT `log stdout format raw local0`: it is INCOMPATIBLE with the
-    # `daemon` keyword below, and incompatible SILENTLY. Verified on the
-    # pinned 3.0.11 binary: with `daemon` set, a `log stdout` config serves
-    # traffic normally and emits ZERO log lines, and `haproxy -c` returns 0
-    # with no error and no warning -- so the CI config gate
-    # (scripts/validate-rendered-config.py) cannot catch it either. Making it
-    # work means dropping `daemon` / adding -db so haproxy stays in the
-    # foreground, which in turn breaks the three synchronous
-    # `subprocess.run(['haproxy', '-W', ...], check=True)` launch sites in
-    # haproxy_manager.py (they would block until the 180s timeout and then be
-    # killed). That is a change to the exact code path whose failure mode is
-    # "container Up, ports 80/443 never bound, every site down, /health still
-    # 200". Not worth it for a logging change.
+    # WHY NOT `log stdout`: silently emits NOTHING with `daemon` (below) on
+    # the pinned 3.0.11 (`haproxy -c` still passes), and dropping `daemon`
+    # breaks the synchronous `haproxy -W` launch sites in haproxy_manager.py.
+    # Also, `docker logs haproxy-manager` feeds WHP's AI log monitor, which
+    # must not get a per-request firehose.
     #
-    # UDP means a dead listener degrades to dropped log lines, never to a
-    # stalled or failing request path -- the correct failure direction for an
-    # edge fronting ~60 customer sites.
+    # The path is relative to the `chroot` below: HAProxy resolves it after
+    # chrooting, so `/log.sock` here is /var/lib/haproxy/log.sock on disk,
+    # which is where the receiver binds (HAPROXY_LOG_SOCKET).
+    #
+    # Sends are non-blocking: a dead receiver or a full socket buffer drops
+    # log lines, never stalls a request. HAPROXY_SYSLOG_TARGET still
+    # overrides the target (`<ip>:<port>` for a remote collector).
     #
     # len 2048 accommodates the enriched log-format in hap_listener.tpl
     # (URL + User-Agent + UUID); the default 1024 would truncate long ones.

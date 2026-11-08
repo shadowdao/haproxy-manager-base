@@ -20,13 +20,13 @@
 #   against.
 #
 # Usage: monitor-attacks.sh [live]
-# Env:   LOG_FILE=<path>  access log to read (default /var/log/haproxy.log)
+# Env:   LOG_FILE=<path>  access log to read (default /var/log/haproxy/access.log)
 #        LOG_LINES=<n>    how many trailing log lines to scan (default 500)
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="${LOG_FILE:-/var/log/haproxy.log}"
+LOG_FILE="${LOG_FILE:-/var/log/haproxy/access.log}"
 LOG_LINES="${LOG_LINES:-500}"
 
 # --- Section 1: current rates (real stick-table data) -----------------------
@@ -47,12 +47,12 @@ show_recent_blocks() {
   syslog on the DOCKER HOST, and the file lives on the host, not in here.
   Read it from the host instead:
 
-    grep -aE ' (PT|PR)--' /var/log/haproxy.log | tail -20   # tarpit / deny
-    grep -aE ' (429|403) ' /var/log/haproxy.log | tail -20  # rate-limited / blocked
-    grep -a 'cip=<IP>'  /var/log/haproxy.log | tail -50     # one client IP
-    grep -a 'id=<uuid>' /var/log/haproxy.log                # one request reference
+    grep -aE ' (PT|PR)--' /var/log/haproxy/access.log | tail -20   # tarpit / deny
+    grep -aE ' (429|403) ' /var/log/haproxy/access.log | tail -20  # rate-limited / blocked
+    grep -a 'cip=<IP>'  /var/log/haproxy/access.log | tail -50     # one client IP
+    grep -a 'id=<uuid>' /var/log/haproxy/access.log                # one request reference
                                                             # (the UUID on the block page)
-    tail -f /var/log/haproxy.log | grep -aE ' (PT|PR)--'    # live
+    tail -f /var/log/haproxy/access.log | grep -aE ' (PT|PR)--'    # live
 
   Or point this script at a copy:  LOG_FILE=/path/to/haproxy.log $0
 MSG
