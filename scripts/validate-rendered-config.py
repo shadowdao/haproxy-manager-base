@@ -128,6 +128,9 @@ STUB_FILES = {
     # `lf-file` on the Coraza deny rule; loaded at parse time. Present in the
     # image (COPY errors /haproxy/errors), stubbed for anything else.
     '/haproxy/errors/403-waf.html': '<html><body>blocked %[unique-id]</body></html>\n',
+    # `file` on the default-splash return rules; loaded at parse time too.
+    '/haproxy/errors/default-splash.html': '<html><body>splash</body></html>\n',
+    '/haproxy/errors/robots-unrouted.txt': 'User-agent: *\nDisallow: /\n',
 }
 
 # (suspension_enabled, coraza_spoe_backend) combinations to render + validate.
@@ -136,6 +139,12 @@ SCENARIOS = (
     ('full', {
         'HAPROXY_SUSPENSION_ENABLED': 'true',
         'HAPROXY_CORAZA_SPOE_BACKEND': '127.0.0.1:9000',
+    }),
+    # The default splash is ON unless switched off; render the off shape too.
+    ('splash-off', {
+        'HAPROXY_SUSPENSION_ENABLED': 'true',
+        'HAPROXY_CORAZA_SPOE_BACKEND': '127.0.0.1:9000',
+        'HAPROXY_DEFAULT_SPLASH': 'off',
     }),
 )
 
@@ -298,7 +307,8 @@ def render(scenario_name, env_overrides, workdir):
     seed_database(os.path.join(scenario_dir, 'haproxy_config.db'))
 
     saved_env = {}
-    for key in ('HAPROXY_SUSPENSION_ENABLED', 'HAPROXY_CORAZA_SPOE_BACKEND'):
+    for key in ('HAPROXY_SUSPENSION_ENABLED', 'HAPROXY_CORAZA_SPOE_BACKEND',
+                'HAPROXY_DEFAULT_SPLASH'):
         saved_env[key] = os.environ.pop(key, None)
     os.environ.update(env_overrides)
 
@@ -330,6 +340,8 @@ def assert_scenario_branches(scenario_name, config_path, env_overrides):
                        'HAPROXY_SUSPENSION_ENABLED' in env_overrides),
         'coraza': ('filter spoe engine coraza',
                    'HAPROXY_CORAZA_SPOE_BACKEND' in env_overrides),
+        'splash': ('file /haproxy/errors/default-splash.html',
+                   env_overrides.get('HAPROXY_DEFAULT_SPLASH') != 'off'),
     }
     for label, (needle, should_be_present) in expected.items():
         present = needle in text

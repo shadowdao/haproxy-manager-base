@@ -55,6 +55,24 @@ if [ ! -f /etc/haproxy/wpadmin_gate_exempt.list ]; then
     fi
 fi
 
+# HAProxy access log receiver (see scripts/haproxy-log-receiver.py and the
+# `log` line in hap_header.tpl). HAProxy sends datagrams to a UNIX socket
+# inside its chroot; this process writes them to a size-capped, rotating
+# /var/log/haproxy/access.log (WHP mounts the haproxy-logs volume there).
+# Started BEFORE init.py so haproxy's first lines land. Supervised by a
+# restart loop: if it dies it is back within 2s, and while it is down HAProxy
+# just drops log lines (non-blocking sends), it never blocks on them.
+# stdout is discarded on purpose -- it never prints log lines, and
+# `docker logs` must not carry a per-request firehose (WHP's AI monitor reads
+# it); its rare status/error lines go to stderr.
+mkdir -p /var/log/haproxy /var/lib/haproxy
+(
+    while true; do
+        python /haproxy/scripts/haproxy-log-receiver.py >/dev/null || true
+        sleep 2
+    done
+) &
+
 cron &
 
 # Phase 1: container init

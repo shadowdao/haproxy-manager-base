@@ -379,8 +379,122 @@ tail -f /var/log/haproxy-manager-errors.log
 | `HAPROXY_DEFAULT_PAGE_TITLE` | Title for the default page | Site Not Configured |
 | `HAPROXY_DEFAULT_MAIN_MESSAGE` | Main message on the default page | This domain has not been configured yet. Please contact your system administrator to set up this website. |
 | `HAPROXY_DEFAULT_SECONDARY_MESSAGE` | Secondary message on the default page | If you believe this is an error, please check the domain name and try again. |
+| `HAPROXY_DEFAULT_SPLASH` | `off` (or `0`/`false`/`no`) disables the default splash for unrouted hosts and restores the default-backend page below | on |
+
+## Default Splash (unrouted hosts)
+
+Since 2026.11.1 (404-everywhere + robots since 2026.11.2), any request whose Host is **not routed to a site** -- the
+server's own hostname (registered cert-only, no backend), a bare IP, a stale
+or unknown name, a request with no Host at all -- is answered by HAProxy
+itself with the static page `errors/default-splash.html` (`http-request
+return ... file`): `404` on EVERY path (including `/`) so search engines never
+index the server's IP or hostname as a site, with `cache-control: no-store`,
+`x-robots-tag: noindex, nofollow, noarchive` and `x-content-type-options:
+nosniff`; `/robots.txt` is `200 text/plain` `User-agent: *` / `Disallow: /`
+(`errors/robots-unrouted.txt`). Monitors pointed at the bare server hostname
+on 80/443 must accept 404 (WHP's own probes -- healthcheck.sh, the watchdog --
+accept any status). The page
+names no version, echoes nothing from the request (it is loaded with `file`,
+not `lf-file`), and links nowhere -- in particular not to the control panel.
+
+**Why.** `use_backend default-backend` does not short-circuit HAProxy's
+`http-request` rules, so the old catch-all was inspected by Coraza with the
+full server-wide rule set like customer traffic. A browser on
+`https://<server-hostname>/` also sends the control panel's cookies (cookies
+are not port-scoped, so `:8443` cookies go to `:443`), and anything Coraza
+matched there showed the WAF block page for a host with no site behind it.
+The splash rules sit before the SPOE call, so unrouted requests never reach
+the WAF; there is nothing behind them to protect.
+
+**What still applies / is kept out:** rate limits, the IP block (blocked IPs
+still get the blocked-ip page), the wp-* gates, and the multipart guard run
+first; `/.well-known/acme-challenge/` still reaches certbot (the server
+hostname's own certificate is issued through it); hosts in
+`suspended_domains.list` still get the suspended page. Configured sites,
+wildcards and their WAF inspection are unchanged. Plain HTTP on `:80` gets
+the splash too, not a redirect: an unknown name usually has no valid
+certificate, so a redirect would trade a clean page for a TLS warning.
+Over TLS the presented certificate is whatever SNI selects -- the
+hostname's own cert if one is issued, otherwise the default bundle.
+
+**How "routed" is decided.** `generate_config()` writes
+`/etc/haproxy/routed_hosts.list` (exact names) and
+`/etc/haproxy/routed_wildcards.list` (`.base` suffixes) from the same domain
+rows, in the same call, as the routing ACLs, and both are in the rollback set
+next to `haproxy.cfg`. The splash ACLs compare the Host port-stripped and
+lowercased, a superset of the routing ACLs (which compare the raw Host), so a
+host that routes is never splashed. Never hand-edit the lists; they are
+rewritten on every regeneration (also when the splash is off, so turning it
+on never meets a missing `-f` file).
+
+**Deploying to an existing host.** The page ships at
+`/haproxy/errors/default-splash.html` and the template under
+`/haproxy/templates/` -- both in the image, OUTSIDE the `/etc/haproxy` named
+volume, so the volume cannot shadow them. The lists live in the volume but are
+generated, not copied. So an image bump plus a recreate of the container is
+the whole deployment: on start `generate_config()` renders the new listener
+and writes both lists, then HAProxy loads them. Nothing to copy into the
+volume, no WHP-side change. Verify after the recreate:
+
+```bash
+docker exec haproxy-manager grep -c default-splash.html /etc/haproxy/haproxy.cfg   # 2
+docker exec haproxy-manager cat /etc/haproxy/routed_hosts.list                     # every site
+curl -skI https://<server-hostname>/                       # 404 + x-robots-tag noindex
+curl -sk https://<server-hostname>/robots.txt              # User-agent: * / Disallow: /
+curl -sk -o /dev/null -w '%{http_code}\n' https://<a-customer-site>/                 # unchanged
+```
+
+Rollback: recreate on the previous image tag, or set
+`HAPROXY_DEFAULT_SPLASH=off` and regenerate.
+
+Covered by `scripts/test-default-splash.py` (template order/conditions, the
+page, list generation) and the `splash-off` scenario of
+`scripts/validate-rendered-config.py`.
+
+## Access Log (in-container, since 2026.11.2)
+
+HAProxy logs (`log /log.sock ... format rfc5424`, `hap_header.tpl`) to a UNIX
+datagram socket inside its chroot (`/var/lib/haproxy/log.sock`).
+`scripts/haproxy-log-receiver.py`, started and supervised by `start-up.sh` (a
+restart loop: back within ~2 s), writes one line per request to
+`/var/log/haproxy/access.log`, rotated at 40 MB with 4 gzip generations
+(worst case 200 MB; `HAPROXY_ACCESS_LOG_MAX_BYTES`, `HAPROXY_ACCESS_LOG_BACKUPS`).
+No network listener anywhere. Fields: client/real IP (`cip=`), Host, status,
+termination state, request id, UA, SNI, HTTP version, WAF body stamp and the
+Coraza `wrule=/wrules=/wscore=` fields (unchanged `log-format`).
+
+* **Never blocks HAProxy.** Sends are non-blocking: a dead or stalled receiver,
+  or a full disk, only drops log lines (counted as `DroppedLogs` in
+  `echo "@1 show info" | socat stdio /tmp/haproxy-cli`). Lab: with the
+  receiver SIGSTOPped, 2500/2500 requests still answered 200 in ~1 s;
+  1025 lines queued, 1475 dropped and counted.
+* **Not in `docker logs`.** The receiver prints no log lines (WHP's AI log
+  monitor reads `docker logs haproxy-manager`; a per-request firehose there
+  would storm it). Only its start line and rate-limited errors go to stderr.
+* **Persistence.** Mount a named volume at `/var/log/haproxy` (WHP:
+  `-v haproxy-logs:/var/log/haproxy`) or the log resets on every recreate.
+  Give the container `--sysctl net.unix.max_dgram_qlen=1024` (a netns starts
+  at 10) for burst headroom.
+* `HAPROXY_SYSLOG_TARGET=<ip>:<port>` still overrides the target for a remote
+  collector. The old default `172.18.0.1:514` (host rsyslog) is gone.
+
+Reading it:
+
+```bash
+docker exec haproxy-manager tail -f /var/log/haproxy/access.log
+docker exec haproxy-manager grep ' 403 ' /var/log/haproxy/access.log | tail
+docker exec haproxy-manager sh -c 'zcat /var/log/haproxy/access.log.*.gz' | grep <request-id>
+docker cp haproxy-manager:/var/log/haproxy/ ./edge-logs/    # or the volume's _data dir on the host
+```
+
+Rollout: image bump + recreate with the volume and sysctl (WHP's
+`lib-edge-container.sh` adds both). The receiver, its script and the template
+are in the image, outside the `/etc/haproxy` named volume, so nothing can be
+shadowed; `haproxy.cfg` is regenerated on start with the new `log` line.
 
 ## Default Backend Configuration
+
+With the default splash on (above), unrouted hosts no longer reach this page; it still serves the blocked-IP and suspended pages, and serves unrouted hosts again when `HAPROXY_DEFAULT_SPLASH=off`.
 
 When a domain is accessed that hasn't been configured in HAProxy, the system will serve a default page instead of showing an error. This default page:
 

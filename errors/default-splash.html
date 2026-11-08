@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!--
+  Default splash: served by HAProxy itself (`http-request return ... file`,
+  hap_listener.tpl) for any request whose Host is not routed to a site --
+  the server's own hostname, a bare IP, an unconfigured name. Static on
+  purpose: no version, no hostname echo, no customer data, no links (in
+  particular none into the control panel). Loaded with `file`, not
+  `lf-file`, so `%` is literal here and nothing from the request is
+  expanded into it. Must stay well under tune.bufsize (16 KB) or HAProxy
+  rejects the config.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Web Hosting Platform</title>
+<style>
+:root{color-scheme:light dark;--bg:#f4f5f7;--card:#fff;--fg:#1d2330;--muted:#5b6475;--line:#dfe3ea}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1217;--card:#181c23;--fg:#e6e9ef;--muted:#9aa3b2;--line:#2a303a}}
+html,body{margin:0;height:100%}
+body{display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px;box-sizing:border-box}
+main{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:32px 28px;max-width:480px;width:100%;text-align:center}
+h1{font-size:1.25rem;margin:0 0 .5rem}
+p{margin:0;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>Web Hosting Platform</h1>
+<p>This server is operated by a web hosting platform. There is no website configured at this address.</p>
+</main>
+</body>
+</html>
