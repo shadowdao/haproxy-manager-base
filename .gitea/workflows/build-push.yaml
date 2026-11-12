@@ -4,10 +4,26 @@ on:
   push:
     branches:
       - main
+  # Manual publish (e.g. after a [skip ci] merge, or to re-publish after a
+  # failed arm64 leg).
+  workflow_dispatch:
 
+# Multi-arch (linux/amd64 + linux/arm64) in ONE job on the trusted x86 runner.
+# Each platform is pushed BY DIGEST (untagged) to BOTH registries, then
+# scripts/assemble-multiarch-index.sh creates :latest, :<version> and :<sha>
+# from those digests (same template as build-push-coraza.yaml; see
+# docs/arm64/IMAGE-PIPELINE-PLAN.md sections 4.1 / 4.4 in the WHP repo).
+#   * amd64 is required and built exactly as before; the Dockerfile build gate
+#     (unit suites + `haproxy -c`) runs in it. Failure = nothing published.
+#   * arm64 is continue-on-error and runs the SAME Dockerfile gate under QEMU
+#     (the gate is RUN steps, so it executes on the arm64 binary). If arm64
+#     fails or times out the tags are published amd64-only, exactly as before
+#     multi-arch, and a previous run's arm64 is never re-attached (the digest is
+#     read only from THIS run's step output).
 jobs:
   Build-and-Push:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,6 +46,8 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: https://github.com/docker/setup-buildx-action@v3
@@ -59,20 +77,45 @@ jobs:
         id: ver
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
-      - name: Build Image
+      # amd64: required. Pushed untagged by digest to both registries (same
+      # digest in each); tags are only created by the assemble step below.
+      - name: Build amd64 (push by digest)
+        id: amd64
         uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64
-          push: true
           build-args: |
             VERSION=${{ steps.ver.outputs.version }}
             PKG_CACHE=${{ steps.pkgcache.outputs.url }}
-          # Three tags per registry: :latest (moving), :<version> (human-readable
-          # release), :<sha> (immutable, guaranteed-unique rollback target).
-          tags: |
-            repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:latest
-            repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:${{ steps.ver.outputs.version }}
-            repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base:${{ gitea.sha }}
-            ghcr.io/shadowdao/haproxy-manager-base:latest
-            ghcr.io/shadowdao/haproxy-manager-base:${{ steps.ver.outputs.version }}
-            ghcr.io/shadowdao/haproxy-manager-base:${{ gitea.sha }}
+          outputs: type=image,"name=repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base,ghcr.io/shadowdao/haproxy-manager-base",push-by-digest=true,name-canonical=true,push=true
+
+      # arm64: best effort (QEMU, apt-based image). Must never block or alter
+      # the amd64 tags.
+      - name: Build arm64 (push by digest)
+        id: arm64
+        continue-on-error: true
+        timeout-minutes: 30
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/arm64
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+            PKG_CACHE=${{ steps.pkgcache.outputs.url }}
+          outputs: type=image,"name=repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base,ghcr.io/shadowdao/haproxy-manager-base",push-by-digest=true,name-canonical=true,push=true
+
+      # Three tags per registry: :latest (moving), :<version> (human-readable
+      # release), :<sha> (immutable, guaranteed-unique rollback target).
+      - name: Assemble tag indexes
+        env:
+          AMD64_DIGEST: ${{ steps.amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ steps.arm64.outputs.digest }}
+          ARM64_OUTCOME: ${{ steps.arm64.outcome }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA: ${{ gitea.sha }}
+        run: |
+          scripts/assemble-multiarch-index.sh \
+            --amd64 "$AMD64_DIGEST" \
+            --arm64 "$ARM64_DIGEST" --arm64-outcome "$ARM64_OUTCOME" \
+            --repo repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base \
+            --repo ghcr.io/shadowdao/haproxy-manager-base \
+            --tag latest --tag "$VERSION" --tag "$SHA"
