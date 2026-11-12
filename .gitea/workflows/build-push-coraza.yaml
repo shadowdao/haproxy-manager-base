@@ -11,12 +11,24 @@ on:
       - main
     paths:
       - 'coraza-spoa/**'
+      - 'scripts/assemble-multiarch-index.sh'
       - '.gitea/workflows/build-push-coraza.yaml'
   workflow_dispatch:
 
+# Multi-arch (linux/amd64 + linux/arm64) in ONE job on the trusted x86 runner,
+# no QEMU: coraza-spoa/Dockerfile cross-compiles the Go binary
+# (--platform=$BUILDPLATFORM + GOOS/GOARCH). Each platform is pushed BY DIGEST
+# (untagged) to BOTH registries, then scripts/assemble-multiarch-index.sh
+# creates the :latest index from those digests. The arm64 step is
+# continue-on-error: if it fails, :latest is published amd64-only exactly as it
+# was before multi-arch, and a previous run's arm64 is never re-attached (the
+# arm64 digest is read only from THIS run's step output). Registry write
+# credentials exist only on this x86 job. Template for the other WHP image
+# repos: docs/arm64/IMAGE-PIPELINE-PLAN.md sections 4.1 / 4.4.
 jobs:
   Build-and-Push:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,9 +51,6 @@ jobs:
           [ -n "$url" ] || echo "::warning::pkg-cache unreachable - building from upstream repositories"
           echo "url=${url}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: https://github.com/docker/setup-buildx-action@v3
 
@@ -52,7 +61,7 @@ jobs:
           username: ${{ secrets.CI_USER }}
           password: ${{ secrets.CI_TOKEN }}
 
-      # Mirror to GitHub Container Registry — see build-push.yaml for the
+      # Mirror to GitHub Container Registry - see build-push.yaml for the
       # secret/username convention.
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -61,14 +70,42 @@ jobs:
           username: shadowdao
           password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: Build Image
+      # amd64: required. Failure here fails the job and publishes nothing, as
+      # before. Pushed untagged by digest to both registries (same digest in
+      # each); the tag is only created by the assemble step below.
+      - name: Build amd64 (push by digest)
+        id: amd64
         uses: docker/build-push-action@v6
         with:
           context: ./coraza-spoa
           platforms: linux/amd64
-          push: true
           build-args: |
             PKG_CACHE=${{ steps.pkgcache.outputs.url }}
-          tags: |
-            repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa:latest
-            ghcr.io/shadowdao/coraza-spoa:latest
+          outputs: type=image,"name=repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa,ghcr.io/shadowdao/coraza-spoa",push-by-digest=true,name-canonical=true,push=true
+
+      # arm64: best effort (cross-compiled, no emulation). Must never block or
+      # alter the amd64 tag.
+      - name: Build arm64 (push by digest)
+        id: arm64
+        continue-on-error: true
+        timeout-minutes: 15
+        uses: docker/build-push-action@v6
+        with:
+          context: ./coraza-spoa
+          platforms: linux/arm64
+          build-args: |
+            PKG_CACHE=${{ steps.pkgcache.outputs.url }}
+          outputs: type=image,"name=repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa,ghcr.io/shadowdao/coraza-spoa",push-by-digest=true,name-canonical=true,push=true
+
+      - name: Assemble :latest index
+        env:
+          AMD64_DIGEST: ${{ steps.amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ steps.arm64.outputs.digest }}
+          ARM64_OUTCOME: ${{ steps.arm64.outcome }}
+        run: |
+          scripts/assemble-multiarch-index.sh \
+            --amd64 "$AMD64_DIGEST" \
+            --arm64 "$ARM64_DIGEST" --arm64-outcome "$ARM64_OUTCOME" \
+            --repo repo.anhonesthost.net/cloud-hosting-platform/coraza-spoa \
+            --repo ghcr.io/shadowdao/coraza-spoa \
+            --tag latest
