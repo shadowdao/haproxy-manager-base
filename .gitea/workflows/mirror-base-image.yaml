@@ -55,9 +55,26 @@ jobs:
           echo "base-image: ${HUB_TAG} -> ${ref} (digest from registry-1.docker.io)"
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
-      # imagetools needs buildx; same setup as the build workflows.
-      - name: Set up Docker Buildx
-        uses: https://github.com/docker/setup-buildx-action@v3
+      # imagetools needs a NEW buildx. The runner's distro buildx is 0.15.1, which
+      # pushes the children of a copied index to the TAG path: Gitea answers the
+      # index PUT with 404 and leaves a stray single-manifest <tag>-staging
+      # version (run 5156). buildx >= 0.24 pushes children by digest and works
+      # (measured on repo.anhonesthost.net). Pin one, verified by sha256
+      # (linux-amd64 binary of the v0.28.0 release); mirror-index-copy.sh also
+      # refuses to run on a buildx older than 0.24.
+      - name: Install pinned buildx
+        env:
+          BUILDX_VERSION: v0.28.0
+          BUILDX_SHA256: 696bc104bac3bb708eff1af3f8bbc09fda0fd88f5757c1f9b404a35117889224
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP:-/tmp}/pinned-buildx"; mkdir -p "$dir"
+          curl -fsSL --retry 3 --max-time 120 -o "$dir/docker-buildx" \
+            "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+          echo "${BUILDX_SHA256}  $dir/docker-buildx" | sha256sum -c -
+          chmod +x "$dir/docker-buildx"
+          "$dir/docker-buildx" version
+          echo "BUILDX=$dir/docker-buildx" >> "$GITHUB_ENV"
 
       # The registry token is written ONLY by this trusted x86 runner step
       # (unchanged from before; no new secret exposure).
@@ -69,7 +86,7 @@ jobs:
           password: ${{ secrets.CI_TOKEN }}
 
       # Registry-to-registry copy of the WHOLE upstream index (all platforms,
-      # incl. linux/arm64). The old pull/tag/push re-published only the runner's
+      # incl. linux/arm64; $BUILDX = the pinned buildx from the step above). The old pull/tag/push re-published only the runner's
       # amd64 manifest. mirror-index-copy.sh stages to <tag>-staging, asserts
       # amd64+arm64 present and index digest == the Docker-Hub-reported digest,
       # and only then moves the real tag, so a bad copy never replaces a good

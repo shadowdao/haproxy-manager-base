@@ -18,17 +18,44 @@
 ## at 4 cannot be rolled back by this script (the tag already moved) but it is
 ## loud and the same digest was already proven at step 2.
 ##
+## Gitea compatibility (measured against repo.anhonesthost.net, 2026-11-11):
+##   * Gitea's registry accepts whole indexes (OCI index, Docker manifest list,
+##     attestation children, 14-16 children) and preserves the index digest
+##     byte-for-byte, so the digest-equality assertion below holds there too.
+##   * It rejects an index PUT whose child manifests are not already stored as
+##     by-DIGEST versions (404 MANIFEST_BLOB_UNKNOWN). buildx <= 0.20.x pushes the
+##     children of a copied index to the TAG path (works on registry:2, not on
+##     Gitea): the copy dies with `PUT .../manifests/<tag>: 404` and leaves a
+##     stray single-manifest version named <tag>. buildx >= 0.24 pushes children by
+##     digest and works. The distro buildx on the runner is 0.15.1, so the
+##     workflow installs a pinned newer one and this script refuses to run on an
+##     older one (MIN_BUILDX) instead of leaving a stray version behind.
+##
 ## Env: REQUIRED_PLATFORMS (default "linux/amd64 linux/arm64").
-##      IMAGETOOLS (default "docker buildx imagetools"), for tests/skopeo-free CI.
+##      BUILDX (default "docker buildx"): the buildx command; may be the path of
+##        a pinned docker-buildx binary.
+##      IMAGETOOLS (default "$BUILDX imagetools").
+##      MIN_BUILDX (default 0.24.0; empty disables the version guard).
 ##      (buildx talks plain HTTP to a localhost registry, so the test needs no flags.)
 set -euo pipefail
 
 SRC="${1:?usage: mirror-index-copy.sh SRC@sha256:DIGEST DST_REPO:TAG}"
 DST="${2:?usage: mirror-index-copy.sh SRC@sha256:DIGEST DST_REPO:TAG}"
 REQUIRED_PLATFORMS="${REQUIRED_PLATFORMS:-linux/amd64 linux/arm64}"
-read -r -a IMGTOOLS <<<"${IMAGETOOLS:-docker buildx imagetools}"
+BUILDX="${BUILDX:-docker buildx}"
+MIN_BUILDX="${MIN_BUILDX-0.24.0}"
+read -r -a BX <<<"$BUILDX"
+read -r -a IMGTOOLS <<<"${IMAGETOOLS:-${BUILDX} imagetools}"
 
 fail() { echo "::error::mirror-index-copy: $*" >&2; exit 1; }
+
+# Version guard: old buildx corrupts the copy on Gitea (see header).
+if [ -n "$MIN_BUILDX" ]; then
+  have_bx=$("${BX[@]}" version 2>/dev/null | awk 'NR==1{print $2}'); have_bx="${have_bx#v}"
+  [[ "$have_bx" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || fail "cannot determine buildx version from '${BUILDX} version'"
+  [ "$(printf '%s\n%s\n' "$MIN_BUILDX" "${have_bx%%[-+]*}" | sort -V | head -1)" = "$MIN_BUILDX" ] \
+    || fail "buildx ${have_bx} is too old (need >= ${MIN_BUILDX}): older buildx pushes index children by tag, which Gitea rejects"
+fi
 
 # Validate shapes (registry host may carry :port, e.g. localhost:5055).
 [[ "$SRC" =~ ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || fail "bad source reference '${SRC}'"
@@ -47,7 +74,10 @@ assert_ref() {
   for want in $REQUIRED_PLATFORMS; do
     case " $have " in *" $want "*) ;; *) fail "${ref} is missing ${want} (has: ${have})" ;; esac
   done
-  got=$("${IMGTOOLS[@]}" inspect "$ref" --format '{{.Manifest.Digest}}') || fail "cannot read digest of ${ref}"
+  # Digest = sha256 of the exact index bytes the registry serves (the same
+  # thing a client pins by). Not `--format {{.Manifest.Digest}}`: buildx 0.28
+  # ignores --format here and prints the human summary instead.
+  got="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
   [ "$got" = "$src_digest" ] || fail "${ref} digest ${got} != upstream ${src_digest}"
   echo "ok: ${ref} platforms=[${have}] digest=${got}"
 }
