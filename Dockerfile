@@ -23,22 +23,30 @@ LABEL org.opencontainers.image.title="haproxy-manager-base" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
-# haproxy is PINNED. It was previously unpinned, so the binary could move under
-# us at Debian's timing — an upstream release that rejected our config would have
-# broken an unrelated commit's build, or worse, shipped an edge that refuses to
-# start (see the `haproxy -c` gate below for why that matters: a config HAProxy
+# haproxy is PINNED to a reviewed UPSTREAM version (HAPROXY_UPSTREAM), not to one
+# Debian package revision. It was previously unpinned, so the binary could move
+# under us at Debian's timing - an upstream release that rejected our config would
+# have broken an unrelated commit's build, or worse, shipped an edge that refuses
+# to start (see the `haproxy -c` gate below for why that matters: a config HAProxy
 # rejects leaves the container Up with 80/443 unbound and /health still 200).
 #
-# Pinning does NOT make the gate redundant, and the gate does NOT make pinning
-# unnecessary — they compose. Pinned means the version moves deliberately; the
-# gate then answers immediately whether the new binary still accepts fleet config.
-# It also makes the image reproducible, which it previously was not.
+# History: this used to pin the exact Debian version (3.0.11-1+deb13u3). Debian
+# security then shipped 3.0.11-1+deb13u4 (same upstream 3.0.11, same arch set) and
+# the exact pin silently froze the image on the OLDER, unpatched revision, and
+# would hard-fail the build as soon as u3 left the archive. Debian security
+# revisions of the SAME upstream version are exactly what we want to take, so:
+#   * an apt preference (Pin: version 3.0.11-*) makes apt install the NEWEST
+#     Debian revision of that upstream version on any architecture;
+#   * the build then FAILS unless the installed package AND `haproxy -v` both
+#     report that upstream version, so a major/minor bump (3.0 -> 3.1, 3.0.12)
+#     can never arrive by accident: that still needs this ARG changed and the
+#     `haproxy -c` gate below to pass.
+# The pin and the gate compose: pinned = the version moves deliberately; the gate
+# answers immediately whether the new binary still accepts fleet config.
 #
-# To move it: bump the version here, rebuild, and let the gate verify. If Debian
-# security-updates the package (e.g. -1+deb13u4) the build FAILS until this pin is
-# updated — that failure is the point, not a bug. Check availability with:
-#   apt-cache policy haproxy
-ARG HAPROXY_VERSION=3.0.11-1+deb13u3
+# To move to another upstream version: change HAPROXY_UPSTREAM, rebuild, let the
+# gate verify. Check what Debian offers with:  apt-cache madison haproxy
+ARG HAPROXY_UPSTREAM=3.0.11
 # OPTIONAL internal package cache, e.g. --build-arg PKG_CACHE=https://192.168.1.40
 # (CT130 pkg-cache, https only; CI sets it only after probing the cache with the
 # pinned CA). Unset = the upstream Debian repositories, exactly as before. The
@@ -50,7 +58,14 @@ ARG PKG_CACHE=
 COPY ./scripts/pkg-cache-repos.sh /usr/local/sbin/pkg-cache-repos.sh
 COPY ./keys/pkg-cache/ /usr/local/share/pkg-cache/
 RUN /usr/local/sbin/pkg-cache-repos.sh apt && \
-    apt update -y && apt dist-upgrade -y && apt install socat "haproxy=${HAPROXY_VERSION}" cron certbot curl jq net-tools -y && apt-mark hold haproxy && \
+    apt update -y && apt dist-upgrade -y && \
+    printf 'Package: haproxy\nPin: version %s-*\nPin-Priority: 1001\n' "${HAPROXY_UPSTREAM}" > /etc/apt/preferences.d/haproxy-upstream-pin && \
+    apt install socat haproxy cron certbot curl jq net-tools -y && apt-mark hold haproxy && \
+    rm -f /etc/apt/preferences.d/haproxy-upstream-pin && \
+    deb_ver="$(dpkg-query -W -f='${Version}' haproxy)" && \
+    case "${deb_ver}" in "${HAPROXY_UPSTREAM}"-*) ;; *) echo "FATAL: installed haproxy ${deb_ver} is not upstream ${HAPROXY_UPSTREAM}" >&2; exit 1;; esac && \
+    haproxy -v | head -n1 | grep -F "version ${HAPROXY_UPSTREAM}-" && \
+    echo "haproxy pin OK: upstream ${HAPROXY_UPSTREAM}, Debian package ${deb_ver}" && \
     /usr/local/sbin/pkg-cache-repos.sh restore && \
     apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
@@ -95,8 +110,8 @@ RUN pip install -r requirements.txt
 #   * it cannot be skipped, and it protects local `docker build` too;
 #   * no workflow restructuring (build-push-action builds and pushes in one
 #     step, so gating in CI would mean splitting build from push);
-#   * it validates against the EXACT haproxy binary in this image. Line 26
-#     installs haproxy unpinned, so that binary moves between builds - this
+#   * it validates against the EXACT haproxy binary in this image. The
+#     installed haproxy can move between builds (Debian revisions) - this
 #     turns "the new haproxy rejects our config" from a silent production
 #     risk into a build failure.
 #
