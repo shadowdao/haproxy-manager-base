@@ -1,8 +1,8 @@
 name: Mirror base images
 run-name: weekly base-image mirror
 
-# Pulls each declared base image from upstream and re-pushes to the in-house
-# registry, so any of our images that FROM these don't depend on docker.io's
+# Copies each declared base image (the whole multi-arch INDEX, not one
+# platform) from upstream to the in-house registry, so any of our images that FROM these don't depend on docker.io's
 # Cloudflare R2 blob storage being reachable. The 2026-05-12 Cloudflare
 # incident motivated this for python:3.12-slim and again for golang:1.25
 # when the coraza-spoa build hit the same blob-fetch failure.
@@ -55,6 +55,12 @@ jobs:
           echo "base-image: ${HUB_TAG} -> ${ref} (digest from registry-1.docker.io)"
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
+      # imagetools needs buildx; same setup as the build workflows.
+      - name: Set up Docker Buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+
+      # The registry token is written ONLY by this trusted x86 runner step
+      # (unchanged from before; no new secret exposure).
       - name: Login to in-house registry
         uses: docker/login-action@v3
         with:
@@ -62,7 +68,14 @@ jobs:
           username: ${{ secrets.CI_USER }}
           password: ${{ secrets.CI_TOKEN }}
 
-      - name: Pull by digest, retag, push ${{ matrix.image.hub }}
+      # Registry-to-registry copy of the WHOLE upstream index (all platforms,
+      # incl. linux/arm64). The old pull/tag/push re-published only the runner's
+      # amd64 manifest. mirror-index-copy.sh stages to <tag>-staging, asserts
+      # amd64+arm64 present and index digest == the Docker-Hub-reported digest,
+      # and only then moves the real tag, so a bad copy never replaces a good
+      # multi-arch mirror. Logic + tests: .gitea/scripts/mirror-index-copy.sh,
+      # .gitea/scripts/test-mirror-index-copy.sh.
+      - name: Copy index by digest, assert platforms + digest ${{ matrix.image.hub }}
         # Values reach the script via env, never via ${{ }} inside run:.
         env:
           REF: ${{ steps.base.outputs.ref }}
@@ -74,28 +87,6 @@ jobs:
           [[ "$DST_PATH" =~ ^[a-z0-9][a-z0-9._/-]*$ && "$DST_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "::error::bad destination"; exit 1; }
           name="${REF%@*}"; digest="${REF#*@}"
           [[ "$name" == */* ]] || name="library/${name}"   # official images
-          SRC="docker.io/${name}@${digest}"
-          DST="repo.anhonesthost.net/${DST_PATH}:${DST_TAG}"
-
-          echo "::group::Pulling ${SRC}"
-          docker pull "${SRC}"
-          echo "::endgroup::"
-
-          # The pulled image must be recorded under exactly the digest Docker
-          # Hub reported (docker refuses content that does not match it anyway).
-          repo_digests=$(docker image inspect "${SRC}" -f '{{range .RepoDigests}}{{println .}}{{end}}')
-          grep -qxF -e "docker.io/${name}@${digest}" -e "${name#library/}@${digest}" -e "${name}@${digest}" <<<"$repo_digests" \
-            || { echo "::error::pulled image is not recorded under ${digest}"; exit 1; }
-          echo "upstream digest: ${SRC}"
-
-          docker tag "${SRC}" "${DST}"
-
-          echo "::group::Pushing ${DST}"
-          docker push "${DST}"
-          echo "::endgroup::"
-
-          # The mirror tag's manifest digest (single-platform image as pushed);
-          # differs from the multi-arch index digest above by design.
-          dst_digests=$(docker image inspect "${DST}" -f '{{range .RepoDigests}}{{println .}}{{end}}')
-          DST_DIGEST=$(grep -m1 -F "repo.anhonesthost.net/${DST_PATH}@" <<<"$dst_digests" || true)
-          echo "mirror digest:   ${DST_DIGEST:-<unknown>}"
+          .gitea/scripts/mirror-index-copy.sh \
+            "docker.io/${name}@${digest}" \
+            "repo.anhonesthost.net/${DST_PATH}:${DST_TAG}"
