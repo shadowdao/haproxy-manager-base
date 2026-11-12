@@ -16,8 +16,16 @@ ARG CORAZA_SPOA_VERSION=v0.7.1
 # then for this image's golang:1.25), so both are mirrored at
 # repo.anhonesthost.net via the .gitea/workflows/mirror-base-image.yaml
 # weekly job.
-FROM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS build
+#
+# Multi-arch (linux/amd64 + linux/arm64) WITHOUT QEMU: both Go stages are pinned
+# to the BUILD host's platform (--platform=$BUILDPLATFORM, so the amd64-only
+# golang mirror is enough) and the binary is CROSS-COMPILED for the target via
+# GOOS/GOARCH. CGO is off (it already was), so cross-compiling is exact. Only
+# the final distroless stage is per target platform (gcr.io publishes arm64).
+FROM --platform=$BUILDPLATFORM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS build
 ARG CORAZA_SPOA_VERSION
+ARG TARGETOS
+ARG TARGETARCH
 # OPTIONAL internal package cache, e.g. --build-arg PKG_CACHE=https://192.168.1.40
 # (CT130 pkg-cache, https only; CI sets it only after probing the cache with the
 # pinned CA). Unset = upstream Debian repositories and the default GOPROXY,
@@ -42,14 +50,17 @@ RUN git clone --depth 1 --branch "${CORAZA_SPOA_VERSION}" \
         https://github.com/corazawaf/coraza-spoa.git . \
     && eval "$(/usr/local/sbin/pkg-cache-repos.sh go-env)" \
     && go mod download \
-    && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/coraza-spoa . \
+    && CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" go build -trimpath -ldflags='-s -w' -o /out/coraza-spoa . \
     && /usr/local/sbin/pkg-cache-repos.sh restore
 
 # Catalog extractor: walks the bundled CRS at build time and emits
 # rules-catalog.json so WHP's UI can render rule metadata without parsing
 # .conf files at runtime. Uses the SAME coraza-coreruleset version pin as
 # the coraza-spoa binary above (drift between the two would mislabel rules).
-FROM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS catalog
+# Runs at build time, so it is built and RUN for the build platform (no
+# GOOS/GOARCH); its JSON output is architecture-neutral and is copied into
+# every target platform's image.
+FROM --platform=$BUILDPLATFORM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS catalog
 # Same optional package cache as the build stage (module downloads only).
 ARG PKG_CACHE=
 COPY ./scripts/pkg-cache-repos.sh /usr/local/sbin/pkg-cache-repos.sh

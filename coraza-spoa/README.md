@@ -76,3 +76,33 @@ When a legitimate request triggers a blocked rule, the audit log shows the rule 
 2. **Drop from the enforce list**: remove the rule's ID range from the `ctl:ruleEngine=On` overrides; it falls back to detect-only.
 
 After tuning, push the change — CI rebuilds, then `recreate coraza-spoa` on each host to apply.
+
+## Multi-arch (linux/amd64 + linux/arm64)
+
+The image is built for both platforms **without QEMU**: the two Go stages are
+`FROM --platform=$BUILDPLATFORM` (the in-house `golang:1.25` mirror is amd64-only,
+which is enough) and the binary is cross-compiled with
+`CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH`. The catalog-extractor runs at
+build time on the build platform; its JSON output is architecture-neutral. Only the
+final distroless stage is per target platform. The amd64 image content is
+byte-identical to the pre-multi-arch build (measured: same rootfs tree, same
+`/coraza-spoa` sha256).
+
+CI (`.gitea/workflows/build-push-coraza.yaml`, one job on the trusted x86 runner):
+amd64 and arm64 are each pushed **by digest, untagged, to both registries**
+(Gitea + GHCR; the same digest lands in both), then
+`scripts/assemble-multiarch-index.sh` creates `:latest` in each registry with
+`docker buildx imagetools create` from `<repo>@<amd64>` and `<repo>@<arm64>`.
+The arm64 step is `continue-on-error`; when it fails the tag is published
+amd64-only, as before, and the arm64 digest is only ever taken from the current
+run's step output (a previous build's arm64 is never re-attached).
+
+Attestations: buildx provenance is kept per platform. A by-digest push with
+attestations is a small per-platform index (image + `attestation-manifest`);
+`imagetools create` over two of them yields one index with all four entries
+(amd64, its attestation, arm64, its attestation), each attestation still pointing
+at its own platform manifest; `imagetools inspect --format '{{json .Provenance}}'`
+shows both. Nothing flattens or drops them.
+
+Local rehearsal (no real registry is touched): `scripts/e2e-coraza-multiarch.sh`
+(usage in its header).
