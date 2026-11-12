@@ -48,6 +48,26 @@ if "$here/mirror-index-copy.sh" "${REG}/${run}/amd64@${SINGLE}" "${REG}/${run}/d
 "$here/mirror-index-copy.sh" "${REG}/x:tag" "${REG}/${run}/d:1" >/dev/null 2>&1 && bad "tag-only source accepted" || ok "non-digest source refused"
 "$here/mirror-index-copy.sh" "${REG}/x@sha256:$(printf 'a%.0s' {1..64})" 'bad dst' >/dev/null 2>&1 && bad "bad dst accepted" || ok "bad destination refused"
 
+# 6. index WITH buildx attestation children (unknown/unknown), like Docker Hub
+#    official images: copy passes, digest preserved, attestations not counted as platforms
+printf 'FROM scratch\nLABEL t=att-%s\n' "$run" >"$work/Dockerfile"
+if docker buildx build -q --platform linux/amd64,linux/arm64 --provenance=mode=min --sbom=false \
+     --output "type=image,name=${REG}/${run}/att:v,push=true" "$work" >/dev/null 2>&1; then
+  ATT=$(digest "${REG}/${run}/att:v")
+  if "$here/mirror-index-copy.sh" "${REG}/${run}/att@${ATT}" "${REG}/${run}/attdst:1" >"$work/o6" 2>&1 \
+     && [ "$(digest "${REG}/${run}/attdst:1")" = "$ATT" ]; then ok "index with attestation children copied, digest preserved ($ATT)"; else bad "attestation-index copy"; cat "$work/o6"; fi
+else bad "could not build attestation index"; fi
+
+# 7. buildx version guard: a too-old buildx is refused BEFORE any registry traffic
+#    (old buildx leaves a stray single-manifest tag on Gitea)
+printf '#!/bin/sh\necho "github.com/docker/buildx v0.15.1 deadbeef"\n' >"$work/old-buildx"; chmod +x "$work/old-buildx"
+if BUILDX="$work/old-buildx" "$here/mirror-index-copy.sh" "${REG}/${run}/multi@${MULTI}" "${REG}/${run}/olddst:1" >"$work/o7" 2>&1; then bad "old buildx accepted"; else
+  grep -q 'too old' "$work/o7" && ok "old buildx refused: $(grep -m1 '::error::' "$work/o7")" || { bad "old-buildx failed for the wrong reason"; cat "$work/o7"; }
+  docker buildx imagetools inspect "${REG}/${run}/olddst:1-staging" >/dev/null 2>&1 && bad "old buildx touched the registry" || ok "no staging tag created by refused run"
+fi
+MIN_BUILDX= BUILDX="$work/old-buildx" IMAGETOOLS="docker buildx imagetools" "$here/mirror-index-copy.sh" "${REG}/${run}/multi@${MULTI}" "${REG}/${run}/olddst2:1" >/dev/null 2>&1 \
+  && ok "MIN_BUILDX= disables the guard" || bad "guard not disabled by empty MIN_BUILDX"
+
 # 5. optional: real upstream digest
 if [ -n "${MIRROR_TEST_UPSTREAM:-}" ]; then
   u="${MIRROR_TEST_UPSTREAM}"
