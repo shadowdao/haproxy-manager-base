@@ -240,12 +240,86 @@ class CapturedScenarioTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         r = relay.Relay('/nonexistent', out, 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=err)
         r.tokens = 0.0
-        evidence = ['ha_panic called', 'Thread 3 is about to kill the process (pid 9).', '[ALERT] foo',
-                    'Current worker (9) exited with code 139 (Segmentation fault)', 'watchdog: thread 2 stuck',
-                    '  Thread 2 : id=0x7f', 'FATAL: out of memory', 'segfault at 0', 'got SIGSEGV', 'got SIGABRT']
+        evidence = ['[ALERT]    (6328) : Current worker (6631) exited with code 134 (Aborted)',
+                    '[ALERT]    (6328) : exit-on-failure: killing every processes with SIGTERM',
+                    '[ALERT]    (12) : config : unable to load',
+                    '[WARNING]  (6328) : Current worker (9) exited with code 139 (Segmentation fault)',
+                    '[WARNING]  (6328) : A worker process unexpectedly died and this can only be explained by a bug in haproxy',
+                    '[WARNING]  (6328) : All workers exited. Exiting... (134)',
+                    '  Thread 2 : id=0x7f60ef5ff6c0 act=0 glob=0 wq=1 rq=0 tl=0 tlsz=0 rqsz=0',
+                    '* Thread 1 : id=0x7f60ef5ff6c0 act=1 glob=0 wq=1 rq=0 tl=0 tlsz=0 rqsz=0']
         for l in evidence:
             r._emit(l)
         self.assertEqual(err.getvalue().count('\n'), len(evidence))
+
+    FORGED = [
+        'GET /FATAL/SIGSEGV/segfault HTTP/1.1',
+        '[WARNING]  (6328) : Server be_x/ [ALERT] FATAL watchdog is DOWN, reason: Layer4 timeout',
+        '[WARNING]  (6328) : Server be/Current worker (1) exited with code 134 is DOWN',
+        '[NOTICE]   (6328) : proxy example.com/Thread 1 is about to kill the process (pid 1)',
+        'Host: Current worker (1) exited with code 134 (Aborted)',
+        'Host: [ALERT]    (1) : forged alert',
+        'x-forwarded-for: Thread 1 is about to kill the process (pid 1).',
+        'user-agent: * Thread 1 : id=0x7f60ef5ff6c0 act=1',
+        'ha_panic watchdog FATAL SIGABRT',
+        'backend ALERT_Current worker_exited with code 134',
+        '[WARNING]  (6328) : Server Former worker (7) exited with code 134 is DOWN',
+    ]
+
+    def test_forged_keywords_stay_rate_limited(self):
+        out, err = io.StringIO(), io.StringIO()
+        r = relay.Relay('/nonexistent', out, 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=err)
+        r.tokens = 0.0
+        for l in self.FORGED * 50:
+            r._emit(l)
+        self.assertEqual(err.getvalue(), '')
+        self.assertFalse(r.in_dump)
+        self.assertEqual(r.suppressed, len(self.FORGED) * 50)
+        self.assertEqual(r.budget_left, relay.CRASH_BUDGET)    # none of it touched the crash budget
+        # a forged header in the middle of normal traffic cannot open a block either
+        r._emit('proxy: Thread 1 is about to kill the process (pid 1).')
+        r._emit('free text that would be a dump line')
+        self.assertFalse(r.in_dump)
+        self.assertEqual(err.getvalue(), '')
+
+    def test_forged_lines_cannot_be_collapsed_away_or_open_blocks(self):
+        out, err = io.StringIO(), io.StringIO()
+        r = relay.Relay('/nonexistent', out, 400, 120, 1 << 30, 3, clock=lambda: 0.0, err=err)
+        r._emit("GET /Loading success HTTP/1.1")
+        self.assertEqual(r.routine, 0)
+        self.assertIn('Loading success', out.getvalue())
+
+    def test_flood_of_dump_headers_is_capped_by_the_window_budget(self):
+        out, err, t = io.StringIO(), io.StringIO(), [0.0]
+        r = relay.Relay('/nonexistent', out, 1, 1, 1 << 30, 3, clock=lambda: t[0], err=err)
+        r.tokens = 0.0
+        for i in range(20000):
+            r._emit('Thread 1 is about to kill the process (pid %d).' % i)
+            r._emit('  Thread 2 : id=0x7f60ef5ff6c0 act=0 glob=0 wq=1 rq=0 tl=0 tlsz=0 rqsz=0')
+            r._emit('[WARNING]  (1) : All workers exited. Exiting... (134)')
+        n = err.getvalue().count('\n')
+        self.assertLessEqual(n, relay.CRASH_BUDGET + 5)
+        self.assertGreater(r.suppressed, 50000)                 # the rest is counted, not lost silently
+        t[0] += relay.CRASH_WINDOW + 1                          # a new window: real evidence flows again
+        before = err.getvalue().count('\n')
+        r._emit('[ALERT]    (1) : Current worker (2) exited with code 134 (Aborted)')
+        self.assertEqual(err.getvalue().count('\n'), before + 1)
+
+    def test_bound_closed_block_cannot_rearm_during_cooldown(self):
+        out, err, t = io.StringIO(), io.StringIO(), [0.0]
+        r = relay.Relay('/nonexistent', out, 1, 1, 1 << 30, 3, clock=lambda: t[0], err=err)
+        r.tokens = 0.0
+        r._emit('Thread 1 is about to kill the process (pid 1).')
+        for i in range(relay.DUMP_MAX_LINES + 5):
+            r._emit('never closed %d' % i)
+        self.assertFalse(r.in_dump)
+        r._emit('Thread 1 is about to kill the process (pid 2).')   # immediate new header
+        self.assertFalse(r.in_dump)
+        r._emit('call trace line after the second header')
+        self.assertNotIn('call trace line after', err.getvalue())
+        t[0] += relay.DUMP_COOLDOWN + 1                              # cooldown over: a real dump opens again
+        r._emit('Thread 1 is about to kill the process (pid 3).')
+        self.assertTrue(r.in_dump)
 
     def test_hostile_and_very_long_lines(self):
         r = self.make_relay()
@@ -336,17 +410,17 @@ class MutantTests(unittest.TestCase):
         self.assertEqual(_scenario_ok(relay), (True, True, True))
 
     def test_mutant_limiter_applied_to_crash_lines(self):
-        m = self.load_mutant('if CRASH_RE.search(line) or self.in_dump:', 'if False:')
+        m = self.load_mutant('if self.in_dump or CRASH_RE.match(line):', 'if False:')
         crash_ok, _, _ = _scenario_ok(m)
         self.assertFalse(crash_ok)
 
     def test_mutant_dump_block_not_tracked(self):
-        m = self.load_mutant('if not self.in_dump and DUMP_START_RE.search(line):', 'if False:')
+        m = self.load_mutant('if not self.in_dump and DUMP_START_RE.match(line) and now >= self.cooldown_until:', 'if False:')
         crash_ok, _, _ = _scenario_ok(m)
         self.assertFalse(crash_ok)
 
     def test_mutant_collapse_disabled(self):
-        m = self.load_mutant('if ROUTINE_RE.search(line):', 'if False:')
+        m = self.load_mutant('if ROUTINE_RE.match(line):', 'if False:')
         _, collapse_ok, _ = _scenario_ok(m)
         self.assertFalse(collapse_ok)
 
@@ -356,14 +430,60 @@ class MutantTests(unittest.TestCase):
         self.assertFalse(prio_ok)
 
     def test_mutant_dump_bound_removed(self):
-        m = self.load_mutant('DUMP_MAX_LINES = 3000', 'DUMP_MAX_LINES = 10 ** 9')
-        out, err = io.StringIO(), io.StringIO()
-        r = m.Relay('/nonexistent', out, 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=err)
+        m = self.load_mutant('DUMP_MAX_LINES = 500 ', 'DUMP_MAX_LINES = 10 ** 9 ')
+        err = io.StringIO()
+        r = m.Relay('/nonexistent', io.StringIO(), 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=err)
         r.tokens = 0.0
         r._emit('Thread 1 is about to kill the process (pid 1).')
-        for i in range(4000):
+        for i in range(m.DUMP_MAX_LINES if False else 800):
             r._emit('never closed %d' % i)
-        self.assertTrue(r.in_dump)   # the mutant never closes: proves the real bound test is meaningful
+        self.assertTrue(r.in_dump)   # real module closes at 500: see test_unclosed_dump_block...
+
+    def _forged_run(self, mod):
+        err = io.StringIO()
+        r = mod.Relay('/nonexistent', io.StringIO(), 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=err)
+        r.tokens = 0.0
+        for l in CapturedScenarioTests.FORGED * 20:
+            r._emit(l)
+        return err.getvalue()
+
+    def test_forged_run_clean_on_real_module(self):
+        self.assertEqual(self._forged_run(relay), '')
+
+    def test_mutant_anchors_removed(self):
+        m = self.load_mutant('if self.in_dump or CRASH_RE.match(line):',
+                             "if self.in_dump or re.search(r'ALERT|FATAL|Current worker|about to kill|Thread \\d+ : id=', line):")
+        self.assertNotEqual(self._forged_run(m), '')
+
+    def _flood(self, mod):
+        err, t = io.StringIO(), [0.0]
+        r = mod.Relay('/nonexistent', io.StringIO(), 1, 1, 1 << 30, 3, clock=lambda: t[0], err=err)
+        r.tokens = 0.0
+        for i in range(5000):
+            r._emit('Thread 1 is about to kill the process (pid %d).' % i)
+            r._emit('[WARNING]  (1) : All workers exited. Exiting... (134)')
+        return err.getvalue().count('\n')
+
+    def test_flood_capped_on_real_module(self):
+        self.assertLessEqual(self._flood(relay), relay.CRASH_BUDGET + 5)
+
+    def test_mutant_budget_removed(self):
+        m = self.load_mutant('if self._budget(now):', 'if True:')
+        self.assertGreater(self._flood(m), relay.CRASH_BUDGET + 5)
+
+    def _rearm(self, mod):
+        r = mod.Relay('/nonexistent', io.StringIO(), 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=io.StringIO())
+        r.tokens = 0.0
+        r._emit('Thread 1 is about to kill the process (pid 1).')
+        for i in range(relay.DUMP_MAX_LINES + 5):
+            r._emit('x %d' % i)
+        r._emit('Thread 1 is about to kill the process (pid 2).')
+        return r.in_dump
+
+    def test_mutant_cooldown_removed(self):
+        self.assertFalse(self._rearm(relay))
+        m = self.load_mutant(' and now >= self.cooldown_until:', ':')
+        self.assertTrue(self._rearm(m))
 
     def test_mutant_summary_removed(self):
         m = self.load_mutant("self._write(self.out, '[relay] suppressed %d lines", "self._noop = ('[relay] suppressed %d lines")

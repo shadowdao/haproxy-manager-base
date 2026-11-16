@@ -17,14 +17,16 @@ Properties
 * Rare by nature: HAProxy only writes here on start/reload/server state
   changes/crashes. The per-request access log is NOT here (it goes to the
   receiver socket), so this does not feed the WHP AI monitor a firehose.
-* Crash evidence is NEVER rate-limited and NEVER summarised away: lines that
-  match CRASH_RE (ha_panic, "Thread N is about to kill", "Current worker ...
-  exited with code N", [ALERT], watchdog, "Thread N : id=", FATAL, SIGSEGV,
-  SIGABRT, ...) and every line of a dump block (from a panic/watchdog header to
+* Crash evidence bypasses the rate limit: lines that match the ANCHORED CRASH_RE
+  ("[ALERT]    (PID) :", "Current worker (N) exited with code N", "Thread N is
+  about to kill the process", "Thread N : id=0x..."; a keyword inside a URL/Host/
+  server name never matches) and every line of a dump block (from a panic/watchdog header to
   the master's "All workers exited" line, bounded by
-  DUMP_MAX_LINES and DUMP_MAX_SECONDS so a never-closed block cannot disable
-  the limiter) are forwarded in full even when the bucket is empty. They go to
-  STDERR.
+  DUMP_MAX_LINES / DUMP_MAX_SECONDS, then a DUMP_COOLDOWN before another block
+  can open; blocks open only on the anchored "Thread N is about to kill" header)
+  are forwarded in full even when the bucket is empty, within a total budget of
+  CRASH_BUDGET lines per CRASH_WINDOW (after that they take the normal limiter
+  and are counted in the suppressed summary). They go to STDERR.
 * Routine reload noise (ROUTINE_RE: "Proxy X stopped (cumulated conns ...)",
   config "parsing [...]" warnings, "Former worker (N) exited with code 0",
   "Initializing new worker", "Loading success", ...) never touches the bucket:
@@ -58,30 +60,43 @@ import time
 PREFIX = 'haproxy-stderr: '
 MAX_LINE = 2000          # longer lines are truncated (hostile / runaway output)
 MAX_PENDING = 65536      # an unterminated line is force-emitted past this size
-DUMP_MAX_LINES = 3000    # a dump block never bypasses the limiter longer than this
+DUMP_MAX_LINES = 500     # a dump block never bypasses the limiter longer than this
 DUMP_MAX_SECONDS = 30.0
 SUMMARY_EVERY = 60.0
 
-# Crash evidence: forwarded unconditionally (to stderr). Deliberately broad.
+# Every pattern is ANCHORED to HAProxy's own message structure (captured from
+# real 3.2 crashes): a keyword inside a request path / Host header / server
+# name that HAProxy echoes into a warning can never match, because the line
+# prefix "[ALERT]    (PID) :" is written by HAProxy itself.
+# Crash evidence: forwarded (to stderr) without the bucket, within CRASH_BUDGET.
 CRASH_RE = re.compile(
-    r'ha_panic|is about to kill|Current worker|exited with code (?!0\b)|\[ALERT\]'
-    r'|watchdog|^\s*\*?\s*Thread\s+\d+\s*:\s*id=|\bFATAL\b|segfault|SIGSEGV|SIGABRT'
-    r'|unexpectedly died|bug in haproxy|exit-on-failure|All workers exited|^Hint: when reporting this bug',
-    re.I)
-# A dump block starts at one of these and runs until DUMP_END_RE (or a bound).
-DUMP_START_RE = re.compile(
-    r'ha_panic|is about to kill|watchdog|^\s*\*?\s*Thread\s+\d+\s*:\s*id=', re.I)
-DUMP_END_RE = re.compile(r'All workers exited')
+    r'^(?:'
+    r'\[ALERT\]\s+\(\d+\)\s*:'                                         # any HAProxy alert
+    r'|\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*(?:Current|Former) worker \(\d+\) exited with code (?!0\b)\d+'
+    r'|\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*A worker process unexpectedly died'
+    r'|\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*All workers exited\b'
+    r'|Thread \d+ is about to kill the process'
+    r'|\s*\*?\s*Thread \d+ : id=0x[0-9a-f]+ '
+    r')')
+# A dump block opens ONLY on the watchdog/panic header, and runs until DUMP_END_RE.
+DUMP_START_RE = re.compile(r'^Thread \d+ is about to kill the process')
+DUMP_END_RE = re.compile(r'^\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*All workers exited\b')
 # A new start/reload cycle also closes a dump block.
-CYCLE_RE = re.compile(r'Reloading HAProxy|Initializing new worker|Loading success')
+CYCLE_RE = re.compile(r'^\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*(?:Reloading HAProxy|Initializing new worker|Loading success)')
 # Routine per-start/reload noise: counted and collapsed, never rate-limited.
 ROUTINE_RE = re.compile(
+    r'^\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*(?:'
     r'Proxy \S+ stopped \(cumulated conns'
     r'|config\s*:\s*parsing \[[^\]]*\]\s*:'
-    r"|Former worker \(\d+\) exited with code 0\b"
+    r'|Former worker \(\d+\) exited with code 0\b'
     r'|Reloading HAProxy|Initializing new worker|Loading success'
     r'|path to executable is|haproxy version is'
-    r"|Can't load stats-file|'option forwardfor' ignored")
+    r"|config: Can't load stats-file|'option forwardfor' ignored)")
+LOADED_RE = re.compile(r'^\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*Loading success')
+# Total exemption budget: even real-looking evidence cannot flood without bound.
+CRASH_BUDGET = 1000        # exempt lines per window (a 4-thread dump is ~70)
+CRASH_WINDOW = 600.0       # seconds
+DUMP_COOLDOWN = 60.0       # after a BOUND closes a block, no new block opens for this long
 
 
 def _env_num(name, default, cast=int):
@@ -108,6 +123,9 @@ class Relay:
         self.in_dump = False
         self.dump_lines = 0
         self.dump_since = 0.0
+        self.cooldown_until = 0.0
+        self.budget_left = CRASH_BUDGET
+        self.window_start = clock()
         self.offset = None  # None = first pass: start at EOF (do not replay history)
         self.pending = ''
         self._last_stream = None
@@ -150,31 +168,44 @@ class Relay:
                         % self.suppressed)
             self.suppressed = 0
 
-    def _end_dump(self, why=None):
+    def _budget(self, now):
+        """Take one unit of the crash-evidence budget; False once the window's budget is spent."""
+        if now - self.window_start >= CRASH_WINDOW:
+            self.window_start, self.budget_left = now, CRASH_BUDGET
+        if self.budget_left > 0:
+            self.budget_left -= 1
+            return True
+        return False
+
+    def _end_dump(self, now, why=None):
         self.in_dump = False
-        if why:
+        if why:   # closed by a bound, not by the master's end line: no re-arming for a while
+            self.cooldown_until = now + DUMP_COOLDOWN
             self._write(self.err, '[relay] dump block closed: %s; rate limit applies again' % why)
 
     def _emit(self, line):
         now = self.clock()
         if self.in_dump:
             if (self.dump_lines >= DUMP_MAX_LINES) or (now - self.dump_since > DUMP_MAX_SECONDS):
-                self._end_dump('bound reached (%d lines / %.0fs)' % (self.dump_lines, now - self.dump_since))
-            elif CYCLE_RE.search(line) and not CRASH_RE.search(line):
-                self._end_dump()
-        if CRASH_RE.search(line) or self.in_dump:
-            # crash evidence: bypasses the bucket, the collapse and the summary
-            if not self.in_dump and DUMP_START_RE.search(line):
-                self.in_dump, self.dump_lines, self.dump_since = True, 0, now
-            if self.in_dump:
-                self.dump_lines += 1
-            self._write(self.err, line)
-            if self.in_dump and DUMP_END_RE.search(line):
-                self._end_dump()
-            return
-        if ROUTINE_RE.search(line):
+                self._end_dump(now, 'bound reached (%d lines / %.0fs)' % (self.dump_lines, now - self.dump_since))
+            elif CYCLE_RE.match(line):
+                self._end_dump(now)
+        if self.in_dump or CRASH_RE.match(line):
+            if self._budget(now):
+                # crash evidence: bypasses the bucket, the collapse and the summary
+                if not self.in_dump and DUMP_START_RE.match(line) and now >= self.cooldown_until:
+                    self.in_dump, self.dump_lines, self.dump_since = True, 0, now
+                if self.in_dump:
+                    self.dump_lines += 1
+                self._write(self.err, line)
+                if self.in_dump and DUMP_END_RE.match(line):
+                    self._end_dump(now)
+                return
+            if self.in_dump:   # budget spent mid-block: the normal limiter takes over
+                self._end_dump(now, 'crash-evidence budget (%d lines/%.0fs) spent' % (CRASH_BUDGET, CRASH_WINDOW))
+        if ROUTINE_RE.match(line):
             self.routine += 1
-            if 'Loading success' in line:   # one summary per start/reload
+            if LOADED_RE.match(line):   # one summary per start/reload
                 self._write(self.out, '[relay] reload/start ok: %d routine lines collapsed (full text in the stderr file)'
                             % self.routine)
                 self.routine = 0
