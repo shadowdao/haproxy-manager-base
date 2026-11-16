@@ -766,6 +766,91 @@ def is_process_running(process_name):
             return True
     return False
 
+# ---------------------------------------------------------------------------
+# Launching the HAProxy master (2026-11 forensics change)
+#
+# haproxy.cfg carries `daemon`, and in daemon mode HAProxy re-points the
+# master's stdin/stdout/stderr at /dev/null after it has parsed the config
+# (MEASURED on 3.0.11: /proc/<master>/fd/2 -> /dev/null). That discarded every
+# [ALERT], the "exited with code 134" master line and the whole ha_panic()/
+# watchdog thread dump of the 2026-11 aborts: only the core file survived.
+#
+# `-db` overrides `daemon` (MEASURED: foreground master, still master-worker,
+# reload via the CLI keeps the same master pid), so the master keeps a real
+# stderr. We append it to HAPROXY_STDERR_LOG (haproxy-logs volume, survives a
+# container recreate) and scripts/haproxy-stderr-relay.py forwards it to the
+# container's stderr (-> docker logging driver -> host journald/Graylog).
+#
+# The master is started as `sh -c '... &'` so it is re-parented to PID 1 exactly
+# as the old daemon fork did (PID 1 reaps it; a Popen child would sit as a
+# zombie in the API worker and is_process_running('haproxy') would keep
+# reporting it alive).
+# ---------------------------------------------------------------------------
+HAPROXY_STDERR_LOG = os.environ.get('HAPROXY_STDERR_LOG', '/var/log/haproxy/haproxy-stderr.log')
+try:
+    HAPROXY_START_WAIT = float(os.environ.get('HAPROXY_START_WAIT', '10'))
+except ValueError:
+    HAPROXY_START_WAIT = 10.0
+
+
+def _stderr_log_path():
+    """HAPROXY_STDERR_LOG if its directory is writable, else a /tmp fallback
+    (a missing volume must never stop HAProxy from starting)."""
+    path = HAPROXY_STDERR_LOG
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a'):
+            pass
+        return path
+    except OSError:
+        return '/tmp/haproxy-stderr.log'
+
+
+def spawn_haproxy_master():
+    """Start `haproxy -W -db` detached, stderr appended to the stderr log.
+
+    Returns a subprocess.CompletedProcess (returncode 0, .stderr = the new log
+    text) once HAProxy has loaded its configuration; raises
+    subprocess.CalledProcessError (.stderr = what HAProxy printed) if it exits
+    or never comes up within HAPROXY_START_WAIT seconds. Same contract the old
+    blocking `subprocess.run([... '-W' ...], check=True)` call sites relied on.
+    """
+    cmd = ['haproxy', '-W', '-db', '-S', '/tmp/haproxy-cli,level,admin',
+           '-f', HAPROXY_CONFIG_PATH]
+    log_path = _stderr_log_path()
+    try:
+        offset = os.path.getsize(log_path)
+    except OSError:
+        offset = 0
+    subprocess.run(
+        ['sh', '-c', 'log=$1; shift; "$@" </dev/null >>"$log" 2>&1 &', 'sh', log_path] + cmd,
+        check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL)
+
+    def new_text():
+        try:
+            with open(log_path, 'rb') as fh:
+                fh.seek(offset)
+                return fh.read().decode('utf-8', 'replace')
+        except OSError:
+            return ''
+
+    deadline = time.monotonic() + HAPROXY_START_WAIT
+    started = time.monotonic()
+    while time.monotonic() < deadline:
+        text = new_text()
+        if 'Loading success.' in text:
+            return subprocess.CompletedProcess(cmd, 0, '', text)
+        if time.monotonic() - started > 1.0 and not is_process_running('haproxy'):
+            break
+        time.sleep(0.1)
+    text = new_text()
+    if is_process_running('haproxy') and '[ALERT]' not in text:
+        # Slow to log (big config) but alive: treat as started.
+        return subprocess.CompletedProcess(cmd, 0, '', text)
+    raise subprocess.CalledProcessError(1, cmd, output='', stderr=text[-4000:])
+
+
 # Initialize template engine
 template_loader = jinja2.FileSystemLoader(TEMPLATE_DIR)
 template_env = jinja2.Environment(loader=template_loader)
@@ -871,12 +956,7 @@ def reload_haproxy():
             return jsonify({'status': 'success'}), 200
         else:
             # Start HAProxy if it's not running
-            result = subprocess.run(
-                ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
-                check=True,
-                capture_output=True,
-                text=True
-            )
+            result = spawn_haproxy_master()
             if result.returncode == 0:
                 print("HAProxy started successfully")
                 log_operation('start_haproxy', True)
@@ -3778,10 +3858,7 @@ def reload_haproxy_safely(backup_status=None):
         else:
             # HAProxy not running, start it
             try:
-                result = subprocess.run(
-                    ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
-                    check=True, capture_output=True, text=True
-                )
+                result = spawn_haproxy_master()
                 logger.info("HAProxy started successfully")
                 # Now - and only now - is this config known good.
                 promote_current_config_to_backup()
@@ -4114,12 +4191,7 @@ def start_haproxy():
                     return
             
             # Configuration is valid, start HAProxy
-            result = subprocess.run(
-                ['haproxy', '-W', '-S', '/tmp/haproxy-cli,level,admin', '-f', HAPROXY_CONFIG_PATH],
-                check=True,
-                capture_output=True,
-                text=True
-            )
+            result = spawn_haproxy_master()
             if result.returncode == 0:
                 logger.info("HAProxy started successfully")
                 log_operation('start_haproxy', True, 'HAProxy started successfully')

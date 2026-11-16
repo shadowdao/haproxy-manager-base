@@ -23,49 +23,67 @@ LABEL org.opencontainers.image.title="haproxy-manager-base" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
-# haproxy is PINNED to a reviewed UPSTREAM version (HAPROXY_UPSTREAM), not to one
-# Debian package revision. It was previously unpinned, so the binary could move
-# under us at Debian's timing - an upstream release that rejected our config would
-# have broken an unrelated commit's build, or worse, shipped an edge that refuses
-# to start (see the `haproxy -c` gate below for why that matters: a config HAProxy
-# rejects leaves the container Up with 80/443 unbound and /health still 200).
+# haproxy comes from the UPSTREAM-maintained apt repo https://haproxy.debian.net
+# (Vincent Bernat's builds, the Debian maintainer's own), suite
+# `trixie-backports-<series>`, NOT from Debian trixie's archive.
 #
-# History: this used to pin the exact Debian version (3.0.11-1+deb13u3). Debian
-# security then shipped 3.0.11-1+deb13u4 (same upstream 3.0.11, same arch set) and
-# the exact pin silently froze the image on the OLDER, unpatched revision, and
-# would hard-fail the build as soon as u3 left the archive. Debian security
-# revisions of the SAME upstream version are exactly what we want to take, so:
-#   * an apt preference (Pin: version 3.0.11-*) makes apt install the NEWEST
-#     Debian revision of that upstream version on any architecture;
-#   * the build then FAILS unless the installed package AND `haproxy -v` both
-#     report that upstream version, so a major/minor bump (3.0 -> 3.1, 3.0.12)
-#     can never arrive by accident: that still needs this ARG changed and the
-#     `haproxy -c` gate below to pass.
-# The pin and the gate compose: pinned = the version moves deliberately; the gate
-# answers immediately whether the new binary still accepts fleet config.
+# WHY (2026-11-16 forensics): Debian trixie ships 3.0.11 (+ security revisions).
+# That build aborts via HAProxy's own watchdog inside the DNS resolver
+# (resolv_process_responses / snr_resolution_cb, haproxy issue #3101) - whole
+# edge down 15-52 s per abort on sdbees/whp01. The fix ("dns: bind the
+# nameserver sockets to the initiating thread", "resolvers: make
+# process_resolvers() single-threaded") is in 3.0.13+, 3.1.11+ and 3.2.6+;
+# Debian trixie will not take it. See docs/go-port/haproxy-edge-upgrade-and-logging.md
+# in the WHP repo for the version evidence and the rollout plan.
 #
-# To move to another upstream version: change HAPROXY_UPSTREAM, rebuild, let the
-# gate verify. Check what Debian offers with:  apt-cache madison haproxy
-ARG HAPROXY_UPSTREAM=3.0.11
+# Series: 3.2 (LTS, supported to 2030-Q2). Its trixie package is built with
+# USE_QUIC=1 against the system OpenSSL 3.5.x NATIVE QUIC API (depends on
+# libssl3t64 >= 3.5.1), so no USE_QUIC_OPENSSL_COMPAT layer. (3.0.x upstream
+# has no trixie packages and would need a source build.)
+#
+# The repo only keeps the CURRENT patch of each series, so the pin is the SERIES
+# (HAPROXY_UPSTREAM=3.2 -> apt preference `3.2.*`), and the build:
+#   * FAILS unless the installed package AND `haproxy -v` both report that series
+#     (a 3.2 -> 3.3/3.4 jump can never arrive by accident: change the ARG);
+#   * records the exact resolved version in /haproxy/HAPROXY_VERSION and the
+#     `haproxy -c` gate below proves the new binary accepts the fleet config;
+#   * for reproducibility pass --build-arg HAPROXY_EXACT=3.2.26 to also pin the
+#     patch (fails loudly when the repo has moved on - bump deliberately).
+# The repo signing key is COMMITTED (keys/haproxy-debian-net/, Vincent Bernat,
+# fingerprint AEF2 3487 66F3 71C6 89A7 3600 95A4 2FE8 3535 25F9) and used with
+# signed-by, never fetched at build time. The fingerprint is asserted below.
+ARG HAPROXY_UPSTREAM=3.2
+ARG HAPROXY_EXACT=
 # OPTIONAL internal package cache, e.g. --build-arg PKG_CACHE=https://192.168.1.40
 # (CT130 pkg-cache, https only; CI sets it only after probing the cache with the
 # pinned CA). Unset = the upstream Debian repositories, exactly as before. The
 # apt sources are restored before this RUN ends (restore FAILS the build if any
 # reference to the cache is left), so no shipped layer carries the cache address.
+# NOTE: CT130 does not proxy haproxy.debian.net (see the design doc); that one
+# repo is always fetched directly.
 # Canonical script + docs: cloud-apache-container (scripts/pkg-cache-repos.sh,
 # docs/pkg-cache.md there); this repo carries byte-identical copies.
 ARG PKG_CACHE=
 COPY ./scripts/pkg-cache-repos.sh /usr/local/sbin/pkg-cache-repos.sh
 COPY ./keys/pkg-cache/ /usr/local/share/pkg-cache/
+COPY ./keys/haproxy-debian-net/haproxy-archive-keyring.gpg /etc/apt/keyrings/haproxy-archive-keyring.gpg
 RUN /usr/local/sbin/pkg-cache-repos.sh apt && \
     apt update -y && apt dist-upgrade -y && \
-    printf 'Package: haproxy\nPin: version %s-*\nPin-Priority: 1001\n' "${HAPROXY_UPSTREAM}" > /etc/apt/preferences.d/haproxy-upstream-pin && \
+    apt install -y --no-install-recommends gnupg ca-certificates && \
+    gpg --show-keys --with-colons /etc/apt/keyrings/haproxy-archive-keyring.gpg | awk -F: '/^fpr:/{print $10; exit}' | grep -qx 'AEF2348766F371C689A7360095A42FE8353525F9' && \
+    echo "deb [signed-by=/etc/apt/keyrings/haproxy-archive-keyring.gpg] https://haproxy.debian.net trixie-backports-${HAPROXY_UPSTREAM} main" > /etc/apt/sources.list.d/haproxy-debian-net.list && \
+    apt update -y && \
+    pin="${HAPROXY_EXACT:-${HAPROXY_UPSTREAM}.*}" && \
+    printf 'Package: haproxy\nPin: version %s\nPin-Priority: 1001\n' "${pin}" > /etc/apt/preferences.d/haproxy-upstream-pin && \
     apt install socat haproxy cron certbot curl jq net-tools -y && apt-mark hold haproxy && \
     rm -f /etc/apt/preferences.d/haproxy-upstream-pin && \
     deb_ver="$(dpkg-query -W -f='${Version}' haproxy)" && \
-    case "${deb_ver}" in "${HAPROXY_UPSTREAM}"-*) ;; *) echo "FATAL: installed haproxy ${deb_ver} is not upstream ${HAPROXY_UPSTREAM}" >&2; exit 1;; esac && \
-    haproxy -v | head -n1 | grep -F "version ${HAPROXY_UPSTREAM}-" && \
-    echo "haproxy pin OK: upstream ${HAPROXY_UPSTREAM}, Debian package ${deb_ver}" && \
+    case "${deb_ver}" in "${HAPROXY_UPSTREAM}".*) ;; *) echo "FATAL: installed haproxy ${deb_ver} is not series ${HAPROXY_UPSTREAM}" >&2; exit 1;; esac && \
+    haproxy -v | head -n1 | grep -F "version ${HAPROXY_UPSTREAM}." && \
+    haproxy -vv | grep -E 'USE_QUIC=1|\+QUIC ' >/dev/null && \
+    if haproxy -vv | grep -q 'USE_QUIC_OPENSSL_COMPAT=1'; then echo "FATAL: QUIC compat layer build, expected native OpenSSL QUIC" >&2; exit 1; fi && \
+    mkdir -p /haproxy && { haproxy -v | head -n1; echo "package ${deb_ver}"; } > /haproxy/HAPROXY_VERSION && \
+    echo "haproxy OK: series ${HAPROXY_UPSTREAM}, Debian package ${deb_ver}" && \
     /usr/local/sbin/pkg-cache-repos.sh restore && \
     apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
@@ -122,6 +140,7 @@ RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
  && python3 /haproxy/scripts/test-xmlrpc-rate-limit.py \
  && python3 /haproxy/scripts/test-default-splash.py \
  && python3 /haproxy/scripts/test-access-log-receiver.py \
+ && python3 /haproxy/scripts/test-haproxy-stderr-relay.py \
  && python3 /haproxy/scripts/test-config-rollback.py \
  && python3 /haproxy/scripts/test-cert-write-safety.py \
  && python3 /haproxy/scripts/test-cert-scripts.py \

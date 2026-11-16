@@ -75,6 +75,9 @@ sys.path.insert(0, MODULE_DIR)
 # The module opens /var/log/haproxy-manager.log at import time via
 # logging.FileHandler. Redirect that one call so the suite runs unprivileged.
 _LOG_DIR = tempfile.mkdtemp(prefix='haproxy-mgr-test-logs-')
+# spawn_haproxy_master() appends the master's stderr here.
+os.environ.setdefault('HAPROXY_STDERR_LOG', os.path.join(_LOG_DIR, 'haproxy-stderr.log'))
+os.environ.setdefault('HAPROXY_START_WAIT', '3')
 _real_file_handler = logging.FileHandler
 logging.FileHandler = (
     lambda fn, *a, **kw: _real_file_handler(
@@ -225,8 +228,9 @@ FAKE_HAPROXY = textwrap.dedent(f"""\
     #   haproxy -c -f FILE  -> reject FILE containing {BROKEN_TOKEN}
     #                          reject any unusable file in $TEST_CERTS_DIR
     cfg=""
+    start=0
     while [ $# -gt 0 ]; do
-      case "$1" in -f) cfg="$2"; shift ;; esac
+      case "$1" in -f) cfg="$2"; shift ;; -W) start=1 ;; esac
       shift
     done
     if [ -n "$cfg" ] && grep -q '{BROKEN_TOKEN}' "$cfg" 2>/dev/null; then
@@ -250,6 +254,8 @@ FAKE_HAPROXY = textwrap.dedent(f"""\
         fi
       done
     fi
+    # real `haproxy -W -db` prints this once the config is loaded
+    [ "$start" = 1 ] && echo "[NOTICE]   (1) : Loading success." >&2
     exit 0
 """)
 

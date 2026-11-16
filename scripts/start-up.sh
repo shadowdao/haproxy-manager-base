@@ -75,6 +75,20 @@ mkdir -p /var/log/haproxy /var/lib/haproxy
 
 cron &
 
+# HAProxy stderr relay (see scripts/haproxy-stderr-relay.py and
+# haproxy_manager.spawn_haproxy_master()). HAProxy's master stderr (ALERTs,
+# "exited with code 134", the watchdog/ha_panic thread dump) is appended to
+# /var/log/haproxy/haproxy-stderr.log; this loop re-emits it on the container's
+# stderr so `docker logs` / the docker logging driver / Graylog get it. Started
+# BEFORE init.py so the first start's lines are followed. Restarted within 2 s
+# if it ever dies; it only reads a file, so it can never affect HAProxy.
+(
+    while true; do
+        python /haproxy/scripts/haproxy-stderr-relay.py || true
+        sleep 2
+    done
+) &
+
 # Phase 1: container init
 python /haproxy/scripts/init.py
 
@@ -84,13 +98,32 @@ python /haproxy/scripts/init.py
 # segfault), the container stays "up" (gunicorn is PID 1), Docker's --restart
 # policy never fires, and haproxy is down until the external host watchdog
 # full-restarts the whole container minutes later (dropping every connection).
-# This loop revives haproxy in place within one interval. ensure_haproxy.py is
-# idempotent — a cheap no-op whenever haproxy is already running.
-HAPROXY_SUPERVISOR_INTERVAL="${HAPROXY_SUPERVISOR_INTERVAL:-15}"
+# This loop revives haproxy in place within one interval.
+#
+# The liveness probe is `pidof` (a few ms), NOT python: ensure_haproxy.py imports
+# the 4000-line manager (Flask, Jinja, ...) which costs ~0.5 s of CPU per run and
+# was affordable at 15 s but not at 2 s. python only runs when haproxy is gone.
+# 2026-11 evidence: every watchdog abort took the whole edge down for 15-52 s,
+# most of it detection latency + start; the default is now 2 s (was 15).
+# If a restart attempt FAILS (config HAProxy rejects), the loop backs off
+# exponentially to HAPROXY_SUPERVISOR_MAX_BACKOFF (default 30 s) instead of
+# re-rendering/re-validating the same broken config every 2 s.
+HAPROXY_SUPERVISOR_INTERVAL="${HAPROXY_SUPERVISOR_INTERVAL:-2}"
+HAPROXY_SUPERVISOR_MAX_BACKOFF="${HAPROXY_SUPERVISOR_MAX_BACKOFF:-30}"
 (
+    delay="${HAPROXY_SUPERVISOR_INTERVAL}"
     while true; do
-        sleep "${HAPROXY_SUPERVISOR_INTERVAL}"
-        python /haproxy/scripts/ensure_haproxy.py 2>&1 || true
+        sleep "${delay}"
+        if pidof -q haproxy; then
+            delay="${HAPROXY_SUPERVISOR_INTERVAL}"
+            continue
+        fi
+        if python /haproxy/scripts/ensure_haproxy.py 2>&1; then
+            delay="${HAPROXY_SUPERVISOR_INTERVAL}"
+        else
+            delay=$(( delay * 2 ))
+            [ "${delay}" -gt "${HAPROXY_SUPERVISOR_MAX_BACKOFF}" ] && delay="${HAPROXY_SUPERVISOR_MAX_BACKOFF}"
+        fi
     done
 ) &
 
