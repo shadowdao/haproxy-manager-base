@@ -92,40 +92,10 @@ cron &
 # Phase 1: container init
 python /haproxy/scripts/init.py
 
-# Phase 1.5: in-container haproxy supervisor.
-# haproxy runs as a background child of PID 1 (gunicorn) with NOTHING watching
-# it after init. If the haproxy master dies mid-life (e.g. SIGABRT -> exit 134,
-# segfault), the container stays "up" (gunicorn is PID 1), Docker's --restart
-# policy never fires, and haproxy is down until the external host watchdog
-# full-restarts the whole container minutes later (dropping every connection).
-# This loop revives haproxy in place within one interval.
-#
-# The liveness probe is `pidof` (a few ms), NOT python: ensure_haproxy.py imports
-# the 4000-line manager (Flask, Jinja, ...) which costs ~0.5 s of CPU per run and
-# was affordable at 15 s but not at 2 s. python only runs when haproxy is gone.
-# 2026-11 evidence: every watchdog abort took the whole edge down for 15-52 s,
-# most of it detection latency + start; the default is now 2 s (was 15).
-# If a restart attempt FAILS (config HAProxy rejects), the loop backs off
-# exponentially to HAPROXY_SUPERVISOR_MAX_BACKOFF (default 30 s) instead of
-# re-rendering/re-validating the same broken config every 2 s.
-HAPROXY_SUPERVISOR_INTERVAL="${HAPROXY_SUPERVISOR_INTERVAL:-2}"
-HAPROXY_SUPERVISOR_MAX_BACKOFF="${HAPROXY_SUPERVISOR_MAX_BACKOFF:-30}"
-(
-    delay="${HAPROXY_SUPERVISOR_INTERVAL}"
-    while true; do
-        sleep "${delay}"
-        if pidof -q haproxy; then
-            delay="${HAPROXY_SUPERVISOR_INTERVAL}"
-            continue
-        fi
-        if python /haproxy/scripts/ensure_haproxy.py 2>&1; then
-            delay="${HAPROXY_SUPERVISOR_INTERVAL}"
-        else
-            delay=$(( delay * 2 ))
-            [ "${delay}" -gt "${HAPROXY_SUPERVISOR_MAX_BACKOFF}" ] && delay="${HAPROXY_SUPERVISOR_MAX_BACKOFF}"
-        fi
-    done
-) &
+# Phase 1.5: in-container haproxy supervisor (see scripts/haproxy-supervisor.sh:
+# revives a dead haproxy master within HAPROXY_SUPERVISOR_INTERVAL seconds, with
+# backoff on failed restarts and on crash loops; knobs validated as integers).
+/haproxy/scripts/haproxy-supervisor.sh &
 
 # Phase 2: WSGI servers
 # Tunable via env: HAPROXY_MGR_API_WORKERS (default 2), HAPROXY_MGR_API_TIMEOUT

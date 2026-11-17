@@ -27,6 +27,13 @@ Properties
   are forwarded in full even when the bucket is empty, within a total budget of
   CRASH_BUDGET lines per CRASH_WINDOW (after that they take the normal limiter
   and are counted in the suppressed summary). They go to STDERR.
+* Tenant-driven state lines (TENANT_RE: "backend 'b' has no server available!",
+  "Server b/s is DOWN|UP ...") are NOT crash evidence even though HAProxy prints
+  the first at [ALERT]: every tenant container stop/crash/deploy makes them.
+  Own rate-limited STDOUT class (own bucket TENANT_BURST/TENANT_PER_MIN, own
+  "[relay] suppressed N tenant-driven ..." summary). They also reach the WHP AI
+  monitor through `docker logs haproxy-manager`; rate-limiting them is intended.
+  Dump blocks have their own budget (DUMP_BUDGET) that nothing else can spend.
 * Routine reload noise (ROUTINE_RE: "Proxy X stopped (cumulated conns ...)",
   config "parsing [...]" warnings, "Former worker (N) exited with code 0",
   "Initializing new worker", "Loading success", ...) never touches the bucket:
@@ -71,12 +78,23 @@ SUMMARY_EVERY = 60.0
 # Crash evidence: forwarded (to stderr) without the bucket, within CRASH_BUDGET.
 CRASH_RE = re.compile(
     r'^(?:'
-    r'\[ALERT\]\s+\(\d+\)\s*:'                                         # any HAProxy alert
+    r'\[ALERT\]\s+\(\d+\)\s*:\s*(?:Current worker \(\d+\) exited with code|exit-on-failure:|A worker process unexpectedly died)'
     r'|\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*(?:Current|Former) worker \(\d+\) exited with code (?!0\b)\d+'
     r'|\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*A worker process unexpectedly died'
     r'|\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*All workers exited\b'
     r'|Thread \d+ is about to kill the process'
     r'|\s*\*?\s*Thread \d+ : id=0x[0-9a-f]+ '
+    r')')
+# Tenant-driven state lines. WHP gives every tenant server `check`, so every
+# tenant container stop/crash/OOM/deploy and every host-wide container restart
+# makes HAProxy print these at runtime (at ALERT/WARNING level). They are NOT crash
+# evidence: own RATE-LIMITED class on STDOUT with their own bucket and summary, so
+# they can neither reach priority 3 nor spend the general bucket / crash budgets.
+TENANT_RE = re.compile(
+    r'^\[(?:ALERT|WARNING|NOTICE)\]\s+\(\d+\)\s*:\s*(?:'
+    r"backend '[^']*' has no server available!"
+    r'|Server \S+ (?:is (?:DOWN|UP|going DOWN|stopping|NOLB)\b|was DOWN\b)'
+    r'|Health check for (?:backup )?server \S+ '
     r')')
 # A dump block opens ONLY on the watchdog/panic header, and runs until DUMP_END_RE.
 DUMP_START_RE = re.compile(r'^Thread \d+ is about to kill the process')
@@ -96,6 +114,10 @@ LOADED_RE = re.compile(r'^\[(?:NOTICE|WARNING)\]\s+\(\d+\)\s*:\s*Loading success
 # Total exemption budget: even real-looking evidence cannot flood without bound.
 CRASH_BUDGET = 1000        # exempt lines per window (a 4-thread dump is ~70)
 CRASH_WINDOW = 600.0       # seconds
+DUMP_BUDGET = 1000         # dump-block lines (header + body) per window: a SEPARATE budget that
+                           # ordinary evidence lines (worker exits, alerts) can never spend
+TENANT_BURST = 100         # tenant-driven state lines: own bucket (burst / refill per minute)
+TENANT_PER_MIN = 30
 DUMP_COOLDOWN = 60.0       # after a BOUND closes a block, no new block opens for this long
 
 
@@ -126,6 +148,11 @@ class Relay:
         self.cooldown_until = 0.0
         self.budget_left = CRASH_BUDGET
         self.window_start = clock()
+        self.dump_budget_left = DUMP_BUDGET
+        self.dump_window_start = clock()
+        self.tenant_tokens = float(TENANT_BURST)
+        self.tenant_last = clock()
+        self.tenant_suppressed = 0
         self.offset = None  # None = first pass: start at EOF (do not replay history)
         self.pending = ''
         self._last_stream = None
@@ -136,6 +163,15 @@ class Relay:
         self.last = now
         if self.tokens >= 1:
             self.tokens -= 1
+            return True
+        return False
+
+    def _take_tenant(self):
+        now = self.clock()
+        self.tenant_tokens = min(TENANT_BURST, self.tenant_tokens + (now - self.tenant_last) * TENANT_PER_MIN / 60.0)
+        self.tenant_last = now
+        if self.tenant_tokens >= 1:
+            self.tenant_tokens -= 1
             return True
         return False
 
@@ -163,13 +199,26 @@ class Relay:
             self._write(self.out, '[relay] %d routine reload/start lines collapsed (full text in the stderr file)'
                         % self.routine)
             self.routine = 0
+        if self.tenant_suppressed:
+            self._write(self.out, '[relay] suppressed %d tenant-driven server/backend state lines '
+                        '(rate limit; full text in the stderr file)' % self.tenant_suppressed)
+            self.tenant_suppressed = 0
         if self.suppressed:
             self._write(self.out, '[relay] suppressed %d lines (rate limit; full text in the stderr file)'
                         % self.suppressed)
             self.suppressed = 0
 
-    def _budget(self, now):
-        """Take one unit of the crash-evidence budget; False once the window's budget is spent."""
+    def _budget(self, now, kind='crash'):
+        """Take one unit of a budget; False once the window's budget is spent.
+
+        kind 'crash': ordinary evidence lines; kind 'dump': dump-block lines (own budget)."""
+        if kind == 'dump':
+            if now - self.dump_window_start >= CRASH_WINDOW:
+                self.dump_window_start, self.dump_budget_left = now, DUMP_BUDGET
+            if self.dump_budget_left > 0:
+                self.dump_budget_left -= 1
+                return True
+            return False
         if now - self.window_start >= CRASH_WINDOW:
             self.window_start, self.budget_left = now, CRASH_BUDGET
         if self.budget_left > 0:
@@ -191,7 +240,9 @@ class Relay:
             elif CYCLE_RE.match(line):
                 self._end_dump(now)
         if self.in_dump or CRASH_RE.match(line):
-            if self._budget(now):
+            is_dump = self.in_dump or bool(DUMP_START_RE.match(line))
+            kind = 'dump' if is_dump else 'crash'
+            if self._budget(now, kind):
                 # crash evidence: bypasses the bucket, the collapse and the summary
                 if not self.in_dump and DUMP_START_RE.match(line) and now >= self.cooldown_until:
                     self.in_dump, self.dump_lines, self.dump_since = True, 0, now
@@ -209,6 +260,13 @@ class Relay:
                 self._write(self.out, '[relay] reload/start ok: %d routine lines collapsed (full text in the stderr file)'
                             % self.routine)
                 self.routine = 0
+            self._summaries()
+            return
+        if TENANT_RE.match(line):
+            if self._take_tenant():
+                self._write(self.out, line)
+            else:
+                self.tenant_suppressed += 1
             self._summaries()
             return
         if self._take():
@@ -233,6 +291,7 @@ class Relay:
                 if os.path.exists(src):
                     os.replace(src, '%s.%d' % (self.path, i))
             shutil.copyfile(self.path, self.path + '.1')
+            os.chmod(self.path + '.1', 0o640)
             with open(self.path, 'r+b') as fh:
                 fh.truncate(0)
             self.offset = 0

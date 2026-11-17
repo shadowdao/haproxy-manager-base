@@ -799,8 +799,8 @@ def _stderr_log_path():
     path = HAPROXY_STDERR_LOG
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'a'):
-            pass
+        # 0640: HAProxy echoes tenant hostnames/backend names here (not world-readable)
+        os.close(os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640))
         return path
     except OSError:
         return '/tmp/haproxy-stderr.log'
@@ -823,7 +823,8 @@ def spawn_haproxy_master():
     except OSError:
         offset = 0
     subprocess.run(
-        ['sh', '-c', 'log=$1; shift; "$@" </dev/null >>"$log" 2>&1 &', 'sh', log_path] + cmd,
+        ['sh', '-c', 'log=$1; shift; (umask 027; : >>"$log"); chmod 0640 "$log" 2>/dev/null; '
+         '"$@" </dev/null >>"$log" 2>&1 &', 'sh', log_path] + cmd,
         check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL)
 

@@ -242,7 +242,6 @@ class CapturedScenarioTests(unittest.TestCase):
         r.tokens = 0.0
         evidence = ['[ALERT]    (6328) : Current worker (6631) exited with code 134 (Aborted)',
                     '[ALERT]    (6328) : exit-on-failure: killing every processes with SIGTERM',
-                    '[ALERT]    (12) : config : unable to load',
                     '[WARNING]  (6328) : Current worker (9) exited with code 139 (Segmentation fault)',
                     '[WARNING]  (6328) : A worker process unexpectedly died and this can only be explained by a bug in haproxy',
                     '[WARNING]  (6328) : All workers exited. Exiting... (134)',
@@ -298,7 +297,7 @@ class CapturedScenarioTests(unittest.TestCase):
             r._emit('  Thread 2 : id=0x7f60ef5ff6c0 act=0 glob=0 wq=1 rq=0 tl=0 tlsz=0 rqsz=0')
             r._emit('[WARNING]  (1) : All workers exited. Exiting... (134)')
         n = err.getvalue().count('\n')
-        self.assertLessEqual(n, relay.CRASH_BUDGET + 5)
+        self.assertLessEqual(n, relay.CRASH_BUDGET + relay.DUMP_BUDGET + 5)
         self.assertGreater(r.suppressed, 50000)                 # the rest is counted, not lost silently
         t[0] += relay.CRASH_WINDOW + 1                          # a new window: real evidence flows again
         before = err.getvalue().count('\n')
@@ -361,6 +360,77 @@ class CapturedScenarioTests(unittest.TestCase):
         r._emit('later benign line')
         self.assertFalse(r.in_dump)
         self.assertNotIn('later benign', err.getvalue())
+
+
+    # --- review finding I2: tenant-triggered ALERT lines must not spend crash evidence --------
+    TENANT_LINES = [
+        "[ALERT]    (10) : backend 'be_tenant1' has no server available!",
+        "[WARNING]  (10) : Server be_tenant1/s1 is DOWN, reason: Layer4 connection problem, info: \"Connection refused\", check duration: 0ms. 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
+        "[WARNING]  (10) : Server be_tenant1/s1 is UP, reason: Layer4 check passed, check duration: 0ms. 1 active and 0 backup servers online. 0 sessions requeued, 0 total in queue.",
+        "[NOTICE]   (10) : Server be_tenant1/s1 is going DOWN for maintenance.",
+    ]
+
+    def test_tenant_alert_flood_then_panic_still_forwards_the_full_dump_at_stderr(self):
+        out, err, t = io.StringIO(), io.StringIO(), [0.0]
+        r = relay.Relay('/nonexistent', out, 400, 120, 1 << 30, 3, clock=lambda: t[0], err=err)
+        for i in range(1200):
+            r._emit(self.TENANT_LINES[0])
+            t[0] += 0.001
+        t[0] += 5.0
+        for l in DUMP:
+            if l.strip():
+                r._emit(l)
+        got = [l[len(relay.PREFIX):] for l in err.getvalue().split('\n') if l]
+        self.assertEqual(got, [d.rstrip() for d in DUMP if d.strip()])
+        self.assertIn('exited with code 134', err.getvalue())
+        self.assertNotIn('exited with code 134', out.getvalue())
+        self.assertNotIn('has no server available', err.getvalue())
+
+    def test_tenant_lines_are_their_own_rate_limited_stdout_class(self):
+        out, err, t = io.StringIO(), io.StringIO(), [0.0]
+        r = relay.Relay('/nonexistent', out, 400, 120, 1 << 30, 3, clock=lambda: t[0], err=err)
+        for i in range(1200):
+            r._emit(self.TENANT_LINES[i % len(self.TENANT_LINES)])
+        self.assertEqual(err.getvalue(), '')                     # never PRIORITY 3
+        self.assertLessEqual(out.getvalue().count('\n'), relay.TENANT_BURST + 2)
+        self.assertGreater(out.getvalue().count('\n'), 0)        # but not silently dropped
+        self.assertEqual(r.tokens, 400.0)                        # general bucket untouched
+        self.assertEqual(r.budget_left, relay.CRASH_BUDGET)      # crash budget untouched
+        self.assertEqual(r.dump_budget_left, relay.DUMP_BUDGET)
+        self.assertGreater(r.tenant_suppressed, 1000)
+        t[0] += relay.SUMMARY_EVERY + 1
+        r.tick()
+        self.assertRegex(out.getvalue(), r'\[relay\] suppressed \d+ tenant-driven server/backend state lines')
+        self.assertEqual(r.tenant_suppressed, 0)
+
+    def test_other_alerts_are_not_crash_evidence(self):
+        out, err = io.StringIO(), io.StringIO()
+        r = relay.Relay('/nonexistent', out, 400, 120, 1 << 30, 3, clock=lambda: 0.0, err=err)
+        r._emit('[ALERT]    (12) : config : unable to load')
+        r._emit("[ALERT]    (12) : backend 'x' has no server available!")
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(out.getvalue().count("\n"), 2)      # both reach stdout (rate-limited classes), neither stderr
+
+
+    def test_dump_block_has_a_budget_ordinary_evidence_cannot_spend(self):
+        out, err, t = io.StringIO(), io.StringIO(), [0.0]
+        r = relay.Relay('/nonexistent', out, 1, 1, 1 << 30, 3, clock=lambda: t[0], err=err)
+        r.tokens = 0.0
+        for i in range(relay.CRASH_BUDGET + 500):       # e.g. a worker crash loop
+            r._emit('[ALERT]    (10) : Current worker (%d) exited with code 134 (Aborted)' % i)
+        self.assertEqual(r.budget_left, 0)
+        before = err.getvalue().count('\n')
+        for l in DUMP:
+            if l.strip():
+                r._emit(l)
+        self.assertEqual(err.getvalue().count('\n') - before, len([d for d in DUMP if d.strip()]))
+
+    def test_rotated_backup_is_mode_0640(self):
+        r = relay.Relay(self.path, io.StringIO(), 1000, 120, 10, 3, clock=lambda: 0.0)
+        os.chmod(self.path, 0o644)
+        self.append('x' * 100 + '\n')
+        r.rotate_if_needed()
+        self.assertEqual(os.stat(self.path + '.1').st_mode & 0o777, 0o640)
 
     # shared helpers for the file-driven tests
     def setUp(self):
@@ -465,11 +535,11 @@ class MutantTests(unittest.TestCase):
         return err.getvalue().count('\n')
 
     def test_flood_capped_on_real_module(self):
-        self.assertLessEqual(self._flood(relay), relay.CRASH_BUDGET + 5)
+        self.assertLessEqual(self._flood(relay), relay.CRASH_BUDGET + relay.DUMP_BUDGET + 5)
 
     def test_mutant_budget_removed(self):
-        m = self.load_mutant('if self._budget(now):', 'if True:')
-        self.assertGreater(self._flood(m), relay.CRASH_BUDGET + 5)
+        m = self.load_mutant('if self._budget(now, kind):', 'if True:')
+        self.assertGreater(self._flood(m), relay.CRASH_BUDGET + relay.DUMP_BUDGET + 5)
 
     def _rearm(self, mod):
         r = mod.Relay('/nonexistent', io.StringIO(), 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=io.StringIO())
@@ -495,6 +565,50 @@ class MutantTests(unittest.TestCase):
         r.tick()
         self.assertNotIn('[relay] suppressed', out.getvalue())
 
+
+    def _tenant_then_panic_ok(self, mod):
+        out, err, t = io.StringIO(), io.StringIO(), [0.0]
+        r = mod.Relay('/nonexistent', out, 400, 120, 1 << 30, 3, clock=lambda: t[0], err=err)
+        for i in range(1200):
+            r._emit("[ALERT]    (10) : backend 'be_tenant1' has no server available!")
+            t[0] += 0.001
+        t[0] += 5.0
+        for l in DUMP:
+            if l.strip():
+                r._emit(l)
+        got = [l[len(mod.PREFIX):] for l in err.getvalue().split('\n') if l]
+        return got == [d.rstrip() for d in DUMP if d.strip()] and 'no server available' not in err.getvalue()
+
+    def test_tenant_then_panic_clean_on_real_module(self):
+        self.assertTrue(self._tenant_then_panic_ok(relay))
+
+    def test_mutant_wide_alert_exemption_restored(self):
+        m = self.load_mutant("\\[ALERT\\]\\s+\\(\\d+\\)\\s*:\\s*(?:Current worker", "\\[ALERT\\]\\s+\\(\\d+\\)\\s*:\\s*(?:.|Current worker")
+        self.assertFalse(self._tenant_then_panic_ok(m))
+
+    def test_mutant_tenant_class_removed(self):
+        m = self.load_mutant('if TENANT_RE.match(line):', 'if False:')
+        self.assertFalse(self._tenant_then_panic_ok(m) and self._tenant_stdout_ok(m))
+
+    def _tenant_stdout_ok(self, mod):
+        out, err = io.StringIO(), io.StringIO()
+        r = mod.Relay('/nonexistent', out, 400, 120, 1 << 30, 3, clock=lambda: 0.0, err=err)
+        for i in range(1200):
+            r._emit("[WARNING]  (10) : Server be_t/s1 is DOWN, reason: Layer4 timeout")
+        return r.tokens == 400.0 and out.getvalue().count('\n') <= mod.TENANT_BURST + 2
+
+    def test_mutant_shared_budget(self):
+        m = self.load_mutant("'dump' if is_dump else 'crash'", "'crash'")
+        out, err = io.StringIO(), io.StringIO()
+        r = m.Relay('/nonexistent', out, 1, 1, 1 << 30, 3, clock=lambda: 0.0, err=err)
+        r.tokens = 0.0
+        for i in range(m.CRASH_BUDGET + 500):
+            r._emit('[ALERT]    (10) : Current worker (%d) exited with code 134 (Aborted)' % i)
+        before = err.getvalue().count('\n')
+        for l in DUMP:
+            if l.strip():
+                r._emit(l)
+        self.assertNotEqual(err.getvalue().count('\n') - before, len([d for d in DUMP if d.strip()]))
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,9 +1,15 @@
 name: HAProxy Manager Build and Push
-run-name: ${{ gitea.actor }} pushed a change to main
+run-name: ${{ gitea.actor }} pushed ${{ gitea.ref_name }}
 on:
   push:
     branches:
       - main
+      # Release candidates: a push to release/* builds the SAME image but publishes
+      # ONLY :<VERSION>-rc and :<sha>, never :latest and never the plain :<VERSION>
+      # (see the "Resolve tags" step). Main keeps its behaviour.
+      - 'release/**'
+    tags:
+      - 'rc-*'
   # Manual publish (e.g. after a [skip ci] merge, or to re-publish after a
   # failed arm64 leg).
   workflow_dispatch:
@@ -77,6 +83,30 @@ jobs:
         id: ver
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
+      # Publishing strategy. main: :latest + :<version> + :<sha> (unchanged).
+      # release/* branch or rc-* tag: :<version>-rc + :<sha> ONLY. A release candidate
+      # is deployed per host by explicit tag (durable per-host pin in WHP); :latest is
+      # moved to it by a later main publish only after the staged rollout succeeded.
+      # Any other ref (e.g. a manual workflow_dispatch on a feature branch) is refused
+      # rather than guessed at.
+      - name: Resolve tags
+        id: tags
+        env:
+          REF: ${{ gitea.ref }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA: ${{ gitea.sha }}
+        run: |
+          case "$REF" in
+            refs/heads/main)
+              tags="latest ${VERSION} ${SHA}" ;;
+            refs/heads/release/*|refs/tags/rc-*)
+              tags="${VERSION}-rc ${SHA}" ;;
+            *)
+              echo "::error::refusing to publish from ref ${REF} (only main, release/* and rc-* tags)"; exit 1 ;;
+          esac
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "publishing tags: ${tags}"
+
       # amd64: required. Pushed untagged by digest to both registries (same
       # digest in each); tags are only created by the assemble step below.
       - name: Build amd64 (push by digest)
@@ -103,19 +133,22 @@ jobs:
             PKG_CACHE=${{ steps.pkgcache.outputs.url }}
           outputs: type=image,"name=repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base,ghcr.io/shadowdao/haproxy-manager-base",push-by-digest=true,name-canonical=true,push=true
 
-      # Three tags per registry: :latest (moving), :<version> (human-readable
+      # main: three tags per registry: :latest (moving), :<version> (human-readable
       # release), :<sha> (immutable, guaranteed-unique rollback target).
+      # release/* or rc-*: :<version>-rc and :<sha> only (see "Resolve tags").
       - name: Assemble tag indexes
         env:
           AMD64_DIGEST: ${{ steps.amd64.outputs.digest }}
           ARM64_DIGEST: ${{ steps.arm64.outputs.digest }}
           ARM64_OUTCOME: ${{ steps.arm64.outcome }}
           VERSION: ${{ steps.ver.outputs.version }}
-          SHA: ${{ gitea.sha }}
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
+          tag_args=()
+          for t in $TAGS; do tag_args+=(--tag "$t"); done
           scripts/assemble-multiarch-index.sh \
             --amd64 "$AMD64_DIGEST" \
             --arm64 "$ARM64_DIGEST" --arm64-outcome "$ARM64_OUTCOME" \
             --repo repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base \
             --repo ghcr.io/shadowdao/haproxy-manager-base \
-            --tag latest --tag "$VERSION" --tag "$SHA"
+            "${tag_args[@]}"

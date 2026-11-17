@@ -41,19 +41,26 @@ LABEL org.opencontainers.image.title="haproxy-manager-base" \
 # libssl3t64 >= 3.5.1), so no USE_QUIC_OPENSSL_COMPAT layer. (3.0.x upstream
 # has no trixie packages and would need a source build.)
 #
-# The repo only keeps the CURRENT patch of each series, so the pin is the SERIES
-# (HAPROXY_UPSTREAM=3.2 -> apt preference `3.2.*`), and the build:
-#   * FAILS unless the installed package AND `haproxy -v` both report that series
-#     (a 3.2 -> 3.3/3.4 jump can never arrive by accident: change the ARG);
-#   * records the exact resolved version in /haproxy/HAPROXY_VERSION and the
-#     `haproxy -c` gate below proves the new binary accepts the fleet config;
-#   * for reproducibility pass --build-arg HAPROXY_EXACT=3.2.26 to also pin the
-#     patch (fails loudly when the repo has moved on - bump deliberately).
+# The repo keeps MANY patch versions of a series (27 as of 2026-11: 3.2.10 ..
+# 3.2.26, all flagged `NotAutomatic: yes`), so "latest of the series" would let any
+# rebuild silently take an untested 3.2.27+. The pin is therefore the EXACT Debian
+# package version, HAPROXY_EXACT (default below), and the build:
+#   * pins apt to it (`Pin: version <full Debian version>`; NOTE a bare
+#     `3.2.26` does NOT match: apt compares the FULL version "3.2.26-1~bpo13+1",
+#     and with a non-matching pin apt falls back to Debian's own 3.0.11 package);
+#   * FAILS unless `dpkg-query` reports EXACTLY HAPROXY_EXACT, and `haproxy -v`
+#     reports the series (so an unreachable repo, which would leave Debian's
+#     3.0.11, fails closed, and a 3.2 -> 3.3/3.4 jump can never arrive by accident);
+#   * records the resolved version in /haproxy/HAPROXY_VERSION; the `haproxy -c`
+#     gate below proves the binary accepts the fleet config.
+# Taking a new patch is a DELIBERATE edit of the default below (or
+# --build-arg HAPROXY_EXACT=3.2.27-1~bpo13+1), tested before it merges; CI never
+# passes it, so a rebuild is reproducible.
 # The repo signing key is COMMITTED (keys/haproxy-debian-net/, Vincent Bernat,
 # fingerprint AEF2 3487 66F3 71C6 89A7 3600 95A4 2FE8 3535 25F9) and used with
 # signed-by, never fetched at build time. The fingerprint is asserted below.
 ARG HAPROXY_UPSTREAM=3.2
-ARG HAPROXY_EXACT=
+ARG HAPROXY_EXACT=3.2.26-1~bpo13+1
 # OPTIONAL internal package cache, e.g. --build-arg PKG_CACHE=https://192.168.1.40
 # (CT130 pkg-cache, https only; CI sets it only after probing the cache with the
 # pinned CA). Unset = the upstream Debian repositories, exactly as before. The
@@ -70,20 +77,24 @@ COPY ./keys/haproxy-debian-net/haproxy-archive-keyring.gpg /etc/apt/keyrings/hap
 RUN /usr/local/sbin/pkg-cache-repos.sh apt && \
     apt update -y && apt dist-upgrade -y && \
     apt install -y --no-install-recommends gnupg ca-certificates && \
-    gpg --show-keys --with-colons /etc/apt/keyrings/haproxy-archive-keyring.gpg | awk -F: '/^fpr:/{print $10; exit}' | grep -qx 'AEF2348766F371C689A7360095A42FE8353525F9' && \
+    keys="$(gpg --show-keys --with-colons /etc/apt/keyrings/haproxy-archive-keyring.gpg)" && \
+    [ "$(printf '%s\n' "${keys}" | grep -c '^pub:')" = 1 ] && \
+    [ "$(printf '%s\n' "${keys}" | awk -F: '/^fpr:/{print $10; exit}')" = 'AEF2348766F371C689A7360095A42FE8353525F9' ] && \
+    apt purge -y gnupg && \
     echo "deb [signed-by=/etc/apt/keyrings/haproxy-archive-keyring.gpg] https://haproxy.debian.net trixie-backports-${HAPROXY_UPSTREAM} main" > /etc/apt/sources.list.d/haproxy-debian-net.list && \
     apt update -y && \
-    pin="${HAPROXY_EXACT:-${HAPROXY_UPSTREAM}.*}" && \
+    pin="${HAPROXY_EXACT}" && \
     printf 'Package: haproxy\nPin: version %s\nPin-Priority: 1001\n' "${pin}" > /etc/apt/preferences.d/haproxy-upstream-pin && \
     apt install socat haproxy cron certbot curl jq net-tools -y && apt-mark hold haproxy && \
     rm -f /etc/apt/preferences.d/haproxy-upstream-pin && \
     deb_ver="$(dpkg-query -W -f='${Version}' haproxy)" && \
+    [ "${deb_ver}" = "${HAPROXY_EXACT}" ] || { echo "FATAL: installed haproxy '${deb_ver}' is not the pinned '${HAPROXY_EXACT}' (repo unreachable, or the pin did not match)" >&2; exit 1; } && \
     case "${deb_ver}" in "${HAPROXY_UPSTREAM}".*) ;; *) echo "FATAL: installed haproxy ${deb_ver} is not series ${HAPROXY_UPSTREAM}" >&2; exit 1;; esac && \
     haproxy -v | head -n1 | grep -F "version ${HAPROXY_UPSTREAM}." && \
     haproxy -vv | grep -E 'USE_QUIC=1|\+QUIC ' >/dev/null && \
     if haproxy -vv | grep -q 'USE_QUIC_OPENSSL_COMPAT=1'; then echo "FATAL: QUIC compat layer build, expected native OpenSSL QUIC" >&2; exit 1; fi && \
     mkdir -p /haproxy && { haproxy -v | head -n1; echo "package ${deb_ver}"; } > /haproxy/HAPROXY_VERSION && \
-    echo "haproxy OK: series ${HAPROXY_UPSTREAM}, Debian package ${deb_ver}" && \
+    echo "haproxy OK: series ${HAPROXY_UPSTREAM}, Debian package ${deb_ver} (exact pin)" && \
     /usr/local/sbin/pkg-cache-repos.sh restore && \
     apt clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /haproxy
@@ -141,6 +152,7 @@ RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
  && python3 /haproxy/scripts/test-default-splash.py \
  && python3 /haproxy/scripts/test-access-log-receiver.py \
  && python3 /haproxy/scripts/test-haproxy-stderr-relay.py \
+ && python3 /haproxy/scripts/test-haproxy-supervisor.py \
  && python3 /haproxy/scripts/test-config-rollback.py \
  && python3 /haproxy/scripts/test-cert-write-safety.py \
  && python3 /haproxy/scripts/test-cert-scripts.py \
