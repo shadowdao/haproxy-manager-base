@@ -89,6 +89,28 @@ cron &
     done
 ) &
 
+# gunicorn access logs (incident-prevention for the journald log driver).
+# gunicorn used to log every request to stdout (`--access-logfile -`), so every
+# :8080 default-page / blocked-IP hit and every :8000 API call became a docker
+# log line -> journal entry -> Graylog line, and could trip journald's rate
+# limit and suppress the relay's crash-dump lines. Now:
+#   :8080  no access log at all;
+#   :8000  access log to a size-bounded FILE in the haproxy-logs volume (mode
+#          0640), rotated by scripts/gunicorn-access-rotate.py (copy-truncate,
+#          20 MiB x 3). Set HAPROXY_MGR_API_ACCESS_LOG to relocate it.
+# Gunicorn ERROR logging (--error-logfile -) stays on stderr -> `docker logs`.
+API_ACCESS_LOG="${HAPROXY_MGR_API_ACCESS_LOG:-/var/log/haproxy/api-access.log}"
+export HAPROXY_MGR_API_ACCESS_LOG="${API_ACCESS_LOG}"
+mkdir -p "$(dirname "${API_ACCESS_LOG}")"
+[ -e "${API_ACCESS_LOG}" ] || : > "${API_ACCESS_LOG}"
+chmod 0640 "${API_ACCESS_LOG}" 2>/dev/null || true
+(
+    while true; do
+        python /haproxy/scripts/gunicorn-access-rotate.py || true
+        sleep 2
+    done
+) &
+
 # Phase 1: container init
 python /haproxy/scripts/init.py
 
@@ -135,7 +157,7 @@ gunicorn \
     --workers 1 --threads 4 --worker-class "${WORKER_CLASS}" \
     --max-requests "${MAX_REQ}" --max-requests-jitter "${MAX_REQ_JITTER}" \
     --timeout 30 \
-    --access-logfile - --error-logfile - --log-level info \
+    --error-logfile - --log-level info \
     --pythonpath /haproxy \
     'haproxy_manager:default_app' &
 
@@ -147,6 +169,6 @@ exec gunicorn \
     --workers "${API_WORKERS}" --threads 4 --worker-class "${WORKER_CLASS}" \
     --max-requests "${MAX_REQ}" --max-requests-jitter "${MAX_REQ_JITTER}" \
     --timeout "${API_TIMEOUT}" \
-    --access-logfile - --error-logfile - --log-level info \
+    --access-logfile "${API_ACCESS_LOG}" --error-logfile - --log-level info \
     --pythonpath /haproxy \
     'haproxy_manager:app'

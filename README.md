@@ -451,6 +451,8 @@ Covered by `scripts/test-default-splash.py` (template order/conditions, the
 page, list generation) and the `splash-off` scenario of
 `scripts/validate-rendered-config.py`.
 
+> gunicorn access logs (:8080 none, :8000 bounded file, not stdout): see docs/logging.md.
+
 ## Access Log (in-container, since 2026.11.2)
 
 HAProxy logs (`log /log.sock ... format rfc5424`, `hap_header.tpl`) to a UNIX
