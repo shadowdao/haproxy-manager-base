@@ -199,26 +199,13 @@ jobs:
           PLATFORMS: ${{ steps.assemble.outputs.platforms }}
         run: |
           set -euo pipefail
-          repos="repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base ghcr.io/shadowdao/haproxy-manager-base"
-          want=$(printf '%s' "$PLATFORMS" | tr ',' '\n' | sort | tr '\n' ' ')
-          ref_digest=""; ref_name=""; fail=0
-          for r in $repos; do
-            for t in $TAGS; do
-              ref="${r}:${t}"
-              if ! d=$(timeout 90 $BUILDX imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>&1); then
-                echo "::error::MISSING or unreadable: ${ref}: ${d}"; fail=1; continue
-              fi
-              [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest for ${ref}: ${d}"; fail=1; continue; }
-              got=$(timeout 90 $BUILDX imagetools inspect "$ref" --format '{{range .Manifest.Manifests}}{{if ne .Platform.OS "unknown"}}{{.Platform.OS}}/{{.Platform.Architecture}}{{"\n"}}{{end}}{{end}}' | sort | tr '\n' ' ')
-              if [ "$got" != "$want" ]; then
-                echo "::error::platform mismatch for ${ref}: have [${got}] want [${want}]"; fail=1
-              fi
-              echo "ok ${ref} ${d} [${got}]"
-              if [ -z "$ref_digest" ]; then ref_digest="$d"; ref_name="$ref"
-              elif [ "$d" != "$ref_digest" ]; then
-                echo "::error::digest mismatch: ${ref}=${d} vs ${ref_name}=${ref_digest}"; fail=1
-              fi
-            done
-          done
-          [ "$fail" = 0 ] || { echo "::error::tag verification FAILED"; exit 1; }
-          echo "verified: ${TAGS} in both registries, digest ${ref_digest}, platforms ${PLATFORMS}"
+          # Version-independent digest logic lives in the script (tested by
+          # scripts/test-verify-published-tags.py); buildx 0.28 ignores --format.
+          export IMAGETOOLS="${BUILDX} imagetools"
+          tag_args=()
+          for t in $TAGS; do tag_args+=(--tag "$t"); done
+          scripts/verify-published-tags.sh \
+            --platforms "$PLATFORMS" \
+            --repo repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base \
+            --repo ghcr.io/shadowdao/haproxy-manager-base \
+            "${tag_args[@]}"
