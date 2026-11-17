@@ -451,6 +451,8 @@ Covered by `scripts/test-default-splash.py` (template order/conditions, the
 page, list generation) and the `splash-off` scenario of
 `scripts/validate-rendered-config.py`.
 
+> gunicorn access logs (:8080 none, :8000 bounded file, not stdout): see docs/logging.md.
+
 ## Access Log (in-container, since 2026.11.2)
 
 HAProxy logs (`log /log.sock ... format rfc5424`, `hap_header.tpl`) to a UNIX
@@ -491,6 +493,22 @@ Rollout: image bump + recreate with the volume and sysctl (WHP's
 `lib-edge-container.sh` adds both). The receiver, its script and the template
 are in the image, outside the `/etc/haproxy` named volume, so nothing can be
 shadowed; `haproxy.cfg` is regenerated on start with the new `log` line.
+
+## HAProxy stderr (panic dumps, [ALERT]s) - since 2026.11.4
+
+HAProxy is started as `haproxy -W -db` so the master keeps a real stderr (with
+the `daemon` keyword HAProxy points it at /dev/null, which discarded the
+`[ALERT]` lines, `Current worker (N) exited with code 134` and the whole
+watchdog/`ha_panic` thread dump). It is appended to
+`/var/log/haproxy/haproxy-stderr.log` (the `haproxy-logs` volume, so it
+survives a recreate) and `scripts/haproxy-stderr-relay.py` re-emits every line
+on the container's stderr prefixed `haproxy-stderr: ` (rate-limited, file
+rotated at 20 MiB x 3). `docker logs haproxy-manager` and whatever docker
+logging driver the host configured therefore carry the crash text; the
+per-request access log stays out of it. The in-container supervisor probes
+with `pidof` every `HAPROXY_SUPERVISOR_INTERVAL` seconds (default 2, was 15) and
+backs off to `HAPROXY_SUPERVISOR_MAX_BACKOFF` (30) only when a restart attempt
+fails. Measured (3.2.26, empty config): crash to listeners back = 1.2-2.0 s.
 
 ## Default Backend Configuration
 

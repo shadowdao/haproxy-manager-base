@@ -1,9 +1,15 @@
 name: HAProxy Manager Build and Push
-run-name: ${{ gitea.actor }} pushed a change to main
+run-name: ${{ gitea.actor }} pushed ${{ gitea.ref_name }}
 on:
   push:
     branches:
       - main
+      # Release candidates: a push to release/* builds the SAME image but publishes
+      # ONLY :<VERSION>-rc and :<sha>, never :latest and never the plain :<VERSION>
+      # (see the "Resolve tags" step). Main keeps its behaviour.
+      - 'release/**'
+    tags:
+      - 'rc-*'
   # Manual publish (e.g. after a [skip ci] merge, or to re-publish after a
   # failed arm64 leg).
   workflow_dispatch:
@@ -77,6 +83,30 @@ jobs:
         id: ver
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
+      # Publishing strategy. main: :latest + :<version> + :<sha> (unchanged).
+      # release/* branch or rc-* tag: :<version>-rc + :<sha> ONLY. A release candidate
+      # is deployed per host by explicit tag (durable per-host pin in WHP); :latest is
+      # moved to it by a later main publish only after the staged rollout succeeded.
+      # Any other ref (e.g. a manual workflow_dispatch on a feature branch) is refused
+      # rather than guessed at.
+      - name: Resolve tags
+        id: tags
+        env:
+          REF: ${{ gitea.ref }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA: ${{ gitea.sha }}
+        run: |
+          case "$REF" in
+            refs/heads/main)
+              tags="latest ${VERSION} ${SHA}" ;;
+            refs/heads/release/*|refs/tags/rc-*)
+              tags="${VERSION}-rc ${SHA}" ;;
+            *)
+              echo "::error::refusing to publish from ref ${REF} (only main, release/* and rc-* tags)"; exit 1 ;;
+          esac
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "publishing tags: ${tags}"
+
       # amd64: required. Pushed untagged by digest to both registries (same
       # digest in each); tags are only created by the assemble step below.
       - name: Build amd64 (push by digest)
@@ -103,19 +133,79 @@ jobs:
             PKG_CACHE=${{ steps.pkgcache.outputs.url }}
           outputs: type=image,"name=repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base,ghcr.io/shadowdao/haproxy-manager-base",push-by-digest=true,name-canonical=true,push=true
 
-      # Three tags per registry: :latest (moving), :<version> (human-readable
-      # release), :<sha> (immutable, guaranteed-unique rollback target).
-      - name: Assemble tag indexes
+      # imagetools needs a NEW buildx. Same pinned, sha256-verified binary as
+      # mirror-base-image.yaml (kept identical on purpose). The assemble step
+      # previously ran on whatever buildx the (possibly ephemeral) runner had
+      # (0.13.1 on the runner that hung in run 5375, 0.15.1 on the trusted one).
+      - name: Install pinned buildx
         env:
+          BUILDX_VERSION: v0.28.0
+          BUILDX_SHA256: 696bc104bac3bb708eff1af3f8bbc09fda0fd88f5757c1f9b404a35117889224
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP:-/tmp}/pinned-buildx"; mkdir -p "$dir"
+          curl -fsSL --retry 3 --max-time 120 -o "$dir/docker-buildx" \
+            "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+          echo "${BUILDX_SHA256}  $dir/docker-buildx" | sha256sum -c -
+          chmod +x "$dir/docker-buildx"
+          "$dir/docker-buildx" version
+          echo "BUILDX=$dir/docker-buildx" >> "$GITHUB_ENV"
+
+      # main: three tags per registry: :latest (moving), :<version> (human-readable
+      # release), :<sha> (immutable, guaranteed-unique rollback target).
+      # release/* or rc-*: :<version>-rc and :<sha> only (see "Resolve tags").
+      # Hardened after run 5375 (assemble hung after pushing, TTY progress, old
+      # buildx): plain progress, pinned buildx, hard 10 minute step timeout.
+      - name: Assemble tag indexes
+        id: assemble
+        timeout-minutes: 10
+        env:
+          BUILDKIT_PROGRESS: plain
           AMD64_DIGEST: ${{ steps.amd64.outputs.digest }}
           ARM64_DIGEST: ${{ steps.arm64.outputs.digest }}
           ARM64_OUTCOME: ${{ steps.arm64.outcome }}
           VERSION: ${{ steps.ver.outputs.version }}
-          SHA: ${{ gitea.sha }}
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
-          scripts/assemble-multiarch-index.sh \
+          set -euo pipefail
+          tag_args=()
+          for t in $TAGS; do tag_args+=(--tag "$t"); done
+          # Use the pinned buildx for create AND the script's platform inspects.
+          export IMAGETOOLS="${BUILDX} imagetools"
+          out=$(scripts/assemble-multiarch-index.sh \
             --amd64 "$AMD64_DIGEST" \
             --arm64 "$ARM64_DIGEST" --arm64-outcome "$ARM64_OUTCOME" \
             --repo repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base \
             --repo ghcr.io/shadowdao/haproxy-manager-base \
-            --tag latest --tag "$VERSION" --tag "$SHA"
+            "${tag_args[@]}" | tee /dev/stderr)
+          platforms=$(printf '%s\n' "$out" | sed -n 's/^platforms=//p' | tail -n1)
+          [ -n "$platforms" ] || { echo "::error::assemble script reported no platforms line"; exit 1; }
+          if [ "$platforms" = "linux/amd64" ]; then
+            echo "::warning::SINGLE-ARCH publish (amd64 only) on purpose: arm64 outcome was '${ARM64_OUTCOME}'. Tags carry no arm64 manifest."
+          else
+            echo "multi-arch publish: ${platforms}"
+          fi
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+
+      # Final gate: every tag in every registry must resolve, carry the platforms
+      # the assemble step reported, and have ONE digest across all tags and both
+      # registries (they are built from the same sources). Any miss fails the job
+      # instead of trusting that the create calls "looked" fine.
+      - name: Verify published tags in every registry
+        timeout-minutes: 10
+        env:
+          BUILDKIT_PROGRESS: plain
+          TAGS: ${{ steps.tags.outputs.tags }}
+          PLATFORMS: ${{ steps.assemble.outputs.platforms }}
+        run: |
+          set -euo pipefail
+          # Version-independent digest logic lives in the script (tested by
+          # scripts/test-verify-published-tags.py); buildx 0.28 ignores --format.
+          export IMAGETOOLS="${BUILDX} imagetools"
+          tag_args=()
+          for t in $TAGS; do tag_args+=(--tag "$t"); done
+          scripts/verify-published-tags.sh \
+            --platforms "$PLATFORMS" \
+            --repo repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base \
+            --repo ghcr.io/shadowdao/haproxy-manager-base \
+            "${tag_args[@]}"

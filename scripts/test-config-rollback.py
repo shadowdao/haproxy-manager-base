@@ -56,6 +56,10 @@ sys.path.insert(0, MODULE_DIR)
 # The module opens /var/log/haproxy-manager.log at import time via
 # logging.FileHandler. Redirect that one call so the suite runs unprivileged.
 _LOG_DIR = tempfile.mkdtemp(prefix='haproxy-mgr-test-logs-')
+# spawn_haproxy_master() appends the master's stderr here (default is the
+# haproxy-logs volume path, not writable unprivileged).
+os.environ.setdefault('HAPROXY_STDERR_LOG', os.path.join(_LOG_DIR, 'haproxy-stderr.log'))
+os.environ.setdefault('HAPROXY_START_WAIT', '3')
 _real_file_handler = logging.FileHandler
 logging.FileHandler = (
     lambda fn, *a, **kw: _real_file_handler(
@@ -80,14 +84,18 @@ FAKE_HAPROXY = textwrap.dedent(f"""\
     #   haproxy -c -f FILE   -> exit 1 if FILE contains {BROKEN_TOKEN}, else 0
     #   haproxy -W -S ... -f FILE (start) -> same validation, then exit 0
     cfg=""
+    start=0
     while [ $# -gt 0 ]; do
-      case "$1" in -f) cfg="$2"; shift ;; esac
+      case "$1" in -f) cfg="$2"; shift ;; -W) start=1 ;; esac
       shift
     done
     if [ -n "$cfg" ] && grep -q '{BROKEN_TOKEN}' "$cfg" 2>/dev/null; then
       echo "[ALERT] parsing [$cfg:1] : unknown keyword '{BROKEN_TOKEN}'" >&2
       exit 1
     fi
+    # A real `haproxy -W -db` prints this once the config is loaded;
+    # spawn_haproxy_master() waits for it.
+    [ "$start" = 1 ] && echo "[NOTICE]   (1) : Loading success." >&2
     exit 0
 """)
 

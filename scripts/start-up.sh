@@ -75,24 +75,49 @@ mkdir -p /var/log/haproxy /var/lib/haproxy
 
 cron &
 
+# HAProxy stderr relay (see scripts/haproxy-stderr-relay.py and
+# haproxy_manager.spawn_haproxy_master()). HAProxy's master stderr (ALERTs,
+# "exited with code 134", the watchdog/ha_panic thread dump) is appended to
+# /var/log/haproxy/haproxy-stderr.log; this loop re-emits it on the container's
+# stderr so `docker logs` / the docker logging driver / Graylog get it. Started
+# BEFORE init.py so the first start's lines are followed. Restarted within 2 s
+# if it ever dies; it only reads a file, so it can never affect HAProxy.
+(
+    while true; do
+        python /haproxy/scripts/haproxy-stderr-relay.py || true
+        sleep 2
+    done
+) &
+
+# gunicorn access logs (incident-prevention for the journald log driver).
+# gunicorn used to log every request to stdout (`--access-logfile -`), so every
+# :8080 default-page / blocked-IP hit and every :8000 API call became a docker
+# log line -> journal entry -> Graylog line, and could trip journald's rate
+# limit and suppress the relay's crash-dump lines. Now:
+#   :8080  no access log at all;
+#   :8000  access log to a size-bounded FILE in the haproxy-logs volume (mode
+#          0640), rotated by scripts/gunicorn-access-rotate.py (copy-truncate,
+#          20 MiB x 3). Set HAPROXY_MGR_API_ACCESS_LOG to relocate it.
+# Gunicorn ERROR logging (--error-logfile -) stays on stderr -> `docker logs`.
+API_ACCESS_LOG="${HAPROXY_MGR_API_ACCESS_LOG:-/var/log/haproxy/api-access.log}"
+export HAPROXY_MGR_API_ACCESS_LOG="${API_ACCESS_LOG}"
+mkdir -p "$(dirname "${API_ACCESS_LOG}")"
+[ -e "${API_ACCESS_LOG}" ] || : > "${API_ACCESS_LOG}"
+chmod 0640 "${API_ACCESS_LOG}" 2>/dev/null || true
+(
+    while true; do
+        python /haproxy/scripts/gunicorn-access-rotate.py || true
+        sleep 2
+    done
+) &
+
 # Phase 1: container init
 python /haproxy/scripts/init.py
 
-# Phase 1.5: in-container haproxy supervisor.
-# haproxy runs as a background child of PID 1 (gunicorn) with NOTHING watching
-# it after init. If the haproxy master dies mid-life (e.g. SIGABRT -> exit 134,
-# segfault), the container stays "up" (gunicorn is PID 1), Docker's --restart
-# policy never fires, and haproxy is down until the external host watchdog
-# full-restarts the whole container minutes later (dropping every connection).
-# This loop revives haproxy in place within one interval. ensure_haproxy.py is
-# idempotent — a cheap no-op whenever haproxy is already running.
-HAPROXY_SUPERVISOR_INTERVAL="${HAPROXY_SUPERVISOR_INTERVAL:-15}"
-(
-    while true; do
-        sleep "${HAPROXY_SUPERVISOR_INTERVAL}"
-        python /haproxy/scripts/ensure_haproxy.py 2>&1 || true
-    done
-) &
+# Phase 1.5: in-container haproxy supervisor (see scripts/haproxy-supervisor.sh:
+# revives a dead haproxy master within HAPROXY_SUPERVISOR_INTERVAL seconds, with
+# backoff on failed restarts and on crash loops; knobs validated as integers).
+/haproxy/scripts/haproxy-supervisor.sh &
 
 # Phase 2: WSGI servers
 # Tunable via env: HAPROXY_MGR_API_WORKERS (default 2), HAPROXY_MGR_API_TIMEOUT
@@ -132,7 +157,7 @@ gunicorn \
     --workers 1 --threads 4 --worker-class "${WORKER_CLASS}" \
     --max-requests "${MAX_REQ}" --max-requests-jitter "${MAX_REQ_JITTER}" \
     --timeout 30 \
-    --access-logfile - --error-logfile - --log-level info \
+    --error-logfile - --log-level info \
     --pythonpath /haproxy \
     'haproxy_manager:default_app' &
 
@@ -144,6 +169,6 @@ exec gunicorn \
     --workers "${API_WORKERS}" --threads 4 --worker-class "${WORKER_CLASS}" \
     --max-requests "${MAX_REQ}" --max-requests-jitter "${MAX_REQ_JITTER}" \
     --timeout "${API_TIMEOUT}" \
-    --access-logfile - --error-logfile - --log-level info \
+    --access-logfile "${API_ACCESS_LOG}" --error-logfile - --log-level info \
     --pythonpath /haproxy \
     'haproxy_manager:app'

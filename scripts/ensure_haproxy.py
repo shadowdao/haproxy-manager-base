@@ -34,6 +34,18 @@ def main():
     haproxy_manager.logger.warning(
         "[haproxy-supervisor] haproxy process not found — attempting in-place restart"
     )
+    # Breadcrumb for the monitoring pipeline: the last thing HAProxy itself said
+    # before it vanished (the relay forwards the same text; this ties it to the
+    # supervisor event even if the relay is behind).
+    try:
+        with open(haproxy_manager._stderr_log_path(), 'rb') as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 1500))
+            tail = fh.read().decode('utf-8', 'replace').strip().splitlines()[-6:]
+        for line in tail:
+            haproxy_manager.logger.warning("[haproxy-supervisor] last haproxy stderr: %s", line)
+    except OSError:
+        pass
     # start_haproxy() validates the config (and regenerates it if invalid)
     # before launching, and swallows its own errors, so it will not raise here.
     haproxy_manager.start_haproxy()
