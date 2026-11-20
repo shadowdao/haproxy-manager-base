@@ -43,7 +43,7 @@ global
 {%- if nbthread %}
 
     # PER-HOST THREAD COUNT. Only emitted when HAPROXY_NBTHREAD is set on the
-    # container (WHP: /etc/whp/edge-nbthread -> container-manager.sh -> env),
+    # container (WHP: /etc/whp/edge-nbthread -> lib-edge-container.sh -> docker run -e),
     # so a host that does not set it renders byte-identically to before and
     # HAProxy keeps choosing automatically (all CPUs in its affinity mask).
     # Why a host would set 1: 2026-11-19 sdbees, thread 1 spun on a server
