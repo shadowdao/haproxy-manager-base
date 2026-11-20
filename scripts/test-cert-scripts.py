@@ -54,6 +54,7 @@ destructive there; see _cleanup_tmp().
 """
 
 import os
+import platform
 import re
 import shutil
 import stat
@@ -62,6 +63,12 @@ import tempfile
 import textwrap
 import time
 import unittest
+
+# Subprocess ceiling. The arm64 image gate runs under QEMU (~30x slower: this
+# file took 8 s natively and 229 s emulated, and the 200-iteration bash loop in
+# test_validation_of_a_live_pem_being_republished_is_not_spurious then exceeded
+# a flat 120 s, failing the arm64 leg of every build). Native x86 keeps 120 s.
+SUBPROCESS_TIMEOUT = 120 if platform.machine() in ('x86_64', 'AMD64') else 900
 
 MODULE_DIR = os.path.abspath(
     os.environ.get('HAPROXY_MANAGER_DIR',
@@ -379,7 +386,7 @@ class CertScriptFixture(unittest.TestCase):
         path = os.path.join(SCRIPTS_DIR, name)
         self.assertTrue(os.path.exists(path), f'{path} does not exist')
         return subprocess.run(['bash', path], env=self.env(**env_overrides),
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
 
     def bundle_is_valid(self, path):
         """Ask the shipped library whether HAProxy could use this bundle."""
@@ -964,7 +971,7 @@ class TestCertPublishLibrary(CertScriptFixture):
             ['bash', '-c',
              '. "$1"; for i in $(seq 1 200); do cert_bundle_valid "$2" || exit 1; done',
              '_', LIB, self.live_pem],
-            env=self.env(), capture_output=True, text=True, timeout=120)
+            env=self.env(), capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
         _stop()
 
         output = result.stdout + result.stderr
