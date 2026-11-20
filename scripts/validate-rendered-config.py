@@ -146,6 +146,17 @@ SCENARIOS = (
         'HAPROXY_CORAZA_SPOE_BACKEND': '127.0.0.1:9000',
         'HAPROXY_DEFAULT_SPLASH': 'off',
     }),
+    # Per-host thread count knob: `nbthread 1` must parse next to everything
+    # else rendered (limited-quic, QUIC bind, SPOE, stats-file). A bad value
+    # must be IGNORED (not rendered), never reach haproxy.
+    ('nbthread-1', {
+        'HAPROXY_SUSPENSION_ENABLED': 'true',
+        'HAPROXY_CORAZA_SPOE_BACKEND': '127.0.0.1:9000',
+        'HAPROXY_NBTHREAD': '1',
+    }),
+    ('nbthread-bad', {
+        'HAPROXY_NBTHREAD': 'abc',
+    }),
 )
 
 
@@ -308,7 +319,7 @@ def render(scenario_name, env_overrides, workdir):
 
     saved_env = {}
     for key in ('HAPROXY_SUSPENSION_ENABLED', 'HAPROXY_CORAZA_SPOE_BACKEND',
-                'HAPROXY_DEFAULT_SPLASH'):
+                'HAPROXY_DEFAULT_SPLASH', 'HAPROXY_NBTHREAD'):
         saved_env[key] = os.environ.pop(key, None)
     os.environ.update(env_overrides)
 
@@ -342,6 +353,8 @@ def assert_scenario_branches(scenario_name, config_path, env_overrides):
                    'HAPROXY_CORAZA_SPOE_BACKEND' in env_overrides),
         'splash': ('file /haproxy/errors/default-splash.html',
                    env_overrides.get('HAPROXY_DEFAULT_SPLASH') != 'off'),
+        'nbthread': ('\n    nbthread 1\n',
+                     env_overrides.get('HAPROXY_NBTHREAD') == '1'),
     }
     for label, (needle, should_be_present) in expected.items():
         present = needle in text

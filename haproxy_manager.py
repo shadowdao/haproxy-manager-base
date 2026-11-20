@@ -3153,6 +3153,21 @@ def get_or_create_cluster_secret():
         logger.error("Failed to get/create cluster-secret: %s", e)
         return ''
 
+
+def parse_nbthread(raw):
+    """HAPROXY_NBTHREAD -> int 1..64, or None (= do not render `nbthread`).
+
+    Fail-safe: anything that is not a plain positive integer in range is
+    IGNORED with a warning, never rendered, so a typo in a host file cannot
+    produce an invalid haproxy.cfg (which would be a total edge outage)."""
+    raw = (raw or '').strip()
+    if not raw:
+        return None
+    if not (raw.isascii() and raw.isdigit()) or not 1 <= int(raw) <= 64:
+        logger.warning(f"Ignoring HAPROXY_NBTHREAD={raw!r}: expected an integer 1-64")
+        return None
+    return int(raw)
+
 def generate_config():
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -3246,10 +3261,15 @@ def generate_config():
         splash_raw = os.environ.get('HAPROXY_DEFAULT_SPLASH', '').strip().lower()
         default_splash = splash_raw not in ('0', 'false', 'no', 'off')
 
+        # Optional per-host thread count (global `nbthread`). Unset/invalid =
+        # not rendered = HAProxy's automatic choice, byte-identical config.
+        nbthread = parse_nbthread(os.environ.get('HAPROXY_NBTHREAD'))
+
         # Add Haproxy Default Headers
         default_headers = template_env.get_template('hap_header.tpl').render(
             cluster_secret = get_or_create_cluster_secret(),
             syslog_target = syslog_target,
+            nbthread = nbthread,
             coraza_spoe_backend = coraza_spoe_backend,
         )
         config_parts.append(default_headers)
