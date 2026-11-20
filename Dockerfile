@@ -10,6 +10,17 @@
 # Future improvement: a scheduled Gitea Action that does the above automatically.
 FROM repo.anhonesthost.net/cloud-hosting-platform/python:3.12-slim
 
+# Base-architecture guard. If the mirrored base tag is a single-platform
+# (flattened amd64) manifest instead of a multi-arch index, buildx silently uses
+# that amd64 base for a linux/arm64 build, every RUN below executes natively as
+# x86-64, and the result is x86-64 binaries labelled arm64 (2026-11-19:
+# haproxy-manager-base:latest). TARGETARCH is set by buildx (empty on the legacy
+# builder, where the check is skipped). On a correct build this is a no-op.
+ARG TARGETARCH
+RUN if [ -n "${TARGETARCH}" ] && [ "$(dpkg --print-architecture)" != "${TARGETARCH}" ]; then \
+      echo "FATAL: base image is $(dpkg --print-architecture) but this build targets ${TARGETARCH}; the in-house python:3.12-slim mirror is not a multi-arch index (re-run mirror-base-image.yaml)" >&2; exit 1; \
+    fi
+
 # image.source is what ghcr.io uses to link the package to a GitHub repo
 # sidebar; pointing at the public GitHub mirror enables that linking. The
 # canonical source-of-truth git remote is still Gitea, but Gitea's registry

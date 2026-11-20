@@ -133,6 +133,29 @@ jobs:
             PKG_CACHE=${{ steps.pkgcache.outputs.url }}
           outputs: type=image,"name=repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base,ghcr.io/shadowdao/haproxy-manager-base",push-by-digest=true,name-canonical=true,push=true
 
+      # Per-platform ELF check BEFORE anything is tagged (2026-11-19: an "arm64"
+      # entry held x86-64 binaries). amd64 mismatch fails the job and publishes
+      # nothing. An arm64 mismatch (or a failed check) keeps arm64 OUT of the
+      # tags (amd64-only publish, as for a failed arm64 build) and the job is
+      # failed afterwards so it is not mistaken for a good multi-arch publish.
+      - name: Verify amd64 image binaries are amd64
+        env:
+          DIGEST: ${{ steps.amd64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 -I scripts/verify-image-arch.py "repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base@${DIGEST}" amd64
+
+      - name: Verify arm64 image binaries are arm64
+        id: arm64check
+        if: steps.arm64.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          DIGEST: ${{ steps.arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 -I scripts/verify-image-arch.py "repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base@${DIGEST}" arm64
+
       # imagetools needs a NEW buildx. Same pinned, sha256-verified binary as
       # mirror-base-image.yaml (kept identical on purpose). The assemble step
       # previously ran on whatever buildx the (possibly ephemeral) runner had
@@ -163,7 +186,8 @@ jobs:
           BUILDKIT_PROGRESS: plain
           AMD64_DIGEST: ${{ steps.amd64.outputs.digest }}
           ARM64_DIGEST: ${{ steps.arm64.outputs.digest }}
-          ARM64_OUTCOME: ${{ steps.arm64.outcome }}
+          # success only if the build AND the ELF check succeeded (a skipped check = not verified = not attached)
+          ARM64_OUTCOME: ${{ steps.arm64check.outcome == 'success' && steps.arm64.outcome || 'unverified' }}
           VERSION: ${{ steps.ver.outputs.version }}
           TAGS: ${{ steps.tags.outputs.tags }}
         run: |
@@ -209,3 +233,11 @@ jobs:
             --repo repo.anhonesthost.net/cloud-hosting-platform/haproxy-manager-base \
             --repo ghcr.io/shadowdao/haproxy-manager-base \
             "${tag_args[@]}"
+
+      # Tags are already published (amd64-only) if arm64 failed verification; fail
+      # the job so that is visible instead of reading as a green multi-arch publish.
+      - name: Fail if arm64 was built but its binaries are not arm64
+        if: always() && steps.arm64.outcome == 'success' && steps.arm64check.outcome != 'success'
+        run: |
+          echo "::error::arm64 image was built but failed the ELF architecture check; tags were published amd64-only (or not at all)"
+          exit 1
