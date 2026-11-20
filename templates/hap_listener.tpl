@@ -443,11 +443,18 @@ frontend web
     # itself refuses both once the site is installed (setup-config.php exits
     # "wp-config.php already exists"; install.php shows "Already Installed"
     # when the options table has siteurl), so the exemption exposes nothing on
-    # a finished site. RESIDUAL RISK (known tradeoff of exempting these two pages, requested 2026-11-19): a site that
-    # was half-installed and abandoned (wp-config.php present, tables not
-    # created) lets any visitor finish the install via install.php?step=2 and
-    # so choose the admin account. The old blanket gate happened to block that
-    # on edge-fronted sites; WordPress itself never did. Matching is exact (path_end on the normalised path,
+    # a finished site. RESIDUAL RISK (known tradeoff of exempting these two pages,
+    # requested 2026-11-19): (1) WordPress files present but NO wp-config.php
+    # (half upload, deleted by mistake, mid-restore/transfer): any visitor can
+    # run setup-config.php with their own database and then install.php, i.e.
+    # take the site over (admin -> plugin upload -> code execution). Scanners
+    # probe for exactly this. (2) A half-installed site (wp-config.php present,
+    # no tables, or a $table_prefix pointing at no tables) lets any visitor
+    # finish install.php?step=2 and choose the admin account. The old gate
+    # blocked cookieless scanners from both on edge-fronted sites (not a real
+    # defence: has_wp_logged_in only checks the cookie NAME, so a targeted
+    # attacker could always send one); WordPress itself never did.
+    # Matching is exact (path_end on the normalised path,
     # case-sensitive): /wp-admin/setup-config.php.php, /wp-admin/Install.php,
     # /wp-admin/install.php/x, /wp-admin/evil/install.php are all still gated.
     # upgrade.php is NOT exempt: WordPress only sends logged-in users there
