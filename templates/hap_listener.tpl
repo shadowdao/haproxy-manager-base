@@ -431,11 +431,29 @@ frontend web
     # suffix matching (/blog/wp-admin/admin-ajax.php ends with
     # /wp-admin/admin-ajax.php) while rejecting an inserted directory.
     #
-    # install.php is DELIBERATELY NOT allowlisted. It is legitimately
-    # reachable without a cookie during a fresh install, but it is also a
-    # standing scanner target and a real takeover vector on a site that was
-    # half-installed and then abandoned. Anyone genuinely installing uses the
-    # per-site exempt-list opt-out below instead.
+    # The WordPress install/setup screens ARE exempt (wp_admin_install below):
+    # exactly /wp-admin/setup-config.php and /wp-admin/install.php. A fresh
+    # WordPress with no wp-config.php redirects EVERY request to
+    # /wp-admin/setup-config.php, and a person doing a manual install has no
+    # cookie by definition -- gating those two pages bounced the installer to
+    # wp-login.php?redirect_to=/wp-admin/setup-config.php (a login form that
+    # can never succeed on a site with no database) and, worse, that URL then
+    # tripped CRS 930120 ("config.php" in ARGS:redirect_to) so the visitor saw
+    # the WAF block page instead of WordPress's own setup screen. WordPress
+    # itself refuses both once the site is installed (setup-config.php exits
+    # "wp-config.php already exists"; install.php shows "Already Installed"
+    # when the options table has siteurl), so the exemption exposes nothing on
+    # a finished site. RESIDUAL RISK (known tradeoff of exempting these two pages, requested 2026-11-19): a site that
+    # was half-installed and abandoned (wp-config.php present, tables not
+    # created) lets any visitor finish the install via install.php?step=2 and
+    # so choose the admin account. The old blanket gate happened to block that
+    # on edge-fronted sites; WordPress itself never did. Matching is exact (path_end on the normalised path,
+    # case-sensitive): /wp-admin/setup-config.php.php, /wp-admin/Install.php,
+    # /wp-admin/install.php/x, /wp-admin/evil/install.php are all still gated.
+    # upgrade.php is NOT exempt: WordPress only sends logged-in users there
+    # (admin_init), and a logged-in user carries the cookie, so it needs no
+    # exemption. The install screens' CSS/JS come from the css|js|images dirs
+    # and load-styles.php / load-scripts.php, already allowed above.
     #
     # Honors the same whitelist as every other rule in this frontend
     # (RFC1918 / trusted_ips.list / trusted_ips.map), and a per-site opt-out
@@ -515,6 +533,7 @@ frontend web
     # the intended "reject a literal backslash" semantics.
     acl wp_admin_safe_path path_reg ^/[^/\\\\]
     acl wp_admin_allowed   path_end /wp-admin/admin-ajax.php /wp-admin/admin-post.php /wp-admin/load-styles.php /wp-admin/load-scripts.php
+    acl wp_admin_install   path_end /wp-admin/setup-config.php /wp-admin/install.php
     # The (?!.*\.php) lookahead is DEFENCE IN DEPTH, not the primary fix. This
     # ACL grants an un-gated bypass to everything under wp-admin/css|js|images,
     # and it used to anchor its prefix but not its suffix, so
@@ -589,7 +608,7 @@ frontend web
     http-request deny deny_status 403 if wp_admin_word path_has_encoded_sep !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
     http-request deny deny_status 403 if wp_admin_path !wp_admin_safe_path !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
     http-request set-var(txn.wp_login_url) path,regsub(/wp-admin/.*,/wp-login.php,i) if wp_admin_path
-    http-request redirect code 302 location %[var(txn.wp_login_url)]?redirect_to=%[path,url_enc] if wp_admin_path wp_admin_safe_path !wp_admin_allowed !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
+    http-request redirect code 302 location %[var(txn.wp_login_url)]?redirect_to=%[path,url_enc] if wp_admin_path wp_admin_safe_path !wp_admin_allowed !wp_admin_install !wp_admin_asset !has_wp_logged_in !wp_gate_exempt !is_local !is_trusted_ip !is_whitelisted
 
     # IP blocking using map file (manual blocks only)
     # Map file format: /etc/haproxy/blocked_ips.map contains "<ip_or_cidr> 1" per line

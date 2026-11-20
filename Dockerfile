@@ -147,6 +147,7 @@ RUN pip install -r requirements.txt
 # The unit suites run here too. They had never run anywhere automated either,
 # and they cost a few seconds.
 RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
+ && python3 /haproxy/scripts/test-wpadmin-gate-behaviour.py \
  && python3 /haproxy/scripts/test-trusted-proxy-gate.py \
  && python3 /haproxy/scripts/test-xmlrpc-rate-limit.py \
  && python3 /haproxy/scripts/test-default-splash.py \
