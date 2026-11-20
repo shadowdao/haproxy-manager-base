@@ -59,7 +59,7 @@ import haproxy_manager  # noqa: E402
 
 ALLOWLIST = ('/admin-ajax.php', '/admin-post.php',
              '/load-styles.php', '/load-scripts.php')
-EXCLUSIONS = ('!wp_admin_allowed', '!wp_admin_asset', '!has_wp_logged_in',
+EXCLUSIONS = ('!wp_admin_allowed', '!wp_admin_install', '!wp_admin_asset', '!has_wp_logged_in',
               '!wp_gate_exempt', '!is_local', '!is_trusted_ip', '!is_whitelisted')
 
 # The normalizer set, in the order it MUST render. Decoding has to precede the
@@ -220,10 +220,23 @@ class WpAdminGate(unittest.TestCase):
         line = require_rule(self.cfg, 'acl wp_admin_asset', 'wp_admin_asset ACL')
         self.assertRegex(line, r'path_reg.*\(css\|js\|images\)')
 
-    def test_install_php_is_NOT_allowlisted(self):
-        """install.php is deliberately gated -- a takeover vector on abandoned installs."""
+    def test_install_php_is_not_in_the_ajax_allowlist(self):
+        """install.php / setup-config.php live in their OWN ACL (wp_admin_install),
+        not in wp_admin_allowed, so the admin-ajax/asset allowlist stays minimal."""
         line = require_rule(self.cfg, 'acl wp_admin_allowed', 'wp_admin_allowed ACL')
         self.assertNotIn('install.php', line)
+        self.assertNotIn('setup-config.php', line)
+
+    def test_install_screens_exempt_exactly_two_anchored_paths(self):
+        """A fresh WordPress redirects every request to /wp-admin/setup-config.php
+        and a manual installer has no cookie. Exactly these two pages are exempt,
+        each anchored to /wp-admin/<file> (path_end, no regex, no wildcard).
+        upgrade.php is deliberately NOT exempt (logged-in only)."""
+        line = require_rule(self.cfg, 'acl wp_admin_install', 'wp_admin_install ACL')
+        self.assertEqual(line.split(None, 3)[2], 'path_end')
+        entries = line.split()[3:]
+        self.assertEqual(sorted(entries),
+                         ['/wp-admin/install.php', '/wp-admin/setup-config.php'])
 
     def test_redirect_rule_has_all_exclusions(self):
         rule = require_rule_by_predicate(
