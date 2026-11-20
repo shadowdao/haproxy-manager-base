@@ -40,6 +40,19 @@ global
     user        haproxy
     group       haproxy
     daemon
+{%- if nbthread %}
+
+    # PER-HOST THREAD COUNT. Only emitted when HAPROXY_NBTHREAD is set on the
+    # container (WHP: /etc/whp/edge-nbthread -> lib-edge-container.sh -> docker run -e),
+    # so a host that does not set it renders byte-identically to before and
+    # HAProxy keeps choosing automatically (all CPUs in its affinity mask).
+    # Why a host would set 1: 2026-11-19 sdbees, thread 1 spun on a server
+    # lock held by a TLS health-check thread stalled in a page fault under
+    # memory pressure -> watchdog abort (whole edge down). With one thread
+    # there is no other lock holder, so the failure class cannot occur.
+    # Do NOT combine with cpu-map/thread-groups here: neither is rendered.
+    nbthread {{ nbthread }}
+{%- endif %}
 
     # SSL and Performance
     tune.ssl.default-dh-param 2048
