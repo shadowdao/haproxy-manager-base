@@ -12,7 +12,7 @@ What this pins (the real `haproxy -c` of the same config is the
 `check-timing` assertions in scripts/validate-rendered-config.py):
   * exactly one default-server line, in `defaults`, with the agreed timing;
   * `spread-checks 50` in `global` (documented max, 0..50);
-  * the agreed timing detects a dead backend in <= ~65 s (inside the 1-2
+  * the agreed timing detects a dead backend in <= ~75 s worst case (inside the 1-2
     minutes Josh accepted) -- computed from the numbers, so changing one of
     them without re-justifying the other fails here;
   * no template puts inter/fastinter/downinter on a customer server line

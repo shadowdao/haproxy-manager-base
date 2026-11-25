@@ -211,9 +211,10 @@ defaults
     #   downinter 30s  a server already fully DOWN is re-tested at the same
     #                  low rate.
     #   rise 2 fall 3  the HAProxy defaults, stated so they are pinned.
-    # A dead backend is marked DOWN in at most ~65s (first failing check
-    # <= 45s after it dies, then two more at fastinter ~10s each); a recovered
-    # one is back UP in about the same. Servers without `check` are unaffected.
+    # A dead backend is marked DOWN in at most ~75s (first failing check
+    # <= 45s after it dies, then two more at fastinter, each <= 15s with the
+    # +50% jitter; ~50s typical); a recovered one is back UP in about the
+    # same (downinter <= 45s, then one more at fastinter). Servers without `check` are unaffected.
     # The Coraza SPOA server sets its own fast timing (hap_coraza_spoa_backend.tpl).
     default-server          inter 30s fastinter 10s downinter 30s rise 2 fall 3
     timeout tarpit          10s  # Tarpit delay for low-level scanners (before silent-drop)
