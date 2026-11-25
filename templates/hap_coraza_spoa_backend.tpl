@@ -13,4 +13,4 @@ backend coraza-spoa-backend
     option spop-check
     timeout connect 5s
     timeout server  30s
-    server coraza-spoa {{ agent_target }} check
+    server coraza-spoa {{ agent_target }} check inter 2s fastinter 2s downinter 2s rise 2 fall 3
