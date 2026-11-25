@@ -54,6 +54,17 @@ global
     nbthread {{ nbthread }}
 {%- endif %}
 
+    # Health-check jitter. Every `check` interval (default-server below) is
+    # randomised by +/- 50% so the hundreds of checks on a big edge drift
+    # apart instead of re-forming one burst per interval. The start-up offsets
+    # alone do NOT do this: HAProxy spreads the FIRST check of every server
+    # over the smallest interval in use, and a server that has not yet
+    # reached full health (every server after a start or reload) counts as
+    # `fastinter`, so the whole fleet starts inside a few seconds and would
+    # stay in lockstep with a fixed 30s period. 50 is the documented
+    # maximum (configuration.txt "spread-checks": 0..50 percent, default 0).
+    spread-checks 50
+
     # SSL and Performance
     tune.ssl.default-dh-param 2048
 
@@ -183,6 +194,29 @@ defaults
     timeout server          10m
     timeout http-keep-alive 30s
     timeout check           10s
+
+    # Backend health checks, set ONCE here for every `server ... check` line
+    # (WHP appends `check ssl verify none` per server; each check is a full
+    # TLS handshake, so on whp01 -- ~426 checked servers -- the old 2s default
+    # was ~200+ handshakes/s of pure health-check churn).
+    #   inter 30s      steady state: one check per server per ~30s (jittered
+    #                  15-45s by `spread-checks` in global).
+    #   fastinter 10s  used while a server is transitioning (going down/up)
+    #                  AND for a server not yet at full health, i.e. every
+    #                  server after a start/reload. It also sizes the
+    #                  start-up stagger window (HAProxy spreads first checks
+    #                  over the smallest interval in use), so it is 10s, not
+    #                  2s: 2s would put all first checks of a reload into a
+    #                  ~2s burst, the very churn this removes.
+    #   downinter 30s  a server already fully DOWN is re-tested at the same
+    #                  low rate.
+    #   rise 2 fall 3  the HAProxy defaults, stated so they are pinned.
+    # A dead backend is marked DOWN in at most ~75s (first failing check
+    # <= 45s after it dies, then two more at fastinter, each <= 15s with the
+    # +50% jitter; ~50s typical); a recovered one is back UP in about the
+    # same (downinter <= 45s, then one more at fastinter). Servers without `check` are unaffected.
+    # The Coraza SPOA server sets its own fast timing (hap_coraza_spoa_backend.tpl).
+    default-server          inter 30s fastinter 10s downinter 30s rise 2 fall 3
     timeout tarpit          10s  # Tarpit delay for low-level scanners (before silent-drop)
     maxconn                 3000
 

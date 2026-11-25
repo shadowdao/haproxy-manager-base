@@ -355,6 +355,10 @@ def assert_scenario_branches(scenario_name, config_path, env_overrides):
                    env_overrides.get('HAPROXY_DEFAULT_SPLASH') != 'off'),
         'nbthread': ('\n    nbthread 1\n',
                      env_overrides.get('HAPROXY_NBTHREAD') == '1'),
+        # Health-check timing is unconditional: every scenario carries it.
+        'check-timing': ('\n    default-server          inter 30s fastinter 10s '
+                         'downinter 30s rise 2 fall 3\n', True),
+        'spread-checks': ('\n    spread-checks 50\n', True),
     }
     for label, (needle, should_be_present) in expected.items():
         present = needle in text
