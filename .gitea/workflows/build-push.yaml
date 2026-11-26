@@ -28,7 +28,7 @@ on:
 #     read only from THIS run's step output).
 jobs:
   Build-and-Push:
-    runs-on: ubuntu-latest
+    runs-on: ephemeral
     timeout-minutes: 60
     steps:
       - name: Checkout

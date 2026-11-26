@@ -20,7 +20,7 @@ on:
 
 jobs:
   Mirror-Base:
-    runs-on: ubuntu-latest
+    runs-on: ephemeral
     strategy:
       # fail-fast=false so one image's upstream being down doesn't block the
       # others from refreshing.
