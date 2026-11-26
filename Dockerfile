@@ -167,6 +167,7 @@ RUN python3 /haproxy/scripts/test-wpadmin-gate.py \
  && python3 /haproxy/scripts/test-access-log-receiver.py \
  && python3 /haproxy/scripts/test-haproxy-stderr-relay.py \
  && python3 /haproxy/scripts/test-haproxy-supervisor.py \
+ && python3 /haproxy/scripts/test-haproxy-supervisor-relaunch.py \
  && python3 /haproxy/scripts/test-config-rollback.py \
  && python3 /haproxy/scripts/test-cert-write-safety.py \
  && python3 /haproxy/scripts/test-cert-scripts.py \
