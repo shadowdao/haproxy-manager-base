@@ -106,6 +106,10 @@ _stderr_log() { # same fallback as haproxy_manager._stderr_log_path()
 _marker_set()   { printf '%s %s\n' "$(date +%s)" "$$" >"${MARKER}" 2>/dev/null || true; }
 _marker_clear() { rm -f "${MARKER}" 2>/dev/null || true; }
 trap _marker_clear EXIT
+# A marker left by a supervisor that was SIGKILLed mid-recovery (`docker restart`
+# kills everything after PID 1 exits; no EXIT trap runs) survives in /tmp, which
+# a restart does not reset. This process never started that recovery: drop it.
+_marker_clear
 
 # Direct bash relaunch. Return 0 = haproxy is up (started here or already
 # running), 1 = caller must fall back to ensure_haproxy.py.

@@ -15,7 +15,7 @@ exits 134). Asserts:
   * a second master is never started while one is running,
   * an invalid on-disk config falls back to ensure_haproxy.py (python stub).
 
-Needs a real `haproxy`, `pidof`, `bash`, `timeout`. Skips (exit 0, loudly)
+Needs a real `haproxy`, `pidof`, `bash`, `timeout` (no procps: children are read from /proc). Skips (exit 0, loudly)
 when haproxy is not installed, so it is meaningful in the image build (where
 validate-rendered-config.py also needs the binary) and on a dev box with haproxy.
 """
@@ -69,8 +69,19 @@ def _master_pids():
 
 
 def _worker_of(master):
-    r = subprocess.run(['pgrep', '-P', str(master)], stdout=subprocess.PIPE, text=True)
-    return [int(x) for x in r.stdout.split()]
+    """Children of `master` from /proc (the image has no procps/pgrep)."""
+    out = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        try:
+            with open('/proc/%s/stat' % name) as fh:
+                ppid = int(fh.read().rsplit(')', 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        if ppid == master:
+            out.append(int(name))
+    return sorted(out)
 
 
 @unittest.skipUnless(HAPROXY, 'haproxy binary not installed')
