@@ -65,8 +65,14 @@ CRS rules are bundled into the coraza-spoa binary at build time, so the CRS vers
 1. Check upstream releases: <https://github.com/corazawaf/coraza-spoa/releases>
 2. Skim the CHANGELOG for new/changed rules in the `overrides.conf` ID ranges.
 3. Bump `ARG CORAZA_SPOA_VERSION` in the Dockerfile.
-4. Push to `main` — the Gitea workflow at `.gitea/workflows/build-push-coraza.yaml` rebuilds + pushes `:latest`.
-5. On each host, run `container-manager.sh recreate coraza-spoa` to pull the new image.
+4. The Coraza ENGINE is pinned separately (`ARG CORAZA_VERSION`, upgraded in place with `go get`; the build fails if the
+   binary does not embed it). Move it together with WHP's WAF regression net (`scripts/tests/waf-regression` +
+   `scripts/tests/coraza-body-parse-harness` go.mod in the WHP repo), which must pass on the new engine first.
+5. Bump `coraza-spoa/VERSION` (YYYY.MM.N) and push a `coraza-release/<anything>` branch: CI publishes ONLY
+   `:<VERSION>-rc` and `:<sha>` (never `:latest`). Roll it out host by host with WHP's coraza image pin
+   (`/etc/whp/coraza-image`, then `container-manager.sh recreate coraza-spoa`).
+6. Only after the staged rollout, merge to `main`: CI then publishes `:latest` + `:<VERSION>` + `:<sha>`. Moving
+   `:latest` IS a fleet-wide rollout: `apply-coraza-waf-mode.sh` pulls `:latest` on every WAF mode apply on unpinned hosts.
 
 ## Tuning false positives
 

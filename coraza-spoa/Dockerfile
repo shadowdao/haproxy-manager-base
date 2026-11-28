@@ -11,6 +11,20 @@
 
 ARG CORAZA_SPOA_VERSION=v0.7.1
 
+# Coraza engine override (security): coraza-spoa v0.7.1 pins
+# github.com/corazawaf/coraza/v3 v3.7.0, which is affected by the v3.8.x
+# advisories (jsDecode octal bypass GHSA-pc5q-qfxp-ggqv, JSON key-collision
+# bypass GHSA-5gj4-9gm7-2fx2, ProcessURI dropping ARGS_GET GHSA-x26q-wvhg-fh4m,
+# first-Content-Type desync GHSA-w253-m66g-rx24, ...). The engine is upgraded
+# IN PLACE (go get of this exact version, verified against go.sum /
+# sum.golang.org) instead of moving to coraza-spoa v0.9.x, so the SPOA agent
+# and coraza-coreruleset (CRS 4.25.0) stay exactly what WHP's WAF regression
+# net (scripts/tests/waf-regression in the WHP repo) measures; only the
+# engine changes. The build FAILS if the binary does not embed this version.
+# Behaviour changes that matter are documented in config.yaml
+# (SecArgumentsLimit) and in the WHP PR that moved the regression net.
+ARG CORAZA_VERSION=v3.8.1
+
 # golang:1.25 from the in-house mirror. The 2026-05-12 Cloudflare incident
 # took out docker.io blob pulls TWICE in one day (first for python:3.12-slim,
 # then for this image's golang:1.25), so both are mirrored at
@@ -24,6 +38,7 @@ ARG CORAZA_SPOA_VERSION=v0.7.1
 # the final distroless stage is per target platform (gcr.io publishes arm64).
 FROM --platform=$BUILDPLATFORM repo.anhonesthost.net/cloud-hosting-platform/golang:1.25 AS build
 ARG CORAZA_SPOA_VERSION
+ARG CORAZA_VERSION
 ARG TARGETOS
 ARG TARGETARCH
 # OPTIONAL internal package cache, e.g. --build-arg PKG_CACHE=https://192.168.1.40
@@ -49,8 +64,10 @@ RUN /usr/local/sbin/pkg-cache-repos.sh apt \
 RUN git clone --depth 1 --branch "${CORAZA_SPOA_VERSION}" \
         https://github.com/corazawaf/coraza-spoa.git . \
     && eval "$(/usr/local/sbin/pkg-cache-repos.sh go-env)" \
+    && go get "github.com/corazawaf/coraza/v3@${CORAZA_VERSION}" \
     && go mod download \
     && CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" go build -trimpath -ldflags='-s -w' -o /out/coraza-spoa . \
+    && go version -m /out/coraza-spoa | grep -E "^[[:space:]]+dep[[:space:]]+github.com/corazawaf/coraza/v3[[:space:]]+${CORAZA_VERSION}[[:space:]]" \
     && /usr/local/sbin/pkg-cache-repos.sh restore
 
 # Catalog extractor: walks the bundled CRS at build time and emits

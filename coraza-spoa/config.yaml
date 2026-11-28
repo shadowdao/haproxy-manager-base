@@ -57,6 +57,42 @@ applications:
       # trees that could not be sampled. Depth 64 itself costs ~21 ms.
       SecRequestBodyJsonDepthLimit 64
 
+      # Argument-count limit, per source (ARGS_GET, ARGS_POST, ARGS_PATH).
+      # Coraza 3.8 started ENFORCING SecArgumentsLimit (default 1000) on
+      # urlencoded and JSON bodies and on the query string: parsing stops at
+      # the limit, ARGUMENTS_LIMIT_REACHED is set, and every argument after it
+      # is never inspected (GHSA-3ww9-vw83-9w5x). Coraza <= 3.7 inspected every
+      # urlencoded/JSON argument. With the default, "1000 filler args + an
+      # LFI in arg 1001" bypassed 930120 (an enforced rule) on 3.8.1 in WHP's
+      # regression net. Upstream pairs the cap with deny rules 200004/200005,
+      # but those live in Coraza's own coraza.conf-recommended; the
+      # @coraza.conf-recommended Included above is the one embedded in
+      # coraza-coreruleset v4.25.0, which predates them.
+      # 65536 = SecRequestBodyLimit / 2: a urlencoded pair is at least two
+      # bytes ("a&"), so no body we accept can reach the limit, and the query
+      # string is bounded by tune.bufsize (16 KB) far below it. Every argument
+      # is therefore inspected, exactly as on 3.7. Memory stays bounded by
+      # the body limit (the reason upstream added the cap). WHP's JSON
+      # argument-count guard (991900030/031, ">= 1000" in pre-overrides.conf)
+      # is unaffected: it counts what this limit lets through.
+      SecArgumentsLimit 65536
+
+      # Defense in depth for the limit above (unreachable while it is
+      # >= SecRequestBodyLimit / 2): if arguments were ever dropped, Coraza
+      # did not see the whole request. Same two-rule shape as WHP's JSON
+      # guard: 209620 switches the engine on in enforce mode
+      # (tx.whp_enforce_mode, set in phase 1 by WHP's local-overrides.conf),
+      # 209621 denies; in detect_only it only logs (audit-logged). Phase 2
+      # and placed before pre-overrides/CRS so it runs before every CRS
+      # phase-2 rule. ARGUMENTS_LIMIT_REACHED exists only on Coraza >= 3.8,
+      # which is why this lives in the image, not in WHP's rendered files.
+      SecRule TX:whp_enforce_mode "@eq 1" \
+          "id:209620,phase:2,pass,nolog,t:none,chain"
+      SecRule ARGUMENTS_LIMIT_REACHED "@eq 1" \
+          "t:none,ctl:ruleEngine=On"
+      SecRule ARGUMENTS_LIMIT_REACHED "@eq 1" \
+          "id:209621,phase:2,deny,status:400,log,t:none,msg:'Argument limit reached: arguments were dropped uninspected',tag:'whp/coraza-arguments-limit',ctl:auditEngine=On"
+
       Include @crs-setup.conf.example
 
       # Runtime-managed PRE-CRS exclusions written by WHP UI. Empty by default.
